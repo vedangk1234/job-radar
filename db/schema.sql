@@ -1,0 +1,57 @@
+-- job-radar schema. Idempotent: safe to re-run against an existing database.
+
+-- companies: the live working set
+CREATE TABLE IF NOT EXISTS companies (
+  id            SERIAL PRIMARY KEY,
+  name          TEXT NOT NULL,
+  ats           TEXT NOT NULL,           -- greenhouse | lever | ashby | smartrecruiters | workable | recruitee | workday | custom_jsonld | custom_sitemap
+  token         TEXT NOT NULL,           -- board token; for workday, the tenant
+  config        JSONB NOT NULL DEFAULT '{}'::jsonb,  -- ATS extras: workday {host, site}; custom {url}
+  category      TEXT,                    -- product | gcc | services | staffing | unknown (hand-tagged once)
+  tracked       BOOLEAN NOT NULL DEFAULT FALSE,      -- true = 30-min tier, false = daily
+  india_scoped  BOOLEAN NOT NULL DEFAULT FALSE,      -- data is partial (India filter applied at source)
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (ats, token)
+);
+
+-- jobs: metadata only, NEVER job descriptions (keeps us on the free tier)
+CREATE TABLE IF NOT EXISTS jobs (
+  canonical_id     TEXT PRIMARY KEY,
+  company_id       INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  title            TEXT NOT NULL,
+  location         TEXT,                 -- raw string, kept verbatim
+  city             TEXT,                 -- computed label: blr | pune | hyd | india-unclear | other
+  url              TEXT NOT NULL,
+  source_posted_at TIMESTAMPTZ,          -- advisory only, never trusted for "new"
+  first_seen_at    TIMESTAMPTZ NOT NULL, -- authoritative "new" timestamp (our own observation)
+  last_seen_at     TIMESTAMPTZ NOT NULL,
+  miss_count       INT NOT NULL DEFAULT 0,
+  status           TEXT NOT NULL DEFAULT 'open',   -- open | closed
+  notified         BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS jobs_company_status_idx ON jobs (company_id, status);
+
+-- discovered_companies: staging area for the (later) discovery script; promoted by hand into companies
+CREATE TABLE IF NOT EXISTS discovered_companies (
+  id                  SERIAL PRIMARY KEY,
+  name                TEXT,
+  ats                 TEXT NOT NULL,
+  token               TEXT NOT NULL,
+  config              JSONB NOT NULL DEFAULT '{}'::jsonb,
+  job_count           INT,
+  last_posting_at     TIMESTAMPTZ,
+  city_hits           TEXT[],           -- which of the three cities appeared
+  looks_like_services BOOLEAN NOT NULL DEFAULT FALSE,  -- name-regex heuristic
+  source              TEXT,             -- commoncrawl | github | domain_crawl
+  discovered_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  promoted            BOOLEAN NOT NULL DEFAULT FALSE,
+  UNIQUE (ats, token)
+);
+
+-- notifications: sent-log so a job is never emailed twice
+CREATE TABLE IF NOT EXISTS notifications (
+  id           SERIAL PRIMARY KEY,
+  canonical_id TEXT NOT NULL REFERENCES jobs(canonical_id) ON DELETE CASCADE,
+  sent_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  digest       TEXT              -- e.g. '2026-07-25-am'
+);

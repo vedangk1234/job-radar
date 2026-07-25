@@ -1,0 +1,12 @@
+# Secrets — NEVER commit. Only .env.example is committed.
+.env
+.env.local
+
+# Local scratch notes holding real credentials.
+scratch.md
+
+
+# Python
+__pycache__/
+*.pyc
+.venv/
