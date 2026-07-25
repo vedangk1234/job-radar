@@ -17,7 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from db.connection import get_crawler_conn  # noqa: E402
 
 SCHEMA_PATH = PROJECT_ROOT / "db" / "schema.sql"
-EXPECTED_TABLES = ["companies", "jobs", "discovered_companies", "notifications"]
+EXPECTED_TABLES = ["companies", "jobs", "discovered_companies", "notifications", "preferences"]
 
 
 async def main() -> int:
@@ -57,8 +57,8 @@ async def main() -> int:
         print(f"\nFAILED: expected tables missing: {', '.join(missing)}", file=sys.stderr)
         return 1
 
-    print("\nSUCCESS: schema applied and all 4 expected tables are present "
-          f"({', '.join(EXPECTED_TABLES)}).")
+    print(f"\nSUCCESS: schema applied and all {len(EXPECTED_TABLES)} expected tables are "
+          f"present ({', '.join(EXPECTED_TABLES)}).")
     return 0
 
 

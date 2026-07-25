@@ -30,7 +30,8 @@ from typing import Any, Iterable, Sequence
 
 import pytest
 
-from fetchers.normalize import make_job
+from fetchers.normalize import city_label, make_job
+from notify.match import DEFAULT_CITIES, DEFAULT_EXCLUSIONS, DEFAULT_KEYWORDS
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -53,6 +54,47 @@ CREATE TABLE jobs (
   miss_count       INTEGER NOT NULL DEFAULT 0,
   status           TEXT NOT NULL DEFAULT 'open',
   notified         INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+# The rest of db/schema.sql, in the same SQLite dialect. The digest joins jobs
+# to companies and writes to notifications, so both have to exist here for the
+# production SQL to run at all.
+#
+# The TEXT[] columns of `preferences` become TEXT holding JSON. That divergence
+# is handled once, in Preferences.from_row, which accepts either a real list
+# (asyncpg) or a JSON string (here) — the same accommodation Company.from_row
+# already makes for JSONB arriving as text.
+COMPANIES_DDL = """
+CREATE TABLE companies (
+  id            INTEGER PRIMARY KEY,
+  name          TEXT NOT NULL,
+  ats           TEXT NOT NULL DEFAULT 'greenhouse',
+  token         TEXT NOT NULL DEFAULT 'testco',
+  config        TEXT NOT NULL DEFAULT '{}',
+  category      TEXT,
+  tracked       INTEGER NOT NULL DEFAULT 0,
+  india_scoped  INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT
+)
+"""
+
+NOTIFICATIONS_DDL = """
+CREATE TABLE notifications (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  canonical_id TEXT NOT NULL,
+  sent_at      TEXT NOT NULL,
+  digest       TEXT
+)
+"""
+
+PREFERENCES_DDL = """
+CREATE TABLE preferences (
+  id          INTEGER PRIMARY KEY CHECK (id = 1),
+  cities      TEXT NOT NULL,
+  keywords    TEXT NOT NULL,
+  exclusions  TEXT NOT NULL,
+  updated_at  TEXT
 )
 """
 
@@ -91,7 +133,17 @@ class FakeConn:
         # Python 3.12 deprecated the implicit datetime adapter; be explicit
         # rather than depend on a shim that is on its way out.
         sqlite3.register_adapter(datetime, lambda d: d.isoformat())
-        self._db.execute(JOBS_DDL)
+        for ddl in (JOBS_DDL, COMPANIES_DDL, NOTIFICATIONS_DDL, PREFERENCES_DDL):
+            self._db.execute(ddl)
+
+    def transaction(self) -> "FakeTransaction":
+        """asyncpg's `async with conn.transaction():`, backed by real BEGIN/ROLLBACK.
+
+        Real, not a no-op: notify/store.record_sent claims that the flag flip and
+        the sent-log insert either both happen or neither does, and a stub
+        context manager would let that claim go untested.
+        """
+        return FakeTransaction(self._db)
 
     async def fetch(self, sql: str, *args: Any) -> list[sqlite3.Row]:
         translated, params = _translate(sql, args)
@@ -122,10 +174,94 @@ class FakeConn:
         rows = await self.fetch("SELECT * FROM jobs")
         return {row["canonical_id"]: dict(row) for row in rows}
 
+    async def sent_log(self) -> list[dict[str, Any]]:
+        """Every notifications row, oldest first."""
+        rows = await self.fetch("SELECT * FROM notifications ORDER BY id")
+        return [dict(row) for row in rows]
+
+    async def add_company(self, company_id: int, name: str) -> None:
+        await self.execute(
+            "INSERT INTO companies (id, name) VALUES ($1, $2)", company_id, name
+        )
+
+    async def add_job(
+        self,
+        canonical_id: str,
+        *,
+        company_id: int = 1,
+        title: str = "Backend Engineer",
+        location: str = "Bengaluru, India",
+        city: str | None = None,
+        url: str | None = None,
+        status: str = "open",
+        notified: bool = False,
+    ) -> None:
+        """Insert one jobs row directly.
+
+        Bypasses the crawler on purpose: these tests are about what the digest
+        does with a row, not about how the row got there.
+        """
+        stamp = self.clock.tick()
+        await self.execute(
+            "INSERT INTO jobs (canonical_id, company_id, title, location, city, url, "
+            "first_seen_at, last_seen_at, status, notified) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9)",
+            canonical_id,
+            company_id,
+            title,
+            location,
+            city if city is not None else city_label(location),
+            url or f"https://example.test/jobs/{canonical_id}",
+            stamp,
+            status,
+            1 if notified else 0,
+        )
+
+    async def set_preferences(
+        self,
+        cities: Sequence[str] = DEFAULT_CITIES,
+        keywords: Sequence[str] = DEFAULT_KEYWORDS,
+        exclusions: Sequence[str] = DEFAULT_EXCLUSIONS,
+    ) -> None:
+        """Seed the single preferences row, TEXT[] columns encoded as JSON."""
+        await self.execute("DELETE FROM preferences")
+        await self.execute(
+            "INSERT INTO preferences (id, cities, keywords, exclusions, updated_at) "
+            "VALUES (1, $1, $2, $3, $4)",
+            json.dumps(list(cities)),
+            json.dumps(list(keywords)),
+            json.dumps(list(exclusions)),
+            self.clock.tick(),
+        )
+
+
+class FakeTransaction:
+    """SQLite BEGIN/COMMIT/ROLLBACK behind asyncpg's async context-manager shape."""
+
+    def __init__(self, db: sqlite3.Connection) -> None:
+        self._db = db
+
+    async def __aenter__(self) -> "FakeTransaction":
+        self._db.execute("BEGIN")
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        self._db.execute("ROLLBACK" if exc_type else "COMMIT")
+        return False
+
 
 @pytest.fixture
 def conn() -> FakeConn:
     return FakeConn()
+
+
+@pytest.fixture
+async def digest_conn() -> FakeConn:
+    """A FakeConn with one company and the seeded preferences already in place."""
+    conn = FakeConn()
+    await conn.add_company(1, "Testco")
+    await conn.set_preferences()
+    return conn
 
 
 # --- job builders ---------------------------------------------------------

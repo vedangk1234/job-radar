@@ -9,6 +9,9 @@ scratch.md
 # Raw ATS responses. Regenerated on every crawl, big and noisy — never committed.
 fixtures/
 
+# Rendered digest from scripts/preview_digest.py. Regenerated on every dry run.
+digest_preview.html
+
 # Python
 __pycache__/
 *.pyc

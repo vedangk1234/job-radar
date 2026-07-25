@@ -55,3 +55,38 @@ CREATE TABLE IF NOT EXISTS notifications (
   sent_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   digest       TEXT              -- e.g. '2026-07-25-am'
 );
+
+-- preferences: the notify-tightly filter, as data rather than as code.
+--
+-- The jobs table stores everything, every city, unfiltered. This single row is
+-- the only thing that decides what reaches an inbox, which is why it lives in
+-- the database and not in a Python constant: the Step 5 dashboard edits it
+-- with an UPDATE, and the very next digest obeys it. No redeploy, no commit.
+--
+-- Exactly one row, forever. The CHECK plus the fixed default is what enforces
+-- that — every INSERT lands on id=1 and collides with the row already there,
+-- so "the preferences" is never an ambiguous question.
+CREATE TABLE IF NOT EXISTS preferences (
+  id          INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  cities      TEXT[] NOT NULL DEFAULT '{}',  -- city labels to include; see fetchers/normalize.city_label
+  keywords    TEXT[] NOT NULL DEFAULT '{}',  -- title must match at least one
+  exclusions  TEXT[] NOT NULL DEFAULT '{}',  -- title must match none
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Seed the row if the table is empty. ON CONFLICT DO NOTHING is what makes
+-- this safe to re-run: once the dashboard has edited the row, re-applying the
+-- schema must not quietly reset the filter to these defaults.
+INSERT INTO preferences (id, cities, keywords, exclusions, updated_at)
+VALUES (
+  1,
+  ARRAY['blr', 'pune', 'hyd', 'india-unclear'],
+  ARRAY['backend', 'back end', 'python', 'golang', 'go ', 'platform',
+        'infrastructure', 'infra', 'api', 'distributed', 'sde',
+        'software engineer', 'backend engineer', 'full stack', 'fullstack'],
+  ARRAY['intern', 'senior', 'staff', 'principal', 'lead', 'manager',
+        'director', 'head', 'architect', 'sales', 'recruiter', 'support',
+        'qa', 'analyst'],
+  now()
+)
+ON CONFLICT (id) DO NOTHING;
