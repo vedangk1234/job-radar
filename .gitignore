@@ -6,6 +6,9 @@
 scratch.md
 
 
+# Raw ATS responses. Regenerated on every crawl, big and noisy — never committed.
+fixtures/
+
 # Python
 __pycache__/
 *.pyc
