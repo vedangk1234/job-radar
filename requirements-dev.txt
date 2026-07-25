@@ -1,0 +1,5 @@
+# Test-only. Kept out of requirements.txt so the crawler's runtime install
+# (and the GitHub Actions job that runs it) stays lean.
+-r requirements.txt
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
