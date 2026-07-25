@@ -17,6 +17,7 @@ import pytest
 from notify.match import (
     Preferences,
     city_ok,
+    compile_term,
     excluded,
     explain,
     is_match,
@@ -86,10 +87,15 @@ def test_goa_does_not_match_the_go_keyword():
     assert not keyword_ok(job("Operations Associate, Goa"), PREFS)
 
 
-def test_go_matches_as_a_real_word():
-    """…while still catching the roles it was written for."""
-    assert keyword_ok(job("Go Developer"), PREFS)
-    assert keyword_ok(job("Go/Python Engineer"), PREFS)
+def test_a_short_term_still_matches_where_it_is_a_real_word():
+    """…while the same pattern still catches the roles such a term is written for.
+
+    Kept as an explicit term list rather than against PREFS: 'go ' is no longer
+    in the resume-grounded keyword set, but it is still the clearest example of
+    the boundary rule, and the rule is what this test is about.
+    """
+    assert matched_terms("Go Developer", ["go "]) == ["go "]
+    assert matched_terms("Go/Python Engineer", ["go "]) == ["go "]
 
 
 def test_devops_manager_is_excluded_on_manager():
@@ -141,6 +147,73 @@ def test_terms_do_fire_as_whole_words(title, term):
 def test_multi_word_terms_span_the_separators_recruiters_actually_use(title):
     """One pattern covers space, hyphen, underscore and slash spellings."""
     assert matched_terms(title, ["back end"]) == ["back end"]
+
+
+# --- terms carrying punctuation -------------------------------------------
+#
+# The stack names on a resume are not clean words. 'next.js' and 'node' both
+# have to survive re.escape and still sit correctly against \b, and a dot in a
+# term must be a literal dot rather than the regex "any character" — otherwise
+# 'next.js' would quietly match "nextXjs" and, worse, the pattern could fail to
+# compile at all.
+
+
+@pytest.mark.parametrize(
+    "title,term,expected",
+    [
+        ("Next.js Engineer", "next.js", True),
+        ("Building with NEXT.JS", "next.js", True),
+        ("NextJS Engineer", "nextjs", True),
+        ("Nextxjs Engineer", "next.js", False),   # the dot is literal, not a wildcard
+        ("Node Developer", "node", True),
+        ("Node.js Backend Engineer", "node", True),
+        ("Nodejs Engineer", "nodejs", True),
+        ("Nodemon Maintainer", "node", False),
+        ("REST API Engineer", "rest", True),
+        ("Restaurant Operations Associate", "rest", False),
+        ("ML Engineer", "ml engineer", True),
+        ("ML-Engineer, Ranking", "ml engineer", True),
+        ("HTML Developer", "ml engineer", False),
+        ("React Native Developer", "react native", True),
+    ],
+)
+def test_punctuated_and_short_stack_terms(title, term, expected):
+    assert bool(matched_terms(title, [term])) is expected
+
+
+def test_a_term_with_a_dot_compiles_and_escapes_it():
+    assert compile_term("next.js").pattern == r"\bnext\.js\b"
+
+
+@pytest.mark.parametrize(
+    "noise",
+    [
+        "HTML Developer",
+        "Restaurant Manager",
+        "Capital Markets Associate",
+        "Rapid Response Coordinator",
+        "Goa Beach Operations",
+    ],
+)
+def test_no_keyword_in_the_whole_set_fires_on_lookalike_noise(noise):
+    """The set-wide version of the boundary rule: 42 terms, none of them greedy."""
+    assert matched_terms(noise, PREFS.keywords) == []
+
+
+def test_member_of_technical_staff_is_excluded_by_the_staff_exclusion():
+    """A known collision between the two lists, asserted so it cannot surprise us.
+
+    'member of technical staff' and 'mts' are keywords, and 'staff' is an
+    exclusion — so an MTS posting matches a keyword and is then dropped anyway.
+    Exclusions are meant to win, and this is what that costs. Changing it is a
+    one-line edit to the preferences row, not to this code.
+    """
+    j = job("Member of Technical Staff")
+    assert keyword_ok(j, PREFS)
+    assert excluded(j, PREFS)
+    assert not is_match(j, PREFS)
+
+    assert is_match(job("MTS - Backend"), PREFS)  # the acronym form survives
 
 
 def test_matching_is_case_insensitive():

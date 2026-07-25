@@ -56,10 +56,27 @@ from typing import Any, Iterable, Mapping, Sequence
 # runtime; this is a mirror, never an override.
 DEFAULT_CITIES = ("blr", "pune", "hyd", "india-unclear")
 
+# Grounded in the resume rather than in what a job board happens to call things:
+# every term here is a role title, a stack, or a discipline actually worth
+# applying to. Grouped for reading, flat for matching.
 DEFAULT_KEYWORDS = (
-    "backend", "back end", "python", "golang", "go ", "platform",
-    "infrastructure", "infra", "api", "distributed", "sde",
-    "software engineer", "backend engineer", "full stack", "fullstack",
+    # role titles
+    "software engineer", "software developer", "software development engineer",
+    "sde", "associate software engineer", "member of technical staff", "mts",
+    "application developer", "programmer",
+    # backend / services
+    "backend", "back end", "node", "nodejs", "express", "fastapi",
+    "api", "rest", "microservices", "distributed",
+    # full stack / frontend
+    "full stack", "fullstack", "frontend", "front end",
+    "react", "react native", "nextjs", "next.js",
+    # languages
+    "python", "javascript", "typescript",
+    # platform / infra
+    "platform", "infrastructure", "infra", "devops", "cloud engineer",
+    # ML / AI
+    "machine learning", "ml engineer", "ai engineer", "mlops",
+    "deep learning", "computer vision", "llm",
 )
 
 DEFAULT_EXCLUSIONS = (
