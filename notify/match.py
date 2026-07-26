@@ -5,11 +5,12 @@ every job, every city, unfiltered — precisely so that the decision to notify c
 be made late, changed cheaply, and re-made against a table that never threw
 anything away. Store loosely, notify tightly; this is the tight end.
 
-The three tests are independent and combine with AND:
+The four tests are independent and combine with AND:
 
-    city_ok      the stored city label is in preferences.cities
-    keyword_ok   the title matches at least one keyword
-    excluded     the title matches at least one exclusion  (negated)
+    city_ok         the stored city label is in preferences.cities
+    keyword_ok      the title matches at least one keyword
+    excluded        the title matches at least one exclusion       (negated)
+    level_excluded  the title states a seniority level above max_level  (negated)
 
 Nothing here reads the database, the clock, or the environment. `preferences`
 arrives as a value, `job` arrives as a mapping, and the answer is a bool — so
@@ -40,6 +41,31 @@ Two deliberate consequences of \b, both accepted:
 Multi-word terms ('back end', 'software engineer') join their tokens with
 [\s\-_/]+ rather than a literal space, so one pattern covers "back end",
 "back-end", "back_end" and "back/end". Recruiters spell it all four ways.
+
+
+Why levels need their own test
+------------------------------
+The word exclusions catch 'senior', 'lead' and 'staff', and miss the other half
+of how seniority is written down: "SDE III", "Software Engineer IV", "Backend
+Engineer L4", "Engineer (Level 5)". Those titles say *senior* in a notation the
+exclusion list cannot see, so they arrive in the inbox and waste the read.
+
+detect_level reads that notation and level_excluded drops anything above
+preferences.max_level (2 by default — level 1 and 2 are the jobs worth having).
+A level is a number, which is what makes this the one filter in the file with a
+real false-positive problem: job titles are *full* of numbers that mean the
+opposite thing.
+
+    "Ops Engineer 2 to 5 Years"          <- 2 and 5 are experience, not levels
+    "Backend Engineer, 3+ years"         <- 3 is experience
+    "Python Developer (2-4 years)"       <- both are experience
+
+Dropping those would delete exactly the mid-level jobs this filter exists to
+find, and silently. So every number in the title is first checked against the
+experience shapes (years/yrs/y-o-e, "N to M", "N-M", slash lists) and masked out
+if it matches; only what survives the mask is allowed to be read as a level.
+The bias is deliberate and one-directional: an unrecognised level costs one line
+in a digest, a misread experience range costs the job.
 """
 
 from __future__ import annotations
@@ -63,7 +89,7 @@ DEFAULT_KEYWORDS = (
     # role titles
     "software engineer", "software developer", "software development engineer",
     "sde", "associate software engineer", "member of technical staff", "mts",
-    "application developer", "programmer",
+    "application developer", "programmer", "forward deployed engineer",
     # backend / services
     "backend", "back end", "node", "nodejs", "express", "fastapi",
     "api", "rest", "microservices", "distributed",
@@ -84,6 +110,10 @@ DEFAULT_EXCLUSIONS = (
     "director", "head", "architect", "sales", "recruiter", "support",
     "qa", "analyst",
 )
+
+# The highest stated seniority level that still reaches the inbox. 2 keeps
+# "Software Engineer II" and "SDE 2" and drops "SDE III" and above.
+DEFAULT_MAX_LEVEL = 2
 
 # Inside a multi-word term, what may stand between the words.
 _INNER_SEP = r"[\s\-_/]+"
@@ -126,6 +156,88 @@ def matched_terms(title: Any, terms: Iterable[str]) -> list[str]:
     return [t for t in terms if (p := compile_term(t)) is not None and p.search(text)]
 
 
+# --- seniority level in the title -----------------------------------------
+
+_ROMAN_LEVELS = {"ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6}
+
+# Longest alternative first so "VI" is read as 6 and not as 5 followed by a
+# stray 'i'; \b on both ends so 'v' fires only as a standalone token and never
+# from inside "Java", "DevOps" or "v2". 'i' is deliberately absent — level 1 is
+# kept anyway, and \bi\b would fire on the English word "I".
+_ROMAN_RE = re.compile(r"\b(vi|iv|iii|ii|v)\b", re.IGNORECASE)
+
+# The tokens a bare digit is allowed to be a level *for*. A digit that follows
+# none of these and is not at the end of the title is not treated as a level.
+_LEVEL_TOKEN = r"(?:sde|swe|sdet|mts|engineer|developer|analyst|grade)"
+
+_DIGIT_LEVEL_RES = (
+    re.compile(r"\bl([2-9])\b", re.IGNORECASE),                            # L3, L4
+    re.compile(r"\blevel[\s\-]*([2-9])\b", re.IGNORECASE),                 # Level 5, level-4
+    re.compile(rf"\b{_LEVEL_TOKEN}\b[\s\-]*([2-9])\b", re.IGNORECASE),     # SDE 3, Engineer-4
+    re.compile(r"[\s\-]([2-9])\s*$"),                                      # "... 3" at the end
+)
+
+_NUMBER_RE = re.compile(r"\d+")
+
+# A number is about EXPERIENCE rather than level when a duration unit follows it
+# ("5 Years", "3+ yrs", "4 y-o-e") ...
+_YEARS_AFTER_RE = re.compile(
+    r"\s*\+?\s*(?:years?|yrs?|y\s*[-–—.]?\s*o\s*[-–—.]?\s*e)\b", re.IGNORECASE
+)
+# ... when a range or a slash list continues out of it ("2 to 5", "2-4", "2 / 3") ...
+_RANGE_AFTER_RE = re.compile(r"\s*(?:to|[-–—/])\s*\d", re.IGNORECASE)
+# ... or when one arrives at it. The hyphen form requires a digit on the far side,
+# which is what keeps "SDE-4" a level while "2-4" is a range.
+_RANGE_BEFORE_RE = re.compile(r"(?:\d\s*(?:to|[-–—/])\s*|\bto\s+)$", re.IGNORECASE)
+
+
+def _mask_experience_numbers(text: str) -> str:
+    """Blank out every number that denotes experience, leaving the rest in place.
+
+    The replacement is the same length as what it replaces, so every offset — and
+    therefore every \\b in the level patterns — still lines up with the original
+    title. '#' is a non-word character, so a masked number cannot be read back as
+    a level by any pattern above.
+
+        "ops engineer 2 to 5 years"  ->  "ops engineer # to # years"
+        "sde-4"                      ->  "sde-4"        (untouched)
+    """
+    out = list(text)
+    for match in _NUMBER_RE.finditer(text):
+        start, end = match.span()
+        if (
+            _YEARS_AFTER_RE.match(text, end)
+            or _RANGE_AFTER_RE.match(text, end)
+            or _RANGE_BEFORE_RE.search(text[:start])
+        ):
+            out[start:end] = "#" * (end - start)
+    return "".join(out)
+
+
+def detect_level(title: Any) -> int | None:
+    """The seniority level the title states, or None if it states none.
+
+    Only the four notations are recognised — roman numerals, L3, "level 3", and a
+    digit attached to a role token or trailing the title. Anything else, and
+    anything the experience mask removed, reads as "no level stated", which is
+    kept rather than dropped.
+
+    The maximum wins when a title states more than one, because "SDE II / III"
+    is a III posting and the point of the filter is not to be surprised by that.
+    """
+    text = (title or "").lower()
+    if not text:
+        return None
+
+    levels = [_ROMAN_LEVELS[m.group(1)] for m in _ROMAN_RE.finditer(text)]
+
+    masked = _mask_experience_numbers(text)
+    for pattern in _DIGIT_LEVEL_RES:
+        levels.extend(int(m.group(1)) for m in pattern.finditer(masked))
+
+    return max(levels) if levels else None
+
+
 @dataclass(frozen=True)
 class Preferences:
     """The single preferences row, as a value object.
@@ -138,6 +250,7 @@ class Preferences:
     cities: tuple[str, ...] = DEFAULT_CITIES
     keywords: tuple[str, ...] = DEFAULT_KEYWORDS
     exclusions: tuple[str, ...] = DEFAULT_EXCLUSIONS
+    max_level: int = DEFAULT_MAX_LEVEL
 
     @staticmethod
     def _as_tuple(value: Any, fallback: Sequence[str]) -> tuple[str, ...]:
@@ -157,6 +270,23 @@ class Preferences:
             return tuple(fallback)
         return tuple(str(v).strip().lower() for v in value if str(v).strip())
 
+    @staticmethod
+    def _as_level(row: Mapping[str, Any], fallback: int) -> int:
+        """Read max_level out of a row that may predate the column.
+
+        A database on the old schema has no max_level at all, and the honest
+        answer there is the seeded default rather than a KeyError in the middle
+        of a digest run — same reasoning as the absent-row fallback below.
+        """
+        try:
+            value = row["max_level"]
+        except (KeyError, IndexError, TypeError):
+            return fallback
+        try:
+            return fallback if value is None else int(value)
+        except (TypeError, ValueError):
+            return fallback
+
     @classmethod
     def from_row(cls, row: Mapping[str, Any] | None) -> "Preferences":
         """Build from a preferences row; an absent row means the seeded defaults."""
@@ -166,10 +296,11 @@ class Preferences:
             cities=cls._as_tuple(row["cities"], DEFAULT_CITIES),
             keywords=cls._as_tuple(row["keywords"], DEFAULT_KEYWORDS),
             exclusions=cls._as_tuple(row["exclusions"], DEFAULT_EXCLUSIONS),
+            max_level=cls._as_level(row, DEFAULT_MAX_LEVEL),
         )
 
 
-# --- the three tests ------------------------------------------------------
+# --- the four tests -------------------------------------------------------
 
 
 def city_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
@@ -194,14 +325,33 @@ def excluded(job: Mapping[str, Any], prefs: Preferences) -> bool:
     return bool(matched_terms(job.get("title"), prefs.exclusions))
 
 
-def is_match(job: Mapping[str, Any], prefs: Preferences) -> bool:
-    """city AND keyword AND NOT excluded. The whole notify decision, in one line.
+def level_excluded(job: Mapping[str, Any], prefs: Preferences) -> bool:
+    """The title states a level, and that level is above the one we asked for.
 
-    Exclusion is checked last and wins outright: "Senior Backend Engineer,
-    Bengaluru" passes both of the first two tests and is still not a job worth
-    an email, because the point of the filter is a small inbox, not a complete one.
+    "States a level" is the load-bearing half. A title with no level survives —
+    most postings never number themselves, and treating silence as senior would
+    empty the digest.
     """
-    return city_ok(job, prefs) and keyword_ok(job, prefs) and not excluded(job, prefs)
+    level = detect_level(job.get("title"))
+    return level is not None and level > prefs.max_level
+
+
+def is_match(job: Mapping[str, Any], prefs: Preferences) -> bool:
+    """city AND keyword AND NOT excluded AND NOT level_excluded.
+
+    Both exclusions are checked last and win outright: "Senior Backend Engineer,
+    Bengaluru" and "SDE III, Bengaluru" each pass the first two tests and are
+    still not jobs worth an email, because the point of the filter is a small
+    inbox, not a complete one. They are two tests rather than one because they
+    fail on different evidence — a word versus a number — and a preview run has
+    to be able to say which.
+    """
+    return (
+        city_ok(job, prefs)
+        and keyword_ok(job, prefs)
+        and not excluded(job, prefs)
+        and not level_excluded(job, prefs)
+    )
 
 
 @dataclass
@@ -212,6 +362,7 @@ class MatchReport:
     matched: bool
     keywords_hit: list[str] = field(default_factory=list)
     exclusions_hit: list[str] = field(default_factory=list)
+    level: int | None = None
     reason: str = ""
 
 
@@ -219,6 +370,7 @@ def explain(job: Mapping[str, Any], prefs: Preferences) -> MatchReport:
     """is_match, with its working shown. Same rules, same order, no second opinion."""
     keywords_hit = matched_terms(job.get("title"), prefs.keywords)
     exclusions_hit = matched_terms(job.get("title"), prefs.exclusions)
+    level = detect_level(job.get("title"))
 
     if not city_ok(job, prefs):
         reason = f"city {job.get('city')!r} not in preferences"
@@ -226,6 +378,8 @@ def explain(job: Mapping[str, Any], prefs: Preferences) -> MatchReport:
         reason = "no keyword in title"
     elif exclusions_hit:
         reason = "excluded by " + ", ".join(repr(t) for t in exclusions_hit)
+    elif level is not None and level > prefs.max_level:
+        reason = f"level {level} above max_level {prefs.max_level}"
     else:
         reason = "matched " + ", ".join(repr(t) for t in keywords_hit)
 
@@ -234,6 +388,7 @@ def explain(job: Mapping[str, Any], prefs: Preferences) -> MatchReport:
         matched=is_match(job, prefs),
         keywords_hit=keywords_hit,
         exclusions_hit=exclusions_hit,
+        level=level,
         reason=reason,
     )
 

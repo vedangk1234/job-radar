@@ -31,7 +31,12 @@ from typing import Any, Iterable, Sequence
 import pytest
 
 from fetchers.normalize import city_label, make_job
-from notify.match import DEFAULT_CITIES, DEFAULT_EXCLUSIONS, DEFAULT_KEYWORDS
+from notify.match import (
+    DEFAULT_CITIES,
+    DEFAULT_EXCLUSIONS,
+    DEFAULT_KEYWORDS,
+    DEFAULT_MAX_LEVEL,
+)
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -94,6 +99,7 @@ CREATE TABLE preferences (
   cities      TEXT NOT NULL,
   keywords    TEXT NOT NULL,
   exclusions  TEXT NOT NULL,
+  max_level   INTEGER NOT NULL DEFAULT 2,
   updated_at  TEXT
 )
 """
@@ -222,15 +228,17 @@ class FakeConn:
         cities: Sequence[str] = DEFAULT_CITIES,
         keywords: Sequence[str] = DEFAULT_KEYWORDS,
         exclusions: Sequence[str] = DEFAULT_EXCLUSIONS,
+        max_level: int = DEFAULT_MAX_LEVEL,
     ) -> None:
         """Seed the single preferences row, TEXT[] columns encoded as JSON."""
         await self.execute("DELETE FROM preferences")
         await self.execute(
-            "INSERT INTO preferences (id, cities, keywords, exclusions, updated_at) "
-            "VALUES (1, $1, $2, $3, $4)",
+            "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at) "
+            "VALUES (1, $1, $2, $3, $4, $5)",
             json.dumps(list(cities)),
             json.dumps(list(keywords)),
             json.dumps(list(exclusions)),
+            int(max_level),
             self.clock.tick(),
         )
 

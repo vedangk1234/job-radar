@@ -18,10 +18,12 @@ from notify.match import (
     Preferences,
     city_ok,
     compile_term,
+    detect_level,
     excluded,
     explain,
     is_match,
     keyword_ok,
+    level_excluded,
     matched_terms,
     select_matches,
 )
@@ -277,3 +279,185 @@ def test_explain_reports_the_first_failing_test():
     assert "no keyword" in explain(job("Office Administrator"), PREFS).reason
     assert "'senior'" in explain(job("Senior Backend Engineer"), PREFS).reason
     assert "matched" in explain(job("Backend Engineer"), PREFS).reason
+    assert "level 4 above max_level 2" in explain(job("SDE-4"), PREFS).reason
+
+
+# --- seniority LEVEL exclusion --------------------------------------------
+#
+# The word exclusions catch 'senior' and 'lead'. They cannot see "SDE III" or
+# "Engineer 4", which say the same thing in a notation made of numbers — and
+# numbers are also how job titles state YEARS OF EXPERIENCE. The two halves of
+# this section are therefore not symmetric in cost:
+#
+#   a level that goes undetected  -> one extra line in one digest
+#   an experience range read as a level -> the mid-level job is deleted, silently
+#
+# So the second parametrize below is the one that matters. Every case in it is a
+# title a real board produced, and every one of them must survive.
+
+
+ABOVE_MAX_LEVEL = [
+    "Software Development Engineer III Data",   # roman numeral, mid-title
+    "Software Development Engineer IV Android",
+    "SDE 3",                                   # digit after a role token
+    "SDE-4",                                   # hyphen, and NOT a range
+    "SWE III",
+    "Backend Engineer L4",                     # the L-form
+    "Engineer (Level 5)",                      # spelled out, inside parentheses
+    "Software Engineer VI",                    # 'vi' must not read as 'v'
+    "Forward Deployed Engineer III",           # keyword hit, dropped anyway
+]
+
+WITHIN_MAX_LEVEL = [
+    "Software Engineer II",                    # level 2 is wanted
+    "SDE 2",
+    "Forward Deployed Engineer - II",
+    "Product Solution Engineer 2",
+    "Network Delivery Engineer 1",             # level 1 is wanted
+    "Ops Engineer 2 to 5 Years",               # "2 to 5" is a range, not a level
+    "Backend Engineer, 3+ years experience",   # "3+ years" is experience
+    "Python Developer (2-4 years)",            # both numbers are experience
+    "Software Engineer",                       # no level stated at all
+]
+
+
+@pytest.mark.parametrize("title", ABOVE_MAX_LEVEL)
+def test_titles_stating_level_three_or_above_are_excluded(title):
+    assert level_excluded(job(title), PREFS)
+    assert not is_match(job(title), PREFS)
+
+
+@pytest.mark.parametrize("title", WITHIN_MAX_LEVEL)
+def test_level_one_and_two_and_experience_ranges_are_never_level_excluded(title):
+    """The expensive direction. A number here is a range or a junior level, never a drop."""
+    assert not level_excluded(job(title), PREFS)
+
+
+@pytest.mark.parametrize(
+    "title,expected",
+    [
+        # the four recognised notations
+        ("Software Development Engineer III Data", 3),
+        ("Software Development Engineer IV Android", 4),
+        ("Software Engineer VI", 6),
+        ("Software Engineer II", 2),
+        ("SDE 3", 3),
+        ("SDE-4", 4),
+        ("SDE 2", 2),
+        ("SWE III", 3),
+        ("Backend Engineer L4", 4),
+        ("Engineer (Level 5)", 5),
+        ("Forward Deployed Engineer - II", 2),
+        ("Product Solution Engineer 2", 2),
+        # level 1 is not mapped: nothing to exclude, so nothing to detect
+        ("Network Delivery Engineer 1", None),
+        ("Software Engineer", None),
+        # the guard: every number here is experience, so no level is stated
+        ("Ops Engineer 2 to 5 Years", None),
+        ("Backend Engineer, 3+ years experience", None),
+        ("Python Developer (2-4 years)", None),
+        ("Software Engineer, React Native (3-5 Years)", None),
+        ("Backend Engineer 4 yrs", None),
+        ("Backend Engineer 3 y-o-e", None),
+        ("Engineer 2 / 3 / 2", None),
+        ("Engineer 3–5 years", None),           # en dash
+    ],
+)
+def test_detect_level_reads_levels_and_refuses_experience(title, expected):
+    assert detect_level(title) is expected
+
+
+def test_the_highest_stated_level_wins():
+    """"SDE II / III" is a III posting."""
+    assert detect_level("SDE II / III") == 3
+    assert level_excluded(job("SDE II / III"), PREFS)
+
+
+def test_a_level_is_only_read_from_a_role_token_or_the_end_of_the_title():
+    """A digit floating in the middle of a title is not a level."""
+    assert detect_level("Engineer, Team 4 Payments") is None   # 'team' is not a level token
+    assert detect_level("Backend Engineer 4") == 4             # trailing, and after a token
+
+
+def test_max_level_is_data_and_raising_it_lets_the_seniors_back_in():
+    """Same contract as cities and keywords: an UPDATE, not a deploy."""
+    j = job("SDE 4")
+    assert level_excluded(j, PREFS)
+    assert not level_excluded(j, Preferences(max_level=4))
+    assert is_match(j, Preferences(max_level=4))
+
+
+def test_word_exclusions_and_level_exclusion_are_independent():
+    """Either one alone is enough to drop a job; neither depends on the other."""
+    word_only = job("Senior Backend Engineer")
+    level_only = job("Backend Engineer L4")
+
+    assert excluded(word_only, PREFS) and not level_excluded(word_only, PREFS)
+    assert level_excluded(level_only, PREFS) and not excluded(level_only, PREFS)
+    assert not is_match(word_only, PREFS) and not is_match(level_only, PREFS)
+
+
+def test_missing_title_is_not_a_level_and_not_a_crash():
+    assert detect_level(None) is None
+    assert detect_level("") is None
+    assert not level_excluded({}, PREFS)
+
+
+# --- the forward-deployed-engineer keyword --------------------------------
+
+
+def test_forward_deployed_engineer_is_a_keyword():
+    """New to the set, so 'engineer' alone still does not qualify a title."""
+    assert matched_terms("Forward Deployed Engineer", PREFS.keywords) == [
+        "forward deployed engineer"
+    ]
+    assert "forward deployed engineer" in PREFS.keywords
+
+
+def test_forward_deployed_engineer_level_two_is_a_match_and_level_three_is_not():
+    """The keyword gets the title considered; the level decides whether it lands."""
+    two = job("Forward Deployed Engineer - II")
+    three = job("Forward Deployed Engineer III")
+
+    assert keyword_ok(two, PREFS) and keyword_ok(three, PREFS)
+    assert detect_level(two["title"]) == 2 and detect_level(three["title"]) == 3
+    assert is_match(two, PREFS)          # keyword + level 2 + wanted city
+    assert not is_match(three, PREFS)    # keyword, but level-excluded
+
+    assert "level 3 above max_level 2" in explain(three, PREFS).reason
+
+
+def test_senior_forward_deployed_engineer_still_loses_to_the_word_exclusion():
+    """The new keyword does not buy an exemption from 'senior'."""
+    assert not is_match(job("Senior Forward Deployed Engineer"), PREFS)
+
+
+# --- the live rows this step was written for ------------------------------
+
+
+def test_the_three_meesho_titles_drop_and_the_phonepe_razorpay_ones_remain():
+    """The exact titles from the table, asserted so the step cannot silently regress.
+
+    These are verbatim from the seeded jobs rows: the three Meesho SDE III/IV
+    postings are what motivated max_level, and the PhonePe/Razorpay matches are
+    what must not become collateral damage — including the React Native role,
+    whose "(3-5 Years)" is precisely the experience range the guard exists for.
+    """
+    dropped = [
+        "Software Development Engineer III Data",
+        "Software Development Engineer III DevOps",
+        "Software Development Engineer IV Android",
+    ]
+    for title in dropped:
+        j = job(title)
+        assert keyword_ok(j, PREFS), title       # it was a candidate...
+        assert level_excluded(j, PREFS), title   # ...and the level is why it went
+        assert not is_match(j, PREFS), title
+
+    kept = [
+        "Software Engineer, React Native (3-5 Years)",
+        "Backend Engineer",
+        "Forward Deployed Engineer - II",
+    ]
+    for title in kept:
+        assert is_match(job(title), PREFS), title

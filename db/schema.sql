@@ -71,19 +71,27 @@ CREATE TABLE IF NOT EXISTS preferences (
   cities      TEXT[] NOT NULL DEFAULT '{}',  -- city labels to include; see fetchers/normalize.city_label
   keywords    TEXT[] NOT NULL DEFAULT '{}',  -- title must match at least one
   exclusions  TEXT[] NOT NULL DEFAULT '{}',  -- title must match none
+  max_level   INT NOT NULL DEFAULT 2,        -- drop titles stating a level above this; see notify.match.detect_level
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- max_level for a database created before the column existed. The DEFAULT is
+-- what backfills the row that is already there: Postgres writes 2 into it as
+-- part of the ADD COLUMN, so the existing preferences row comes out of this at
+-- max_level = 2 without a separate UPDATE — and re-running the schema later
+-- cannot reset a value the dashboard has since edited.
+ALTER TABLE preferences ADD COLUMN IF NOT EXISTS max_level INT NOT NULL DEFAULT 2;
 
 -- Seed the row if the table is empty. ON CONFLICT DO NOTHING is what makes
 -- this safe to re-run: once the dashboard has edited the row, re-applying the
 -- schema must not quietly reset the filter to these defaults.
-INSERT INTO preferences (id, cities, keywords, exclusions, updated_at)
+INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at)
 VALUES (
   1,
   ARRAY['blr', 'pune', 'hyd', 'india-unclear'],
   ARRAY['software engineer', 'software developer', 'software development engineer',
         'sde', 'associate software engineer', 'member of technical staff', 'mts',
-        'application developer', 'programmer',
+        'application developer', 'programmer', 'forward deployed engineer',
         'backend', 'back end', 'node', 'nodejs', 'express', 'fastapi',
         'api', 'rest', 'microservices', 'distributed',
         'full stack', 'fullstack', 'frontend', 'front end',
@@ -95,6 +103,18 @@ VALUES (
   ARRAY['intern', 'senior', 'staff', 'principal', 'lead', 'manager',
         'director', 'head', 'architect', 'sales', 'recruiter', 'support',
         'qa', 'analyst'],
+  2,
   now()
 )
 ON CONFLICT (id) DO NOTHING;
+
+-- New keywords, for the row the INSERT above deliberately declined to touch.
+-- Additive and guarded by a membership test, so it is idempotent and cannot
+-- undo an edit made in the dashboard — the one thing ON CONFLICT DO NOTHING is
+-- protecting. Every keyword added here must also be added to DEFAULT_KEYWORDS
+-- in notify/match.py; the constant is a mirror of this seed, never an override.
+UPDATE preferences
+   SET keywords = keywords || ARRAY['forward deployed engineer'],
+       updated_at = now()
+ WHERE id = 1
+   AND NOT ('forward deployed engineer' = ANY (keywords));

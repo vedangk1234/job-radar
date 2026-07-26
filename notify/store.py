@@ -32,7 +32,9 @@ from .match import Preferences
 # Postgres at 65535, so chunk well below both.
 CHUNK = 400
 
-PREFERENCES_SQL = "SELECT cities, keywords, exclusions FROM preferences WHERE id = 1"
+PREFERENCES_SQL = (
+    "SELECT cities, keywords, exclusions, max_level FROM preferences WHERE id = 1"
+)
 
 # The queue, joined to its companies so the digest can group by employer without
 # a second round trip. Ordered by company then title so the rendered email is
