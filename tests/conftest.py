@@ -58,7 +58,10 @@ CREATE TABLE jobs (
   last_seen_at     TEXT NOT NULL,
   miss_count       INTEGER NOT NULL DEFAULT 0,
   status           TEXT NOT NULL DEFAULT 'open',
-  notified         INTEGER NOT NULL DEFAULT 0
+  notified         INTEGER NOT NULL DEFAULT 0,
+  min_experience   INTEGER,
+  is_pm_role       INTEGER NOT NULL DEFAULT 0,
+  desc_checked     INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -201,17 +204,25 @@ class FakeConn:
         url: str | None = None,
         status: str = "open",
         notified: bool = False,
+        min_experience: int | None = None,
+        is_pm_role: bool = False,
+        desc_checked: bool = False,
     ) -> None:
         """Insert one jobs row directly.
 
         Bypasses the crawler on purpose: these tests are about what the digest
         does with a row, not about how the row got there.
+
+        The three description-derived columns default to exactly what a crawled
+        row starts life as — unknown, not a PM role, never read — so a test that
+        says nothing about them is testing the ordinary case.
         """
         stamp = self.clock.tick()
         await self.execute(
             "INSERT INTO jobs (canonical_id, company_id, title, location, city, url, "
-            "first_seen_at, last_seen_at, status, notified) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9)",
+            "first_seen_at, last_seen_at, status, notified, "
+            "min_experience, is_pm_role, desc_checked) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12)",
             canonical_id,
             company_id,
             title,
@@ -221,6 +232,9 @@ class FakeConn:
             stamp,
             status,
             1 if notified else 0,
+            min_experience,
+            1 if is_pm_role else 0,
+            1 if desc_checked else 0,
         )
 
     async def set_preferences(
@@ -256,6 +270,28 @@ class FakeTransaction:
     async def __aexit__(self, exc_type, exc, tb) -> bool:
         self._db.execute("ROLLBACK" if exc_type else "COMMIT")
         return False
+
+
+@pytest.fixture(autouse=True)
+def no_description_fetches(monkeypatch) -> None:
+    """No test reaches a real ATS. Description fetching answers None by default.
+
+    Autouse because notify.digest.run_digest now performs a network read between
+    its two filter stages, and a suite whose behaviour depends on whether
+    boards-api.greenhouse.io is up is not a suite. None is also the honest
+    stand-in: it is exactly what a dead board returns in production, so the
+    existing digest tests keep asserting the "we could not read it, so keep the
+    job" path rather than a path invented for them.
+
+    Tests that need real detection either call the detectors directly on saved
+    text or inject their own fetcher — see tests/test_description.py.
+    """
+
+    async def offline(company, job):
+        return None
+
+    monkeypatch.setattr("notify.description.fetch_description", offline)
+    monkeypatch.setattr("notify.description._board_cache", {})
 
 
 @pytest.fixture

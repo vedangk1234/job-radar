@@ -15,23 +15,40 @@ from __future__ import annotations
 import pytest
 
 from notify.match import (
+    MAX_MIN_EXPERIENCE,
     Preferences,
     city_ok,
     compile_term,
     detect_level,
     excluded,
+    experience_excluded,
     explain,
     is_match,
     keyword_ok,
     level_excluded,
     matched_terms,
+    pm_excluded,
     select_matches,
+    title_stage_ok,
 )
 
 PREFS = Preferences()  # the seeded defaults, same values as db/schema.sql
 
 
-def job(title: str, city: str = "blr", location: str = "Bengaluru, India") -> dict:
+def job(
+    title: str,
+    city: str = "blr",
+    location: str = "Bengaluru, India",
+    *,
+    min_experience: int | None = None,
+    is_pm_role: bool = False,
+) -> dict:
+    """A candidate row. The description-derived columns default to "not looked".
+
+    NULL / FALSE is what a freshly crawled row carries, so every test that says
+    nothing about them is testing the ordinary, unenriched case — which must keep
+    behaving exactly as it did before the second stage existed.
+    """
     return {
         "canonical_id": f"greenhouse:1:{title}",
         "title": title,
@@ -39,6 +56,8 @@ def job(title: str, city: str = "blr", location: str = "Bengaluru, India") -> di
         "location": location,
         "url": "https://example.test/job",
         "company": "Testco",
+        "min_experience": min_experience,
+        "is_pm_role": is_pm_role,
     }
 
 
@@ -461,3 +480,143 @@ def test_the_three_meesho_titles_drop_and_the_phonepe_razorpay_ones_remain():
     ]
     for title in kept:
         assert is_match(job(title), PREFS), title
+
+
+# --- the description stage ------------------------------------------------
+#
+# Two more AND clauses, reading two columns that notify/description.py computed
+# from text this module never sees. The evidence is gone; the conclusion is a
+# integer and a boolean on the row, read here exactly as `city` is read.
+#
+# The asymmetry is the same as everywhere else in this file, and here it is
+# spelled into the NULL handling: min_experience IS NULL covers "never read",
+# "read and stated nothing" and "the fetch failed", and all three keep the job.
+# Only a number we are confident about, above the ceiling, drops one.
+
+
+def test_a_role_demanding_three_years_is_dropped():
+    """The headline case. 3 > 2, so this stops arriving."""
+    j = job("Full Stack Builder", min_experience=3)
+    assert title_stage_ok(j, PREFS)          # it passed every title test...
+    assert experience_excluded(j)            # ...and the description is why it went
+    assert not is_match(j, PREFS)
+
+
+def test_a_role_demanding_two_years_is_kept():
+    """The ceiling is inclusive. Two years is the job we are looking for."""
+    j = job("Backend Engineer", min_experience=2)
+    assert not experience_excluded(j)
+    assert is_match(j, PREFS)
+
+
+def test_an_unknown_minimum_is_kept():
+    """NULL is silence, and silence is never a reason to delete a job."""
+    j = job("Backend Engineer", min_experience=None)
+    assert not experience_excluded(j)
+    assert is_match(j, PREFS)
+
+
+def test_a_pm_role_is_dropped_however_the_title_reads():
+    """"Full Stack Builder" says nothing. The description said it was a PM job."""
+    j = job("Full Stack Builder", is_pm_role=True)
+    assert title_stage_ok(j, PREFS)
+    assert pm_excluded(j)
+    assert not is_match(j, PREFS)
+
+
+@pytest.mark.parametrize(
+    "min_experience,is_pm_role,expected",
+    [
+        (None, False, True),    # nothing known -> kept
+        (0, False, True),       # explicitly entry level
+        (1, False, True),
+        (2, False, True),       # the ceiling itself
+        (3, False, False),      # one year over
+        (8, False, False),
+        (None, True, False),    # PM alone is enough
+        (2, True, False),       # ...even at a welcome experience level
+        (3, True, False),       # the Razorpay case: both clauses fire
+    ],
+)
+def test_the_two_description_clauses_across_the_whole_range(
+    min_experience, is_pm_role, expected
+):
+    j = job("Backend Engineer", min_experience=min_experience, is_pm_role=is_pm_role)
+    assert is_match(j, PREFS) is expected
+
+
+def test_the_description_stage_cannot_rescue_a_title_stage_failure():
+    """The clauses only ever subtract. AND, not OR."""
+    senior = job("Senior Backend Engineer", min_experience=1)
+    berlin = job("Backend Engineer", city="other", location="Berlin", min_experience=0)
+
+    assert not is_match(senior, PREFS)
+    assert not is_match(berlin, PREFS)
+
+
+def test_title_stage_ok_is_exactly_the_old_four_test_filter():
+    """The seam the enrichment pass fetches against, unchanged by its arrival."""
+    assert title_stage_ok(job("Backend Engineer"), PREFS)
+    assert not title_stage_ok(job("Senior Backend Engineer"), PREFS)
+    assert not title_stage_ok(job("SDE-4"), PREFS)
+    assert not title_stage_ok(job("Backend Engineer", city="other"), PREFS)
+    assert not title_stage_ok(job("Customer Success Associate"), PREFS)
+
+    # ...and it is deliberately blind to the description columns, because those
+    # are what it exists to decide are worth fetching.
+    assert title_stage_ok(job("Backend Engineer", min_experience=9, is_pm_role=True), PREFS)
+
+
+def test_a_row_that_predates_the_columns_behaves_as_unknown():
+    """A dict with neither key is the old shape, and the old answer."""
+    old_row = {"title": "Backend Engineer", "city": "blr"}
+    assert not pm_excluded(old_row)
+    assert not experience_excluded(old_row)
+    assert is_match(old_row, PREFS)
+
+
+def test_an_unreadable_min_experience_is_treated_as_unknown():
+    """A garbage value keeps the job rather than raising mid-digest."""
+    assert not experience_excluded({"min_experience": "three"})
+    assert not experience_excluded({"min_experience": ""})
+
+
+def test_explain_names_the_description_clause_that_dropped_the_job():
+    assert "PM/management" in explain(job("Full Stack Builder", is_pm_role=True), PREFS).reason
+    assert f"above ceiling {MAX_MIN_EXPERIENCE}" in explain(
+        job("Full Stack Builder", min_experience=3), PREFS
+    ).reason
+    assert "matched" in explain(job("Backend Engineer", min_experience=2), PREFS).reason
+
+
+def test_pm_wins_over_experience_in_the_explanation_when_both_fire():
+    """Both are true of the Razorpay posting; the report names one, consistently."""
+    report = explain(job("Full Stack Builder", min_experience=3, is_pm_role=True), PREFS)
+    assert not report.matched
+    assert report.min_experience == 3
+    assert report.is_pm_role is True
+    assert "PM/management" in report.reason
+
+
+def test_the_two_razorpay_full_stack_builders_now_drop():
+    """The live rows this step was written for.
+
+    Both were kept by the title filter — "Full Stack Builder" hits the 'full
+    stack' keyword, states no level, sits in Bengaluru — and both are a technical
+    PM role asking for 3-6 years, which only the description says.
+    """
+    razorpay = job("Full Stack Builder", min_experience=3, is_pm_role=True)
+    assert title_stage_ok(razorpay, PREFS)
+    assert not is_match(razorpay, PREFS)
+
+
+def test_select_matches_applies_both_new_clauses():
+    jobs = [
+        job("Backend Engineer"),
+        job("Full Stack Builder", min_experience=3, is_pm_role=True),
+        job("Platform Engineer", min_experience=2),
+        job("Python Developer", min_experience=5),
+        job("React Native Engineer", is_pm_role=True),
+    ]
+    kept = select_matches(jobs, PREFS)
+    assert [j["title"] for j in kept] == ["Backend Engineer", "Platform Engineer"]

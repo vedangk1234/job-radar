@@ -11,9 +11,18 @@ ignore that too.
 
 Ordering, which is the safety property
 --------------------------------------
-    render -> send -> (Resend returns an id) -> flip notified, write the receipt
+    title filter -> read descriptions -> match -> render -> send
+                 -> (Resend returns an id) -> flip notified, write the receipt
 
-The write happens last and only on success. If Resend errors, times out, or
+The LIFECYCLE write happens last and only on success.
+
+One write does happen before the send: notify/description.py stores the three
+description-derived columns as soon as it computes them. That is not a hole in
+the rule, because those columns say nothing about whether a job was sent. They
+are facts about the posting, true whether or not an email goes out, and the only
+cost of a run that dies after writing them is that the next run does not have to
+re-read the same descriptions. No flag, no receipt — nothing that could make a
+job look delivered when it was not. If Resend errors, times out, or
 rejects the recipient, this module raises and touches no rows: every job stays
 notified=FALSE and the next run picks up exactly the same set. That is the
 crawler's Guard 1 philosophy applied to email — when the outcome is in doubt,
@@ -43,7 +52,8 @@ import httpx
 
 from db.connection import load_env
 
-from .match import Preferences, select_matches
+from .description import enrich_candidates
+from .match import Preferences, select_matches, title_stage_ok
 from .store import fetch_candidates, load_preferences, record_sent
 
 RESEND_ENDPOINT = "https://api.resend.com/emails"
@@ -316,6 +326,8 @@ class DigestRun:
 
     def __init__(self) -> None:
         self.candidates: int = 0
+        self.title_stage: int = 0
+        self.enriched: list[dict[str, Any]] = []
         self.matched: list[Mapping[str, Any]] = []
         self.emailed: int = 0
         self.subject: str | None = None
@@ -334,22 +346,32 @@ async def run_digest(
     today: date | None = None,
     tag_suffix: str = "manual",
     sender=send_via_resend,
+    describer=None,
 ) -> DigestRun:
-    """Load, match, send, record. The entire Step 4 pipeline in one call.
+    """Load, filter on titles, read descriptions, match, send, record.
 
     `to` defaults to MY_EMAIL and is checked against it either way — the
     recipient is not a knob, it is an assertion (see assert_self_send).
 
     `sender` is the injection point for tests; production uses send_via_resend.
-    Everything before and after the send is the same code either way, which is
-    what makes "a failed send writes nothing" a property the tests can prove
-    rather than one the tests assume.
+    `describer` is the same for the description fetch. Everything before and
+    after the network calls is the same code either way, which is what makes "a
+    failed send writes nothing" a property the tests can prove rather than one
+    the tests assume.
+
+    The enrichment sits between the two stages of the filter rather than at the
+    top, so a description is fetched only for a job that has already earned one.
     """
     run = DigestRun()
     prefs = await load_preferences(conn)
 
     candidates = await fetch_candidates(conn)
     run.candidates = len(candidates)
+
+    title_stage = [job for job in candidates if title_stage_ok(job, prefs)]
+    run.title_stage = len(title_stage)
+    run.enriched = await enrich_candidates(conn, title_stage, fetcher=describer)
+
     run.matched = select_matches(candidates, prefs)
 
     if not run.matched:

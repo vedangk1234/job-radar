@@ -72,6 +72,20 @@ async def queue_ids(conn) -> set[str]:
     return {r["canonical_id"] for r in rows}
 
 
+# The columns that describe where a job is in its LIFECYCLE, as opposed to what
+# the job is. These are the ones a failed send must leave exactly as it found
+# them; see test_a_failed_send_changes_absolutely_nothing.
+LIFECYCLE_COLUMNS = ("notified", "status", "first_seen_at", "last_seen_at", "miss_count")
+
+
+async def lifecycle(conn) -> dict[str, dict]:
+    """{canonical_id: the lifecycle columns only}, for before/after comparison."""
+    return {
+        cid: {col: row[col] for col in LIFECYCLE_COLUMNS}
+        for cid, row in (await conn.snapshot()).items()
+    }
+
+
 # --- selection ------------------------------------------------------------
 
 
@@ -213,20 +227,26 @@ async def test_a_second_run_after_a_successful_send_finds_nothing(digest_conn):
     ],
 )
 async def test_a_failed_send_changes_absolutely_nothing(digest_conn, failure):
-    """Guard 1, applied to email: when the outcome is in doubt, write nothing.
+    """Guard 1, applied to email: when the outcome is in doubt, write no RECEIPT.
 
     The alternative — flip first, send second — loses the job permanently if the
     send fails, and losing a job silently is the failure this table exists to
     prevent. A duplicate email is the cheaper mistake.
+
+    "Nothing" is the lifecycle, not literally every column. The run does mark
+    desc_checked on the way past, because reading a description happens before
+    the send and what it learned is true whether or not an email went out. That
+    write cannot make a job look delivered: no notified flag, no notifications
+    row, nothing that would stop the next run retrying this exact set.
     """
     await digest_conn.add_job("a", title="Backend Engineer")
     await digest_conn.add_job("b", title="Platform Engineer")
-    before = await digest_conn.snapshot()
+    before = await lifecycle(digest_conn)
 
     with pytest.raises(type(failure)):
         await run_digest(digest_conn, today=TODAY, sender=FakeResend(fail=failure))
 
-    assert await digest_conn.snapshot() == before
+    assert await lifecycle(digest_conn) == before
     assert await digest_conn.sent_log() == []
     assert await queue_ids(digest_conn) == {"a", "b"}  # both still queued for a retry
 

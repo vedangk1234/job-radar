@@ -2,9 +2,16 @@
 
 Three operations, and the split between them is the whole safety story:
 
-    load_preferences   read the filter
-    fetch_candidates   read the queue  (notified=FALSE AND status='open')
-    record_sent        write the receipt, ONLY after Resend returned an id
+    load_preferences        read the filter
+    fetch_candidates        read the queue  (notified=FALSE AND status='open')
+    save_description_facts  write what reading a description taught us
+    record_sent             write the receipt, ONLY after Resend returned an id
+
+save_description_facts is the only write in this file that is not a receipt, and
+it writes three scalars: min_experience, is_pm_role, desc_checked. It has no
+parameter for the description itself, which is the point — see
+notify/description.py. There is no column for one and no statement here that
+could fill it.
 
 record_sent is deliberately the last thing that happens in a digest run, after
 the network call has already succeeded. That ordering is the same idea as the
@@ -39,9 +46,17 @@ PREFERENCES_SQL = (
 # The queue, joined to its companies so the digest can group by employer without
 # a second round trip. Ordered by company then title so the rendered email is
 # stable: the same match set always produces the same HTML.
+#
+# c.ats / c.token / c.config come along because the second-stage filter has to
+# ask the right vendor API for this job's description, and that is the company's
+# knowledge, not the job's. The three description-derived columns come along so
+# is_match can apply them without a second query — and so a job already checked
+# is visibly already checked, which is what stops it being fetched twice.
 _CANDIDATES_TEMPLATE = """
 SELECT j.canonical_id, j.title, j.location, j.city, j.url,
-       j.first_seen_at, j.company_id, c.name AS company
+       j.first_seen_at, j.company_id,
+       j.min_experience, j.is_pm_role, j.desc_checked,
+       c.name AS company, c.ats, c.token, c.config
   FROM jobs j
   JOIN companies c ON c.id = j.company_id
  WHERE j.status = 'open'{queue_filter}
@@ -59,6 +74,21 @@ CANDIDATES_IGNORING_NOTIFIED_SQL = _CANDIDATES_TEMPLATE.format(queue_filter="")
 INSERT_NOTIFICATION_SQL = """
 INSERT INTO notifications (canonical_id, sent_at, digest)
 VALUES ($1, now(), $2)
+"""
+
+# Three scalars and a flag flip. Note what is NOT here: any column that could
+# hold the description these three facts were derived from.
+#
+# desc_checked = TRUE is set unconditionally, including when min_experience came
+# back NULL because the fetch failed. "We looked and learned nothing" is a fact
+# worth recording — the alternative is re-fetching the same dead endpoint on
+# every run for as long as the posting stays open.
+SAVE_DESCRIPTION_FACTS_SQL = """
+UPDATE jobs
+   SET min_experience = $2,
+       is_pm_role     = $3,
+       desc_checked   = TRUE
+ WHERE canonical_id = $1
 """
 
 
@@ -94,6 +124,32 @@ async def fetch_candidates(conn, *, ignore_notified: bool = False) -> list[Mappi
     """
     sql = CANDIDATES_IGNORING_NOTIFIED_SQL if ignore_notified else CANDIDATES_SQL
     return [dict(row) for row in await conn.fetch(sql)]
+
+
+async def save_description_facts(
+    conn, facts: Iterable[tuple[str, int | None, bool]]
+) -> int:
+    """Persist (canonical_id, min_experience, is_pm_role) for jobs just read.
+
+    Returns how many rows were handed to the database. Not in a transaction, and
+    it does not need to be: each row is independent, every write is idempotent,
+    and a run that dies halfway leaves the jobs it did finish correctly marked
+    rather than making the next run redo them.
+
+    This is also the one write the digest performs BEFORE a send, which is a
+    deliberate exception to this module's usual ordering. It is safe because it
+    touches nothing about the job's lifecycle: no notified flag, no receipt. A
+    send that fails afterwards leaves these rows enriched and still queued,
+    which is exactly what should happen — the facts are true regardless of
+    whether an email went out, and re-reading the descriptions to rediscover
+    them would be the only cost of not writing them here.
+    """
+    records = [(cid, years, bool(is_pm)) for cid, years, is_pm in facts]
+    if not records:
+        return 0
+
+    await conn.executemany(SAVE_DESCRIPTION_FACTS_SQL, records)
+    return len(records)
 
 
 async def record_sent(conn, canonical_ids: Iterable[str], digest: str) -> int:

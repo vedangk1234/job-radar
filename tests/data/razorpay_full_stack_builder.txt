@@ -1,0 +1,47 @@
+Razorpay is one of India’s leading full-stack financial technology companies, powering the way businesses move, manage, and grow money. Founded in 2014 by Harshil Mathur and Shashank Kumar with a simple vision - to simplify payments for Indian businesses - we’ve since grown into a fintech powerhouse driving India’s digital payment revolution.
+Razorpay powers millions of businesses with a smarter, scalable stack that goes beyond transactions to help them truly build and grow.
+From building AI-native agentic payments, to AI-assisted fraud detection and real-time risk intelligence to automated reconciliation, smart payouts, and predictive financial insights, we are embedding intelligence across our stack to make money movement faster, safer, and more efficient. In close collaboration with ecosystem partners - including banks, networks, regulators - we are pioneering industry-first solutions that are shaping the next era of fintech
+Across India, Singapore and Malaysia, our products span everything from seamless checkouts to payroll automation - powering a fintech ecosystem that’s redefining how money moves across Asia.
+Today, that ecosystem supports everyone from early-stage startups to some of India’s largest enterprises, enabling them to accept, process, and disburse payments at scale while expanding into new ways of managing money more efficiently.
+Our scale speaks volumes: Razorpay processes $180+ billion in annualized transactions, powering leading businesses like Airbnb, Facebook, WhatsApp, Airtel, CRED, BookmyShow, Zomato, Swiggy, Lenskart, Mirae Asset Capital markets, Indian Oil, National Pension Scheme - and over 100 of India’s unicorns. With strong roots in India and growing operations in Southeast Asia, we are shaping the next chapter of financial technology across the region.
+We are backed by global investors including GIC, Peak XV Partners (formerly Sequoia Capital India & SEA), Tiger Global, Ribbit Capital, Matrix Partners, MasterCard, and Salesforce Ventures, having raised over $740 million to date. Strategic acquisitions - including Ezetap (POS and offline payments), Curlec (Malaysia expansion), BillMe (digital invoicing), and POP (rewards-first UPI) - along with earlier moves in fraud prevention, payroll, and lending, have further strengthened our platform and widened our footprint across Asia.
+But what truly sets Razorpay apart is our culture. At Razorpay, ownership is our oxygen - you own what you build, with no micromanagement or red tape, just the runway to make your ideas fly. Learning is a lifestyle - if you’re curious, you’ll feel at home here. People > Pedigree - we hire for attitude, hustle, and hunger more than degrees. Transparency thrives over titles - this is where interns question CXOs and CXOs say “thank you.” Guided by our values of Customer First, Autonomy & Ownership, Agility with Integrity, Transparency, Challenging the status quo and a strong belief that Razorpay grows with Razors, you’ll be part of a 3000+ strong team building not just products, but the financial infrastructure of the future.
+Role Summary
+Most engineers, PMs & designers use AI. Few are AI-native. We're hiring the latter and looking for someone who can drive things end-to-end (discovery to conceptualisation to design to building to driving adoption) for a given canvas.Own a product or a feature end-to-end. Scope the problem, build the solution, ship it to users. Flex between frontend and backend based on what the problem needs, not your title. Work on 0→1 projects with real autonomy. Be part of Razorpay's AI transformation at scale and define the journey.
+You Know Who You Are
+You have deep expertise across the building journey:
+Customer backward thinking
+Product solutioning
+Prototyping & designing
+Building & taking products live
+Taking solutions to market, driving adoption & measuring impact
+You also exhibit good competence in the others. In past roles, you've juggled multiple hats. You've been using AI tools for over a year—Claude Code or Cursor is your default environment, not a novelty. You orchestrate agents, build with skills and MCPs. AI assistance is muscle memory. You're a polyglot—picking up new stacks fast because AI handles the ramp. Discovering & solving customer problems gives joy to you.
+You will be a good fit if you bring
+Product sense: you ask "why" before "how"
+3-6 years building software as technical PM, user focussed product engineer
+Deep expertise in one domain + breadth across others
+Should be able to read code, fix CI/CD configurations if needed
+Track record of shipping, not just building
+You will not be a good fit if you
+You need detailed specs handed to you. You prefer deep specialization over breadth. You're uncomfortable with ambiguity. You optimize for code elegance over customer outcomes. You still thrive living in a 2 week sprint.
+Razorpay believes in and follows an equal employment opportunity policy that doesn't discriminate on gender, religion, sexual orientation, colour, nationality, age, etc. We welcome interests and applications from all groups and communities across the globe.
+Follow us on LinkedIn & Twitter
+First Name
+Last Name
+Email
+Phone
+Resume/CV
+LinkedIn Profile
+Website
+Total Years of Experience
+Current Career Stage
+Gender
+Current Industry
+Current Designation
+Current Location
+Current Compensation (Please mention breakup of Fixed + Variable + ESOPs)
+Expected Comp (Please mention fixed comp below which you are not willing to consider an offer)
+Current Company
+Notice Period (in days)
+In 3–4 lines, describe how you leverage AI in your work as a Product Manager.
+Share a PDF link highlighting one area where you excel at leveraging AI as a Product Manager (e.g., case study, workflow, feature, or measurable impact).

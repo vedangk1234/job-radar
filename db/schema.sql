@@ -15,6 +15,13 @@ CREATE TABLE IF NOT EXISTS companies (
 );
 
 -- jobs: metadata only, NEVER job descriptions (keeps us on the free tier)
+--
+-- The three description-derived columns at the bottom are the ONLY trace a job
+-- description ever leaves in this database. Step 4's second-stage filter reads
+-- each candidate's full description over the network, reduces it to two facts
+-- and a checkbox, and throws the text away. No description column exists, on
+-- purpose: two integers per job cost nothing, and 10 KB of HTML per job times a
+-- growing board is how a free tier turns into a bill.
 CREATE TABLE IF NOT EXISTS jobs (
   canonical_id     TEXT PRIMARY KEY,
   company_id       INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -27,9 +34,21 @@ CREATE TABLE IF NOT EXISTS jobs (
   last_seen_at     TIMESTAMPTZ NOT NULL,
   miss_count       INT NOT NULL DEFAULT 0,
   status           TEXT NOT NULL DEFAULT 'open',   -- open | closed
-  notified         BOOLEAN NOT NULL DEFAULT FALSE
+  notified         BOOLEAN NOT NULL DEFAULT FALSE,
+  min_experience   INT,                            -- years the description demands as a MINIMUM; NULL = unknown
+  is_pm_role       BOOLEAN NOT NULL DEFAULT FALSE, -- the description frames the role as product/people management
+  desc_checked     BOOLEAN NOT NULL DEFAULT FALSE  -- the description has been read once; never read twice
 );
 CREATE INDEX IF NOT EXISTS jobs_company_status_idx ON jobs (company_id, status);
+
+-- The same three columns for a database created before they existed. Additive
+-- and idempotent, exactly like the preferences.max_level migration below: the
+-- DEFAULTs backfill every existing row (FALSE / FALSE), and min_experience is
+-- deliberately nullable because "we have not looked" and "no minimum stated"
+-- are the same answer and both mean KEEP. See notify/match.is_match.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS min_experience INT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_pm_role   BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS desc_checked BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- discovered_companies: staging area for the (later) discovery script; promoted by hand into companies
 CREATE TABLE IF NOT EXISTS discovered_companies (

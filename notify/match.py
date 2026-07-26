@@ -5,16 +5,43 @@ every job, every city, unfiltered — precisely so that the decision to notify c
 be made late, changed cheaply, and re-made against a table that never threw
 anything away. Store loosely, notify tightly; this is the tight end.
 
-The four tests are independent and combine with AND:
+The six tests are independent and combine with AND:
 
-    city_ok         the stored city label is in preferences.cities
-    keyword_ok      the title matches at least one keyword
-    excluded        the title matches at least one exclusion       (negated)
-    level_excluded  the title states a seniority level above max_level  (negated)
+    city_ok              the stored city label is in preferences.cities
+    keyword_ok           the title matches at least one keyword
+    excluded             the title matches at least one exclusion            (negated)
+    level_excluded       the title states a seniority level above max_level  (negated)
+    pm_excluded          the description frames the role as management       (negated)
+    experience_excluded  the description demands a minimum above 2 years     (negated)
 
 Nothing here reads the database, the clock, or the environment. `preferences`
 arrives as a value, `job` arrives as a mapping, and the answer is a bool — so
 the whole notify decision is testable without a connection or a network.
+
+
+Two stages, and why the seam is where it is
+-------------------------------------------
+The first four tests read the TITLE, which the crawler already stored. They are
+free, and they run over every open job.
+
+The last two read the DESCRIPTION, which costs a network request. So they read
+columns rather than text: notify/description.py fetches each candidate's
+description once, reduces it to `min_experience` and `is_pm_role`, stores those
+two facts and discards the text. By the time this module sees a job, the answer
+is already an integer and a boolean sitting on the row.
+
+`title_stage_ok` names the seam explicitly, because the enrichment pass needs to
+know which jobs are worth a request — the answer is "the ones that already pass
+every title test", which is a handful per run rather than the whole board.
+
+Both new tests inherit the same inclusion bias as everything else here:
+
+    min_experience IS NULL  ->  KEEP
+
+NULL covers three different situations — the description was never read, it was
+read and stated no requirement, or the fetch failed — and all three mean the
+same thing: we do not know, so do not delete the job. Only a number we are
+confident about, above 2, drops a posting.
 
 
 Why word boundaries, not substrings
@@ -114,6 +141,14 @@ DEFAULT_EXCLUSIONS = (
 # The highest stated seniority level that still reaches the inbox. 2 keeps
 # "Software Engineer II" and "SDE 2" and drops "SDE III" and above.
 DEFAULT_MAX_LEVEL = 2
+
+# The most years of experience a description may demand and still be worth an
+# email. A constant rather than a preferences column: max_level is about what a
+# title CALLS the role, this is about what the description ASKS FOR, and the two
+# have been wrong together often enough that conflating them would hide bugs in
+# both. If it ever needs to be editable it becomes a column, exactly like
+# max_level did.
+MAX_MIN_EXPERIENCE = 2
 
 # Inside a multi-word term, what may stand between the words.
 _INNER_SEP = r"[\s\-_/]+"
@@ -336,21 +371,81 @@ def level_excluded(job: Mapping[str, Any], prefs: Preferences) -> bool:
     return level is not None and level > prefs.max_level
 
 
-def is_match(job: Mapping[str, Any], prefs: Preferences) -> bool:
-    """city AND keyword AND NOT excluded AND NOT level_excluded.
+def title_stage_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
+    """The four title tests: city AND keyword AND NOT excluded AND NOT level.
 
-    Both exclusions are checked last and win outright: "Senior Backend Engineer,
-    Bengaluru" and "SDE III, Bengaluru" each pass the first two tests and are
-    still not jobs worth an email, because the point of the filter is a small
-    inbox, not a complete one. They are two tests rather than one because they
-    fail on different evidence — a word versus a number — and a preview run has
-    to be able to say which.
+    This is the set worth spending a network request on. notify/description.py
+    fetches a description only for jobs that get TRUE from this function, which
+    is what keeps the second stage at a handful of requests per run instead of
+    one per row on the board.
+
+    It is also, deliberately, the whole of the old is_match. Nothing about the
+    title stage changed when the description stage was added; the new tests are
+    two extra AND clauses, not a rewrite.
     """
     return (
         city_ok(job, prefs)
         and keyword_ok(job, prefs)
         and not excluded(job, prefs)
         and not level_excluded(job, prefs)
+    )
+
+
+def pm_excluded(job: Mapping[str, Any]) -> bool:
+    """The stored is_pm_role flag. Computed by notify.description.detect_pm_role.
+
+    Read, never recomputed — the same contract as `city`. The evidence was the
+    description text, which no longer exists anywhere; the conclusion is the
+    column. An unenriched row is FALSE, which means kept.
+    """
+    return bool(job.get("is_pm_role"))
+
+
+def experience_excluded(job: Mapping[str, Any]) -> bool:
+    """The description states a minimum, and that minimum is above the ceiling.
+
+    "States a minimum" is the load-bearing half, exactly as with level_excluded.
+    NULL is silence, and silence is kept: a fetch that failed, a description that
+    never mentioned years, and a description nobody has read yet are all NULL,
+    and dropping any of them would delete jobs for the reason that we did not
+    look hard enough.
+
+    A non-integer value is treated as silence too, rather than as an exception in
+    the middle of a digest run.
+    """
+    years = min_experience_of(job)
+    return years is not None and years > MAX_MIN_EXPERIENCE
+
+
+def min_experience_of(job: Mapping[str, Any]) -> int | None:
+    """The stored min_experience as an int, or None for absent/unreadable."""
+    value = job.get("min_experience")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_match(job: Mapping[str, Any], prefs: Preferences) -> bool:
+    """The title stage AND NOT a PM role AND NOT a 3+-years role.
+
+    Every exclusion is checked after the inclusions and each wins outright:
+    "Senior Backend Engineer, Bengaluru", "SDE III, Bengaluru" and Razorpay's
+    "Full Stack Builder" (a technical-PM role asking for 3-6 years) all pass the
+    tests before the one that drops them. The point of the filter is a small
+    inbox, not a complete one.
+
+    They are four separate tests rather than one because they fail on four
+    different kinds of evidence — a word in the title, a number in the title, a
+    fact from the description, another fact from the description — and a preview
+    run has to be able to say which.
+    """
+    return (
+        title_stage_ok(job, prefs)
+        and not pm_excluded(job)
+        and not experience_excluded(job)
     )
 
 
@@ -363,6 +458,8 @@ class MatchReport:
     keywords_hit: list[str] = field(default_factory=list)
     exclusions_hit: list[str] = field(default_factory=list)
     level: int | None = None
+    min_experience: int | None = None
+    is_pm_role: bool = False
     reason: str = ""
 
 
@@ -371,6 +468,8 @@ def explain(job: Mapping[str, Any], prefs: Preferences) -> MatchReport:
     keywords_hit = matched_terms(job.get("title"), prefs.keywords)
     exclusions_hit = matched_terms(job.get("title"), prefs.exclusions)
     level = detect_level(job.get("title"))
+    min_experience = min_experience_of(job)
+    is_pm = pm_excluded(job)
 
     if not city_ok(job, prefs):
         reason = f"city {job.get('city')!r} not in preferences"
@@ -380,6 +479,10 @@ def explain(job: Mapping[str, Any], prefs: Preferences) -> MatchReport:
         reason = "excluded by " + ", ".join(repr(t) for t in exclusions_hit)
     elif level is not None and level > prefs.max_level:
         reason = f"level {level} above max_level {prefs.max_level}"
+    elif is_pm:
+        reason = "description frames this as a PM/management role"
+    elif experience_excluded(job):
+        reason = f"minimum {min_experience} years above ceiling {MAX_MIN_EXPERIENCE}"
     else:
         reason = "matched " + ", ".join(repr(t) for t in keywords_hit)
 
@@ -389,6 +492,8 @@ def explain(job: Mapping[str, Any], prefs: Preferences) -> MatchReport:
         keywords_hit=keywords_hit,
         exclusions_hit=exclusions_hit,
         level=level,
+        min_experience=min_experience,
+        is_pm_role=is_pm,
         reason=reason,
     )
 
