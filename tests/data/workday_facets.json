@@ -1,0 +1,332 @@
+{
+ "nvidia": {
+  "total": 2000,
+  "jobPostings": [],
+  "facets": [
+   {
+    "facetParameter": "locationMainGroup",
+    "values": [
+     {
+      "facetParameter": "locationHierarchy2",
+      "descriptor": "Location Type",
+      "values": [
+       {
+        "descriptor": "Office",
+        "id": "0c3f5f117e9a0101f6422f0fe79d0000",
+        "count": 2526
+       },
+       {
+        "descriptor": "Remote",
+        "id": "0c3f5f117e9a0101f63dc469c3010000",
+        "count": 538
+       }
+      ]
+     },
+     {
+      "facetParameter": "locationHierarchy1",
+      "descriptor": "Locations",
+      "values": [
+       {
+        "descriptor": "India",
+        "id": "2fcb99c455831013ea52b82135ba3266",
+        "count": 212
+       },
+       {
+        "descriptor": "Armenia",
+        "id": "d21cf68980ad0128000fd2c6b107c000",
+        "count": 1
+       },
+       {
+        "descriptor": "Australia",
+        "id": "2fcb99c455831013ea528dce556b3224",
+        "count": 7
+       },
+       {
+        "descriptor": "Austria",
+        "id": "2fcb99c455831013ea5294ef910e322a",
+        "count": 1
+       },
+       {
+        "descriptor": "Belgium",
+        "id": "e5375aecc8d9103bebc47017be18ffd3",
+        "count": 1
+       },
+       {
+        "descriptor": "Brazil",
+        "id": "2fcb99c455831013ea5298c9e1f63230",
+        "count": 3
+       }
+      ]
+     },
+     {
+      "facetParameter": "locations",
+      "descriptor": "Sites",
+      "values": [
+       {
+        "descriptor": "India, Bengaluru",
+        "id": "91336993fab910af6d6fb9748af4c1df",
+        "count": 174
+       },
+       {
+        "descriptor": "India, Gurugram",
+        "id": "f28ae3c49d2601aff203e114d301695f",
+        "count": 8
+       },
+       {
+        "descriptor": "India, Hyderabad",
+        "id": "91336993fab910af6d6fb2be0974c1d0",
+        "count": 42
+       },
+       {
+        "descriptor": "India, Mumbai",
+        "id": "91336993fab910af6d6fabbb968cc1c1",
+        "count": 9
+       },
+       {
+        "descriptor": "India, Pune",
+        "id": "91336993fab910af6d6fb0782884c1cb",
+        "count": 49
+       },
+       {
+        "descriptor": "India, Remote",
+        "id": "91336993fab910af6d6fb4ee7634c1d5",
+        "count": 8
+       },
+       {
+        "descriptor": "Armenia, Yerevan",
+        "id": "c0ed409f79231000eaff724467330000",
+        "count": 1
+       },
+       {
+        "descriptor": "Australia, Remote",
+        "id": "91336993fab910af6d70362ab49cc2f7",
+        "count": 7
+       },
+       {
+        "descriptor": "Australia, Sydney",
+        "id": "0d86a8e04eda011538f0ac5d90019611",
+        "count": 1
+       },
+       {
+        "descriptor": "Austria, Remote",
+        "id": "91336993fab910af6d71181266acc35c",
+        "count": 1
+       },
+       {
+        "descriptor": "Belgium, Ghent",
+        "id": "032e9a97c43101913d2c9929040131e5",
+        "count": 1
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "adobe": {
+  "total": 839,
+  "jobPostings": [],
+  "facets": [
+   {
+    "facetParameter": "locationMainGroup",
+    "values": [
+     {
+      "facetParameter": "locationCountry",
+      "descriptor": "Country",
+      "values": [
+       {
+        "descriptor": "India",
+        "id": "c4f78be1a8f14da0ab49ce1162348a5e",
+        "count": 157
+       },
+       {
+        "descriptor": "Australia",
+        "id": "d903bb3fedad45039383f6de334ad4db",
+        "count": 4
+       },
+       {
+        "descriptor": "Austria",
+        "id": "d004c0d1a6c84511ab048669fcdf9fd7",
+        "count": 1
+       },
+       {
+        "descriptor": "Brazil",
+        "id": "1a29bb1357b240ab99a2fa755cc87c0e",
+        "count": 3
+       },
+       {
+        "descriptor": "Canada",
+        "id": "a30a87ed25634629aa6c3958aa2b91ea",
+        "count": 7
+       },
+       {
+        "descriptor": "Denmark",
+        "id": "49ab063f422741e2aef271de00efeac8",
+        "count": 3
+       }
+      ]
+     },
+     {
+      "facetParameter": "locations",
+      "descriptor": "Locations",
+      "values": [
+       {
+        "descriptor": "Amsterdam",
+        "id": "3ba4ecdf4893100bc84d49a246ad6e2d",
+        "count": 1
+       },
+       {
+        "descriptor": "Atlanta",
+        "id": "3ba4ecdf4893100bc84cd055fcbd6d6a",
+        "count": 7
+       },
+       {
+        "descriptor": "Austin",
+        "id": "c5c6352929d2108dccfb87293a8addc8",
+        "count": 28
+       },
+       {
+        "descriptor": "Bangalore",
+        "id": "3ba4ecdf4893100bc84a8e6d38d46b70",
+        "count": 96
+       },
+       {
+        "descriptor": "Barcelona",
+        "id": "3ba4ecdf4893100bc84d6ad46e566e64",
+        "count": 1
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ },
+ "salesforce": {
+  "total": 1470,
+  "jobPostings": [],
+  "facets": [
+   {
+    "facetParameter": "CF_-_REC_-_LRV_-_Job_Posting_Anchor_-_Country_from_Job_Posting_Location_Extended",
+    "descriptor": "Country",
+    "values": [
+     {
+      "descriptor": "India",
+      "id": "c4f78be1a8f14da0ab49ce1162348a5e",
+      "count": 120
+     },
+     {
+      "descriptor": "United States of America",
+      "id": "bc33aa3152ec42d4995f4791a106ed09",
+      "count": 536
+     },
+     {
+      "descriptor": "Ireland",
+      "id": "04a05835925f45b3a59406a2a6b72c8a",
+      "count": 116
+     },
+     {
+      "descriptor": "Japan",
+      "id": "8b705da2becf43cfaccc091da0988ab2",
+      "count": 98
+     },
+     {
+      "descriptor": "Mexico",
+      "id": "e2adff9272454660ac4fdb56fc70bb51",
+      "count": 81
+     },
+     {
+      "descriptor": "United Kingdom",
+      "id": "29247e57dbaf46fb855b224e03170bc7",
+      "count": 63
+     }
+    ]
+   },
+   {
+    "facetParameter": "locationMainGroup",
+    "values": [
+     {
+      "facetParameter": "locations",
+      "descriptor": "Locations",
+      "values": [
+       {
+        "descriptor": "India - Bangalore",
+        "id": "1038e944b1101012453f5b10dc370000",
+        "count": 87
+       },
+       {
+        "descriptor": "India - Bangalore - Remote",
+        "id": "1038e944b1101012453a0fff44b80000",
+        "count": 1
+       },
+       {
+        "descriptor": "India - Gurgaon",
+        "id": "1038e944b11010124539eb4950f50000",
+        "count": 20
+       },
+       {
+        "descriptor": "India - Hyderabad",
+        "id": "8ef61f627eb01012453a9ce004d20000",
+        "count": 68
+       },
+       {
+        "descriptor": "India - Mumbai",
+        "id": "2c2bf80869591012453ab08dba870000",
+        "count": 21
+       },
+       {
+        "descriptor": "India - Mumbai - Remote",
+        "id": "1038e944b1101012453d94a739200000",
+        "count": 2
+       },
+       {
+        "descriptor": "Indiana - Chicago Metro - Remote",
+        "id": "1038e944b1101012453bf5e8f2000000",
+        "count": 3
+       },
+       {
+        "descriptor": "Indiana - Indianapolis",
+        "id": "1038e944b11010124540a2b92d130000",
+        "count": 109
+       },
+       {
+        "descriptor": "Indiana - Remote",
+        "id": "1038e944b1101012453eb26824540000",
+        "count": 17
+       },
+       {
+        "descriptor": "India - Pune",
+        "id": "1038e944b1101012453acb52a3810000",
+        "count": 11
+       },
+       {
+        "descriptor": "Alabama - Remote",
+        "id": "1038e944b1101012453f52aa5ae90000",
+        "count": 5
+       },
+       {
+        "descriptor": "Alaska - Remote",
+        "id": "1038e944b1101012453ad88c6c8c0000",
+        "count": 2
+       },
+       {
+        "descriptor": "Argentina - Buenos Aires",
+        "id": "8ef61f627eb01012453af18f1a980000",
+        "count": 19
+       },
+       {
+        "descriptor": "Argentina - Remote",
+        "id": "8ef61f627eb01012453aa67dbdfe0000",
+        "count": 1
+       },
+       {
+        "descriptor": "Arizona - Phoenix",
+        "id": "1038e944b1101012453c315325f80000",
+        "count": 1
+       }
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}

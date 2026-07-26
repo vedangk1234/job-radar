@@ -39,6 +39,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from fetchers.normalize import canonical_id
 from fetchers.tier1 import TIER1_ATS, fetch as fetch_tier1
 from fetchers.tier3 import jsonld_jobpostings, sitemap_jobs
+from fetchers.workday import fetch_workday
 
 from .diff import diff_snapshots
 from .store import bump_missing, close_stale, load_company_ids, mark_new, upsert_seen
@@ -93,10 +94,24 @@ async def _sitemap(token: str, config: dict) -> list[dict]:
     return await sitemap_jobs(config.get("url") or token)
 
 
+async def _workday(token: str, config: dict) -> list[dict]:
+    """Tier 2. The token is the tenant; host/site come from the company config.
+
+    Unlike every other entry here this one fetches a DELIBERATELY PARTIAL board
+    (India only, filtered at source), which is what companies.india_scoped
+    records. The guards above are unaffected: a partial-by-design board is still
+    consistently the same size crawl to crawl, so Guard 2 compares like with
+    like. And fetch_workday RAISES rather than returning [] on a dead tenant,
+    which is precisely what Guard 1 needs to leave the table alone.
+    """
+    return await fetch_workday(token, config)
+
+
 # ats -> (token, config) -> normalised jobs. Every entry takes the same two
 # arguments so the loop never special-cases a vendor.
 FETCHERS: dict[str, Callable[[str, dict], Awaitable[list[dict]]]] = {
     **{ats: _tier1(ats) for ats in TIER1_ATS},
+    "workday": _workday,
     "custom_jsonld": _jsonld,
     "custom_sitemap": _sitemap,
 }

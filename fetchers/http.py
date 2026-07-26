@@ -78,11 +78,17 @@ def _sem() -> asyncio.Semaphore:
     return _semaphore
 
 
-async def _pace(host: str) -> None:
-    """Hold the per-host lock until at least PER_HOST_DELAY has passed."""
+async def _pace(host: str, min_delay: float | None = None) -> None:
+    """Hold the per-host lock until at least the required delay has passed.
+
+    `min_delay` lets a block-sensitive vendor ask for a gentler pace than the
+    global default (Workday does). It can only ever slow us down: the effective
+    delay is the larger of the two, so a caller cannot use this to go faster.
+    """
+    delay = max(PER_HOST_DELAY, min_delay or 0.0)
     lock = _host_locks.setdefault(host, asyncio.Lock())
     async with lock:
-        wait = PER_HOST_DELAY - (time.monotonic() - _host_last_hit.get(host, 0.0))
+        wait = delay - (time.monotonic() - _host_last_hit.get(host, 0.0))
         if wait > 0:
             await asyncio.sleep(wait)
         _host_last_hit[host] = time.monotonic()
@@ -110,11 +116,21 @@ class Fetched:
     error: str | None = None
 
 
-async def polite_get(url: str, *, want_json: bool = True, params: dict | None = None) -> Fetched:
-    """GET `url` under the global semaphore and the per-host pace, with retries.
+async def _request(
+    method: str,
+    url: str,
+    *,
+    want_json: bool,
+    params: dict | None = None,
+    json_body: Any = None,
+    headers: dict | None = None,
+    min_delay: float | None = None,
+) -> Fetched:
+    """One paced, retried request. The shared body of polite_get/polite_post.
 
-    Never raises for network or HTTP reasons — a fetcher that hits a dead board
-    should degrade to "no jobs", not take the whole crawl down.
+    Never raises for network or HTTP reasons — the outcome is always a Fetched.
+    Callers that need a failure to be loud (Workday) read `ok`/`status` and
+    raise for themselves; callers that should degrade quietly return [].
     """
     host = urlsplit(url).netloc.lower()
     client = get_client()
@@ -127,9 +143,11 @@ async def polite_get(url: str, *, want_json: bool = True, params: dict | None = 
             await asyncio.sleep(delay)
 
         async with _sem():
-            await _pace(host)
+            await _pace(host, min_delay)
             try:
-                resp = await client.get(url, params=params)
+                resp = await client.request(
+                    method, url, params=params, json=json_body, headers=headers
+                )
             except httpx.HTTPError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 last_status = None
@@ -156,3 +174,42 @@ async def polite_get(url: str, *, want_json: bool = True, params: dict | None = 
             return Fetched(url, 200, False, text=resp.text, error="response was not JSON")
 
     return Fetched(url, last_status, False, error=last_error or "exhausted retries")
+
+
+async def polite_get(
+    url: str,
+    *,
+    want_json: bool = True,
+    params: dict | None = None,
+    min_delay: float | None = None,
+) -> Fetched:
+    """GET `url` under the global semaphore and the per-host pace, with retries.
+
+    Never raises for network or HTTP reasons — a fetcher that hits a dead board
+    should degrade to "no jobs", not take the whole crawl down.
+    """
+    return await _request("GET", url, want_json=want_json, params=params, min_delay=min_delay)
+
+
+async def polite_post(
+    url: str,
+    *,
+    json_body: Any = None,
+    headers: dict | None = None,
+    want_json: bool = True,
+    min_delay: float | None = None,
+) -> Fetched:
+    """POST a JSON body under the same semaphore, pace and retry rules as GET.
+
+    Exists for Workday, whose board is a paginated POST search endpoint rather
+    than a GET feed. Retrying a POST is safe here only because this particular
+    POST is a read: it is a search query, not a mutation.
+    """
+    return await _request(
+        "POST",
+        url,
+        want_json=want_json,
+        json_body=json_body,
+        headers=headers,
+        min_delay=min_delay,
+    )
