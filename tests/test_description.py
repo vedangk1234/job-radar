@@ -26,17 +26,21 @@ written. Both failures are silent, and both delete real jobs from the inbox.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from notify.description import (
+    config_of,
     description_from_row,
     detect_min_experience,
     detect_pm_role,
     enrich_candidates,
     html_to_text,
     native_id_from,
+    needs_description_check,
+    workday_external_path,
 )
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -144,6 +148,38 @@ def test_the_real_phonepe_requirement_lines(line, expected):
     filter exists to prevent, one level down.
     """
     assert detect_min_experience(line) is expected
+
+
+def test_the_real_adobe_requirement_line():
+    """Verbatim from the Adobe posting this whole change exists for.
+
+    "Computer Scientist - Fullstack" passes every TITLE test — Bengaluru, the
+    keyword "full stack", no excluded word, no level notation — and its
+    description asks for four to six years. Until enrichment moved into the
+    crawl, nothing had ever read that line: Adobe is a Workday tenant, and
+    fetch_description had no Workday route, so the job sat on Home as
+    "experience unknown, therefore keep".
+
+    The detector was never the problem, which is exactly why this assertion is
+    here. It pins the answer at 4 so that a future tightening of
+    detect_min_experience cannot quietly reopen the hole from the other end.
+
+    Note the EN DASH. Workday's HTML carries U+2013, not a hyphen, and _RANGE_RE
+    accepts both — a version that only knew about "-" would read this line as
+    stating nothing at all.
+    """
+    assert detect_min_experience("4–6 years of experience in software engineering.") == 4
+
+
+def test_the_adobe_line_is_read_the_same_way_out_of_its_markup():
+    """The same line as it actually arrives: wrapped in Workday's tag soup.
+
+    html_to_text runs before the detector in production, so the string the
+    detector sees is this one, and a `</span><span>` between the number and the
+    word "years" is the sort of thing that silently defeats a pattern.
+    """
+    raw = "<div><p><b><span>4–6 years</span></b><span> of experience in software engineering.</span></p></div>"
+    assert detect_min_experience(html_to_text(raw)) == 4
 
 
 def test_a_range_may_be_anchored_anywhere_on_its_own_line_but_not_across_one():
@@ -356,9 +392,73 @@ def test_workable_and_recruitee_read_requirements_as_well_as_description():
 
 
 def test_an_ats_with_no_verified_description_route_returns_none():
-    """Unknown is a real answer, and it means keep the job."""
+    """Unknown is a real answer, and it means keep the job.
+
+    Workday is absent from this list on purpose now — it has a route of its own
+    (the CXS detail endpoint), which does not go through description_from_row
+    because it is a separate request rather than a row of the board payload.
+    """
     assert description_from_row("smartrecruiters", {"name": "Engineer"}) is None
-    assert description_from_row("workday", {}) is None
+    assert description_from_row("custom_sitemap", {}) is None
+
+
+# --- workday: the public URL back to the CXS detail path ------------------
+
+
+@pytest.mark.parametrize(
+    "site,url,expected",
+    [
+        # The real Adobe posting, verbatim from the jobs table.
+        (
+            "external_experienced",
+            "https://adobe.wd5.myworkdayjobs.com/en-US/external_experienced"
+            "/job/Bangalore/Computer-Scientist---Fullstack_R168336",
+            "/job/Bangalore/Computer-Scientist---Fullstack_R168336",
+        ),
+        # No language segment: build_url omits it when lang is empty, and the
+        # site is still the landmark.
+        (
+            "nvidiaexternalcareersite",
+            "https://nvidia.wd5.myworkdayjobs.com/nvidiaexternalcareersite/job/India/Engineer_JR1",
+            "/job/India/Engineer_JR1",
+        ),
+        ("site", "https://h/en-US/other/job/X_1", None),   # site not in the path
+        ("", "https://h/en-US/site/job/X_1", None),        # no site configured
+        ("site", None, None),                              # no URL stored
+    ],
+)
+def test_the_workday_detail_path_is_recovered_from_the_stored_url(site, url, expected):
+    """The externalPath is not a column; it is the tail of the URL we did store.
+
+    Getting this wrong is silent in the worst way — a malformed path answers
+    404, which reads as "no description", which reads as "unknown", which means
+    the job is kept. So a mistake here does not break anything visibly; it just
+    quietly stops the filter working, which is the failure this test exists for.
+    """
+    assert workday_external_path(site, url) == expected
+
+
+def test_the_language_segment_is_dropped_and_not_merely_assumed_absent():
+    """`/en-US` is in the public URL and must NOT be in the CXS one.
+
+    The detail route lives under /wday/cxs/{tenant}/{site} with no language
+    segment at all. Passing it through answers 404.
+    """
+    path = workday_external_path(
+        "external_experienced",
+        "https://adobe.wd5.myworkdayjobs.com/en-US/external_experienced/job/Bangalore/X_R1",
+    )
+    assert path is not None
+    assert "en-US" not in path
+
+
+def test_company_config_is_read_whether_it_arrives_as_jsonb_or_as_text():
+    """asyncpg hands JSONB back as a string; Workday's request needs the dict."""
+    assert config_of({"config": {"host": "h", "site": "s"}}) == {"host": "h", "site": "s"}
+    assert config_of({"config": '{"host": "h", "site": "s"}'}) == {"host": "h", "site": "s"}
+    assert config_of({"config": None}) == {}
+    assert config_of({"config": "not json"}) == {}
+    assert config_of({}) == {}
 
 
 # --- canonical_id -> the vendor's own id ----------------------------------
@@ -433,7 +533,11 @@ async def test_a_failed_fetch_marks_the_job_checked_and_keeps_it(digest_conn):
     """None means "we do not know", which means keep — and means do not re-ask.
 
     Re-fetching a dead endpoint every thirty minutes for as long as the posting
-    stays open is not persistence, so desc_checked is set either way.
+    stays open is not persistence, so desc_checked is set either way. What IS
+    recorded is that the check failed, which is the difference between "read,
+    nothing disqualifying" and "never actually read" — the two states the old
+    single flag conflated, and the conflation that let a 4-6-years Adobe posting
+    be treated as clean forever.
     """
     await digest_conn.add_job("dead-board", title="Backend Engineer")
 
@@ -447,7 +551,108 @@ async def test_a_failed_fetch_marks_the_job_checked_and_keeps_it(digest_conn):
     assert row["min_experience"] is None
     assert row["is_pm_role"] == 0
     assert row["desc_checked"] == 1
+    assert row["desc_fetch_failed"] == 1
+    assert row["desc_checked_at"] is not None
     assert report[0]["fetched"] is False
+
+
+async def test_a_successful_read_is_recorded_as_not_having_failed(digest_conn):
+    """The flag is about the FETCH, not about what the description said.
+
+    A description that states no experience requirement is a successful read
+    that learned a real thing — "this posting does not ask" — and must never be
+    retried. Only a fetch that came back empty-handed is worth another request.
+    """
+    await digest_conn.add_job("quiet-jd", title="Backend Engineer")
+
+    from notify.store import fetch_candidates
+
+    await enrich_candidates(
+        digest_conn,
+        await fetch_candidates(digest_conn),
+        fetcher=await stub_fetcher({"quiet-jd": NO_EXPERIENCE_JD}),
+    )
+
+    row = (await digest_conn.snapshot())["quiet-jd"]
+    assert row["min_experience"] is None      # nothing stated -> unknown -> kept
+    assert row["desc_checked"] == 1
+    assert row["desc_fetch_failed"] == 0      # ... but we did read it
+
+
+# --- when a description is worth asking about again -----------------------
+
+NEVER = None
+YESTERDAY = "2026-07-25T12:00:00+00:00"
+LAST_HOUR = "2026-07-26T11:00:00+00:00"
+CUTOFF = datetime(2026, 7, 26, tzinfo=timezone.utc)  # 24h before "now"
+
+
+@pytest.mark.parametrize(
+    "job,expected,why",
+    [
+        ({}, True, "never read"),
+        ({"desc_checked": True}, False, "read cleanly, and the text is gone"),
+        ({"desc_checked": True, "min_experience": 4}, False, "read, and it answered"),
+        (
+            {"desc_checked": True, "desc_fetch_failed": True, "desc_checked_at": LAST_HOUR},
+            False,
+            "failed an hour ago — a board down at 11am is usually still down at noon",
+        ),
+        (
+            {"desc_checked": True, "desc_fetch_failed": True, "desc_checked_at": YESTERDAY},
+            True,
+            "failed yesterday — worth one more question",
+        ),
+        (
+            {"desc_checked": True, "desc_fetch_failed": True, "desc_checked_at": NEVER},
+            True,
+            "failed before there was a column to record when",
+        ),
+    ],
+)
+def test_the_retry_gate_asks_again_only_for_a_stale_failure(job, expected, why):
+    assert needs_description_check(job, retry_before=CUTOFF) is expected, why
+
+
+def test_without_a_cutoff_a_failure_is_never_retried():
+    """The digest path passes no cutoff, so its behaviour is exactly as before.
+
+    Retrying is the crawl's job — it runs every thirty minutes and can afford to
+    be patient about it. A digest run should read what it has and send.
+    """
+    failed_long_ago = {"desc_checked": True, "desc_fetch_failed": True, "desc_checked_at": YESTERDAY}
+    assert needs_description_check(failed_long_ago) is False
+    assert needs_description_check({}) is True  # ... but an unread job is still read
+
+
+async def test_a_stale_failure_is_re_read_and_can_change_the_verdict(digest_conn):
+    """The point of the retry: yesterday's silence is not evidence.
+
+    The Workday rows in the live table were in exactly this state — marked
+    checked, nothing learned, never to be asked again — until a route existed to
+    ask with.
+    """
+    await digest_conn.add_job(
+        "was-dead",
+        title="Backend Engineer",
+        desc_checked=True,
+        desc_fetch_failed=True,
+        desc_checked_at=YESTERDAY,
+    )
+
+    from notify.store import fetch_candidates
+
+    candidates = await fetch_candidates(digest_conn)
+    await enrich_candidates(
+        digest_conn,
+        candidates,
+        fetcher=await stub_fetcher({"was-dead": "4–6 years of experience in software engineering."}),
+        retry_before=CUTOFF,
+    )
+
+    row = (await digest_conn.snapshot())["was-dead"]
+    assert row["min_experience"] == 4
+    assert row["desc_fetch_failed"] == 0
 
 
 async def test_an_already_checked_job_is_never_fetched_again(digest_conn):

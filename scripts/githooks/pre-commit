@@ -1,0 +1,145 @@
+#!/bin/sh
+#
+# job-radar secret guard. Refuses a commit that would put a credential into
+# git history.
+#
+# Enable it once per clone:
+#
+#     git config core.hooksPath scripts/githooks
+#
+# A hook is not a security boundary — anyone can pass --no-verify, and it only
+# ever sees what is STAGED. It exists because the alternative is trusting
+# yourself to remember, and the failure mode is a rotated Supabase password and
+# a rewritten history. Treat a block as correct until proven otherwise.
+#
+# Two checks, both against staged content rather than the working tree, so a
+# `git add -p` of a hunk containing a key is caught even when the file on disk
+# looks clean:
+#
+#   1. FORBIDDEN NAMES — files that exist only to hold real values.
+#   2. SECRET SHAPES   — literals shaped like credentials, wherever they
+#                        appear, including inside a file with an innocent name.
+#
+# Check 2 reads the whole staged blob, not just the added lines. Slightly
+# stricter than it needs to be, and deliberately: a secret three commits old
+# that you are now editing around is still a secret.
+#
+# Self-reference note: this script names the shapes it hunts for, so two
+# patterns are assembled from halves ('GOCSP''X-') the shell rejoins at
+# runtime. Without that the guard would refuse to let itself be committed.
+# There is deliberately no path allowlist — an allowlisted path is exactly
+# where a secret would learn to hide.
+
+set -u
+
+# --- 1. names that never belong in a commit -------------------------------
+# Exact basename matches. `.env.example` and `.env.local.example` are NOT on
+# this list on purpose: they are the committed templates, and they hold
+# placeholders.
+FORBIDDEN_NAMES='.env .env.local scratch.md'
+
+# --- 2. shapes that look like credentials ---------------------------------
+# Assembled so the guard does not match its own source. See note above.
+GOOGLE_SECRET='GOCSP''X-'
+SUPABASE_REF='qfbegmglknn''oyfrgoouc'
+
+# The \b matters for the same reason it matters in notify/match.py, and it was
+# missing for the same reason: `re_` is not a rare string, it is the middle of
+# every snake_case identifier containing the letters. Without a left boundary
+# this fired on `test_..._are_never_read_as_experience` and on four other test
+# names in tests/test_description.py, which meant the guard blocked every commit
+# that touched that file — and a guard that cries wolf is a guard that teaches
+# you to reach for --no-verify. A real key is preceded by a quote, an `=` or a
+# space, all of which are boundaries; none of them is a letter.
+RESEND_KEY='\bre_[A-Za-z0-9_-]{20,}'
+
+# `sk-` has to look like a key rather than merely be a substring: those three
+# characters also sit inside task-, risk- and disk-, and a guard that cries
+# wolf on ordinary prose is a guard that gets bypassed with --no-verify. The
+# \b kills those; the length floor is one a real OpenAI/Anthropic key clears.
+OPENAI_KEY='\bsk-[A-Za-z0-9_-]{16,}'
+
+# A postgres URL carrying a real password. The `[^<>@[:space:]]` password class
+# is what lets .env.example and dashboard/.env.local.example through: their
+# password field is the literal placeholder <password>, and a placeholder is
+# not a leak.
+PG_URL_WITH_PASSWORD='postgres(ql)?://[^:@/[:space:]]+:[^<>@[:space:]]{3,}@'
+
+PATTERNS="$RESEND_KEY|$GOOGLE_SECRET|$OPENAI_KEY|$SUPABASE_REF|$PG_URL_WITH_PASSWORD"
+
+RED='' BOLD='' DIM='' RESET=''
+if [ -t 2 ]; then
+	RED=$(printf '\033[31m')
+	BOLD=$(printf '\033[1m')
+	DIM=$(printf '\033[2m')
+	RESET=$(printf '\033[0m')
+fi
+
+blocked=0
+header() {
+	if [ "$blocked" -eq 0 ]; then
+		printf '\n%s%sCOMMIT BLOCKED%s — the secret guard found something.\n\n' \
+			"$RED" "$BOLD" "$RESET" >&2
+	fi
+	blocked=1
+}
+
+# No HEAD yet (the very first commit)? Diff against the empty tree.
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+	against=HEAD
+else
+	against=$(git hash-object -t tree /dev/null)
+fi
+
+list=$(git diff --cached --name-only --diff-filter=ACMR "$against")
+[ -z "$list" ] && exit 0
+
+# A here-doc rather than a pipe: a `while read` on the right of a pipe runs in
+# a subshell, and every `blocked=1` it sets would be discarded on exit.
+while IFS= read -r path; do
+	[ -z "$path" ] && continue
+
+	base=${path##*/}
+	for name in $FORBIDDEN_NAMES; do
+		if [ "$base" = "$name" ]; then
+			header
+			printf '  %sforbidden filename%s  %s\n' "$BOLD" "$RESET" "$path" >&2
+			printf '    %sthis file holds real values; only its .example twin is committed%s\n\n' \
+				"$DIM" "$RESET" >&2
+		fi
+	done
+
+	# -I skips binaries; -n gives the line so the report is actionable. `git
+	# show :path` reads the staged blob, which is the thing about to be
+	# committed — not the working copy, which may differ.
+	hits=$(git show ":$path" 2>/dev/null | grep -I -n -E "$PATTERNS" 2>/dev/null | head -5)
+	if [ -n "$hits" ]; then
+		header
+		printf '  %ssecret-shaped literal%s  %s\n' "$BOLD" "$RESET" "$path" >&2
+		# Print only the line NUMBER and the matched shape, never the
+		# surrounding line: echoing the key into a terminal scrollback (and
+		# from there into a bug report) is the leak this hook exists to stop.
+		printf '%s\n' "$hits" | while IFS= read -r hit; do
+			printf '    line %s%s\n' "${hit%%:*}" "$RESET" >&2
+		done
+		printf '    %smatched one of: re_… | %s… | sk-… | supabase project ref | postgres:// with password%s\n\n' \
+			"$DIM" "$GOOGLE_SECRET" "$RESET" >&2
+	fi
+done <<EOF
+$list
+EOF
+
+if [ "$blocked" -ne 0 ]; then
+	cat >&2 <<'MSG'
+Fix it, do not bypass it:
+  - move the value into .env (gitignored) and reference it by name
+  - `git restore --staged <path>` to unstage the file
+  - if the value already reached a remote, it is burned: rotate it first
+
+--no-verify exists and this hook cannot stop you. It can only make sure
+the decision is one you made on purpose.
+MSG
+	exit 1
+fi
+
+exit 0

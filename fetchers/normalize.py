@@ -67,16 +67,93 @@ def canonical_id(
 # ambiguous we bias toward india-unclear rather than other, because
 # india-unclear stays in the funnel and other drops out of it.
 
+# SHORT CODES, AND WHY THEY ARE SAFE HERE
+# ---------------------------------------
+# Some boards write the airport/office code instead of the city name. LSEG's
+# Workday tenant is one: every Bangalore posting on it reads
+# "IND-BLR-Divyasree Technopolis", which named none of the markers below and so
+# labelled `other` — a label the default preferences drop. 135 real Bengaluru
+# jobs were being discarded by a string format.
+#
+# Codes are ADDITIVE; every full name above still matches, and precedence is
+# unchanged (blr -> hyd -> pune), so a string carrying both a code and a name
+# resolves exactly as it did before.
+#
+# The reason a three-letter token is not reckless here is `norm`: it has already
+# turned every hyphen, comma, slash and parenthesis into a space by the time
+# _hit sees the string, and _hit anchors single tokens with \b. So "blr" matches
+# the BLR in "IND-BLR-Divyasree" and the one in "Global BLR team", and cannot
+# match inside a longer word.
+#
+# Two candidates were deliberately REJECTED rather than added:
+#
+#   "beng"  is not a code any board uses for Bangalore. In the data it occurs
+#           only inside "Bengaluru", which the full name already catches, so it
+#           buys no recall — while "Beng" standing alone is likelier to be
+#           short for Bengal. Adding it would be pure false-positive surface.
+#
+#   "pun"   bare is an English word, and PUN is not Pune's IATA code — PNQ is.
+#           It appears in this database only inside "Pune"/"PUNE", again already
+#           matched by name. So the bare token is out and only the
+#           country-prefixed forms survive, which cannot be a sentence's "pun".
+
+# MISSPELLINGS, AND WHY THERE IS ONLY ONE
+# ---------------------------------------
+# A recruiter typing the city name wrong drops the posting into `other` just as
+# thoroughly as an office code does. PhonePe's Greenhouse board writes
+# "Banglore" — no second 'a' — on every posting from that office.
+#
+# Which spellings are worth a marker is a question about the data, not about
+# English, so it was answered from the data: scripts/survey_locations.py prints
+# every distinct location string in the `other` and `india-unclear` buckets, and
+# a fuzzy pass compared every 4+ letter token in all 1197 stored rows against
+# "bangalore", "bengaluru", "hyderabad", "pune" and "secunderabad". Across the
+# whole table exactly ONE near-miss exists:
+#
+#     banglore   3 rows, PhonePe, all labelled `other`
+#
+# The fuzzy pass's only other hit was "bengal", inside "Kolkata, West Bengal" —
+# a real state, correctly not Bangalore, and the same string names Bangalore
+# elsewhere so the row already labelled blr. Hyderabad and Pune are spelled
+# correctly on every board in this database; neither gets a misspelling marker,
+# because a marker that matches nothing is false-positive surface bought with no
+# recall. That is the same test "beng" and bare "pun" failed above.
+#
+# Deliberately NOT added, having been checked against the data first:
+#
+#   "bangalore urban"   the district form. Already matches — it CONTAINS the
+#   "bengaluru urban"   standalone token "bangalore"/"bengaluru", and _hit
+#                       anchors on word boundaries rather than on the whole
+#                       string, so the existing full names cover both. A
+#                       separate marker would be dead weight.
+#
+#   "bengalore"         plausible spellings that appear nowhere in this database
+#   "bangalor"          or in tests/data. Cheap to add and impossible to justify:
+#   "banaglore"         the rule for adding a marker here is that a real posting
+#                       was lost to it, and no posting was.
+#
+# What makes "banglore" safe is what makes "blr" safe: it is not a word, not a
+# prefix of one, and \b-anchored. "Bangkok" — 3 LSEG rows, the nearest thing in
+# the data to a trap — shares only "bang" and cannot match.
 _CITY_MARKERS: dict[str, tuple[str, ...]] = {
     "blr": (
         "bangalore", "bengaluru", "bangaluru", "whitefield", "electronic city",
         "electronics city", "koramangala", "bellandur", "marathahalli",
+        "blr",
+        "banglore",
     ),
     "hyd": (
         "hyderabad", "secunderabad", "gachibowli", "hitec city", "hitech city",
         "hi tech city", "madhapur",
+        "hyd",
     ),
-    "pune": ("pune", "puné", "hinjewadi", "hinjawadi", "kharadi", "magarpatta", "baner"),
+    "pune": (
+        "pune", "puné", "hinjewadi", "hinjawadi", "kharadi", "magarpatta", "baner",
+        # PNQ is unambiguous on its own. "pun" is only trusted behind a country
+        # prefix — and only because _hit anchors the whole phrase, so "ind pun"
+        # matches "IND-PUN-Kharadi" and NOT "IND-Punjab-Mohali".
+        "pnq", "ind pun", "in pun",
+    ),
 }
 
 # Elsewhere in India: real postings, just not our three cities.
@@ -125,16 +202,20 @@ _VAGUE_MARKERS = (
 
 
 def _hit(haystack: str, marker: str) -> bool:
-    """Word-boundary match for single tokens, substring for phrases.
+    """Word-boundary match, for single tokens and for phrases alike.
 
-    Boundaries stop "baner" from matching inside "banerjee" and " us " from
-    matching inside "australia"; phrases like "electronic city" are safe as
-    plain substrings.
+    Boundaries stop "baner" from matching inside "banerjee" and "us" from
+    matching inside "australia".
+
+    Phrases are anchored too, which they did not used to be. A plain substring
+    test is fine for "electronic city" but not for the country-prefixed codes:
+    "ind pun" as a substring fires inside "IND-Punjab-Mohali", labelling a
+    Punjab posting as Pune. Anchoring the whole phrase means the trailing \\b
+    has to fall after "pun", which it does in "IND-PUN-Kharadi" and does not in
+    "IND-Punjab". Verified to change no label across every location string in
+    the database and in tests/data — it only closes the hole.
     """
-    marker = marker.strip()
-    if " " in marker:
-        return marker in haystack
-    return re.search(rf"\b{re.escape(marker)}\b", haystack) is not None
+    return re.search(rf"\b{re.escape(marker.strip())}\b", haystack) is not None
 
 
 def city_label(location_str: Any) -> str:

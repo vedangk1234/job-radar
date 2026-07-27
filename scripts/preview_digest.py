@@ -17,10 +17,17 @@ documented command reads honestly.
 It is NOT, however, read-only any more, and pretending otherwise would be the
 kind of stale docstring that gets believed. The second-stage filter reads each
 title-stage candidate's description over the network and stores what it learned
-in three columns — min_experience, is_pm_role, desc_checked. That write is why a
-description is only ever fetched once, and it is the same write the real send
-path performs. It touches nothing about a job's lifecycle: no notified flag, no
-notifications row, and never the description text itself.
+in five columns — min_experience, is_pm_role, desc_checked, desc_fetch_failed,
+desc_checked_at. That write is why a description is only ever fetched once, and
+it is the same write the real send path performs. It touches nothing about a
+job's lifecycle: no notified flag, no notifications row, and never the
+description text itself.
+
+In practice it now reads almost nothing, and that is the point: crawler/enrich.py
+runs the same pass during every crawl, so by the time a job reaches a digest its
+description has already been read. This path stays because a preview must not
+depend on a crawl having happened first, and because a job whose description was
+unavailable yesterday deserves the same answer here as anywhere else.
 
 --no-descriptions skips the enrichment entirely for a genuinely read-only,
 no-network run against whatever facts are already stored.

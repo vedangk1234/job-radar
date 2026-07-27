@@ -59,9 +59,11 @@ CREATE TABLE jobs (
   miss_count       INTEGER NOT NULL DEFAULT 0,
   status           TEXT NOT NULL DEFAULT 'open',
   notified         INTEGER NOT NULL DEFAULT 0,
-  min_experience   INTEGER,
-  is_pm_role       INTEGER NOT NULL DEFAULT 0,
-  desc_checked     INTEGER NOT NULL DEFAULT 0
+  min_experience    INTEGER,
+  is_pm_role        INTEGER NOT NULL DEFAULT 0,
+  desc_checked      INTEGER NOT NULL DEFAULT 0,
+  desc_fetch_failed INTEGER NOT NULL DEFAULT 0,
+  desc_checked_at   TEXT
 )
 """
 
@@ -207,22 +209,25 @@ class FakeConn:
         min_experience: int | None = None,
         is_pm_role: bool = False,
         desc_checked: bool = False,
+        desc_fetch_failed: bool = False,
+        desc_checked_at: str | None = None,
     ) -> None:
         """Insert one jobs row directly.
 
         Bypasses the crawler on purpose: these tests are about what the digest
         does with a row, not about how the row got there.
 
-        The three description-derived columns default to exactly what a crawled
-        row starts life as — unknown, not a PM role, never read — so a test that
-        says nothing about them is testing the ordinary case.
+        The five description-derived columns default to exactly what a crawled
+        row starts life as — unknown, not a PM role, never read, never failed,
+        never looked at — so a test that says nothing about them is testing the
+        ordinary case.
         """
         stamp = self.clock.tick()
         await self.execute(
             "INSERT INTO jobs (canonical_id, company_id, title, location, city, url, "
             "first_seen_at, last_seen_at, status, notified, "
-            "min_experience, is_pm_role, desc_checked) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12)",
+            "min_experience, is_pm_role, desc_checked, desc_fetch_failed, desc_checked_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12, $13, $14)",
             canonical_id,
             company_id,
             title,
@@ -235,6 +240,8 @@ class FakeConn:
             min_experience,
             1 if is_pm_role else 0,
             1 if desc_checked else 0,
+            1 if desc_fetch_failed else 0,
+            desc_checked_at,
         )
 
     async def set_preferences(

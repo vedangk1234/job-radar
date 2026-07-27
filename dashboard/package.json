@@ -1,0 +1,32 @@
+{
+  "name": "job-radar-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "db:check": "tsx scripts/db-check.ts",
+    "parity": "tsx scripts/parity-check.ts",
+    "match-parity": "tsx scripts/match-parity.ts",
+    "mint-session": "tsx scripts/mint-session.ts",
+    "config-roundtrip": "tsx scripts/config-roundtrip.ts"
+  },
+  "dependencies": {
+    "next": "^15.5.22",
+    "next-auth": "^5.0.0-beta.32",
+    "postgres": "3.4.5",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.7",
+    "@types/react": "19.0.7",
+    "@types/react-dom": "19.0.3",
+    "dotenv": "16.4.7",
+    "tsx": "4.19.2",
+    "typescript": "5.7.3"
+  }
+}

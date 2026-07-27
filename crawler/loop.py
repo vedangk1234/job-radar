@@ -51,6 +51,53 @@ from .store import bump_missing, close_stale, load_company_ids, mark_new, upsert
 PARTIAL_FETCH_FLOOR = 0.5
 
 
+# A JSON string nested inside a JSON string inside a JSON string is not a thing
+# any writer produces on purpose; two decodes is already one more than should
+# ever be needed. The cap is here so a hostile or corrupt value cannot spin.
+_MAX_CONFIG_DECODES = 4
+
+
+def _as_config(value: Any, *, who: str) -> dict[str, Any]:
+    """Coerce a stored `config` to a dict, or to `{}` loudly.
+
+    Every caller of Company.config treats it as a mapping — `config.get("host")`
+    in fetchers/workday.py is the load-bearing one — so this is the single place
+    that gets to decide the type, and it is not allowed to return anything else.
+
+    Decoding LOOPS rather than running once. asyncpg hands jsonb back as text,
+    so one decode is normal; a second decode being necessary means the value was
+    written double-encoded, which is exactly what the dashboard's add-by-URL
+    route used to do (see upsertCompany in dashboard/src/lib/companies.ts). Such
+    a row decoded once yields a `str`, and `str.get` does not exist — the crawl
+    died in the fetcher and Guard 1 recorded it as an unreachable board rather
+    than as the data bug it was. Unpicking the extra layer here keeps a repaired
+    crawler working against a database that has not been repaired yet, and the
+    warning is what stops that silently becoming the normal state of affairs.
+    """
+    for depth in range(_MAX_CONFIG_DECODES):
+        if isinstance(value, dict):
+            if depth > 1:
+                print(
+                    f"  ! {who}: config was stored {depth}x-encoded — decoded it, but the row "
+                    f"itself is still wrong. Repair it with scripts/repair_config.py.",
+                    file=sys.stderr,
+                )
+            return value
+        if not isinstance(value, (str, bytes)):
+            break
+        try:
+            value = json.loads(value)
+        except ValueError:
+            break
+
+    print(
+        f"  ! {who}: config is {type(value).__name__}, not an object — using {{}} instead. "
+        f"A workday row without host/site cannot be crawled; repair it.",
+        file=sys.stderr,
+    )
+    return {}
+
+
 @dataclass
 class Company:
     """The fields of a companies row that a crawl actually needs."""
@@ -63,20 +110,20 @@ class Company:
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "Company":
-        """Build from an asyncpg record. JSONB may arrive as text — decode it."""
-        config = row["config"]
-        if isinstance(config, str):
-            try:
-                config = json.loads(config)
-            except ValueError:
-                config = {}
-        return cls(
+        """Build from an asyncpg record. JSONB arrives as text — decode it.
+
+        The returned `config` is a dict. Always, for every input — that is the
+        postcondition the rest of the crawler is written against.
+        """
+        company = cls(
             id=row["id"],
             name=row["name"],
             ats=row["ats"],
             token=row["token"],
-            config=config or {},
+            config=_as_config(row["config"], who=f"{row['name']} (id={row['id']})"),
         )
+        assert isinstance(company.config, dict)  # the postcondition, in one line
+        return company
 
 
 def _tier1(ats: str) -> Callable[[str, dict], Awaitable[list[dict]]]:

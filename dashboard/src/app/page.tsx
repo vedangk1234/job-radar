@@ -1,0 +1,54 @@
+import { byMatchesThenName, listCompanyCards } from "@/lib/companies";
+import { requirePage } from "@/lib/guard";
+import { CompanyList } from "@/components/CompanyList";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+/**
+ * Home — "what fits me right now", by company.
+ *
+ * The "For you" count is not a dashboard opinion about a job. It is
+ * notify/match.is_match, ported to lib/match.ts and parity-checked against the
+ * Python over the live table by `npm run match-parity`. A job counted here is a
+ * job the digest would email; if the two ever disagree, that check fails before
+ * anyone has to notice a number looked wrong.
+ *
+ * One thing is deliberately NOT part of the filter: `notified`. A job that was
+ * already emailed still fits, so it still shows. Home is not the outbox.
+ *
+ * Rendered on the server — the page is already behind the session gate, so
+ * reading the database directly beats making the browser round-trip through an
+ * API route that would re-check the same session.
+ */
+export default async function HomePage() {
+  await requirePage();
+
+  const companies = (await listCompanyCards()).sort(byMatchesThenName);
+  const matches = companies.reduce((n, c) => n + c.match_jobs, 0);
+  const withMatches = companies.filter((c) => c.match_jobs > 0).length;
+  const openJobs = companies.reduce((n, c) => n + c.open_jobs, 0);
+
+  return (
+    <>
+      <h1>Home</h1>
+      <p className="lede">
+        <strong>{matches}</strong> of {openJobs} open jobs fit your preferences, across{" "}
+        {withMatches} of {companies.length} companies. Same filter as the digest email — city,
+        keyword, no excluded word, no level above your ceiling, and nothing the description
+        marked as a PM role or a 3+-years role. Expand a company to see its matches; the title
+        is the apply link.
+      </p>
+      <CompanyList initial={companies} mode="matches" />
+      <p className="muted small" style={{ marginTop: 14 }}>
+        A job already sent in a digest still appears here — this is what fits, not what is
+        unsent. Descriptions are read during the crawl, so a matching job&rsquo;s experience
+        requirement is known within one crawl of it appearing.{" "}
+        <code>desc not checked</code> marks the few minutes before that happens, and{" "}
+        <code>desc unavailable</code> marks a board that would not give us the description at
+        all — both mean the job passed on its title alone and could still turn out to want six
+        years.
+      </p>
+    </>
+  );
+}

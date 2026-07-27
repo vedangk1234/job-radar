@@ -16,12 +16,12 @@ CREATE TABLE IF NOT EXISTS companies (
 
 -- jobs: metadata only, NEVER job descriptions (keeps us on the free tier)
 --
--- The three description-derived columns at the bottom are the ONLY trace a job
--- description ever leaves in this database. Step 4's second-stage filter reads
--- each candidate's full description over the network, reduces it to two facts
--- and a checkbox, and throws the text away. No description column exists, on
--- purpose: two integers per job cost nothing, and 10 KB of HTML per job times a
--- growing board is how a free tier turns into a bill.
+-- The five description-derived columns at the bottom are the ONLY trace a job
+-- description ever leaves in this database. The second-stage filter reads each
+-- candidate's full description over the network, reduces it to two facts and
+-- three bookkeeping flags, and throws the text away. No description column
+-- exists, on purpose: two integers per job cost nothing, and 10 KB of HTML per
+-- job times a growing board is how a free tier turns into a bill.
 CREATE TABLE IF NOT EXISTS jobs (
   canonical_id     TEXT PRIMARY KEY,
   company_id       INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -35,13 +35,15 @@ CREATE TABLE IF NOT EXISTS jobs (
   miss_count       INT NOT NULL DEFAULT 0,
   status           TEXT NOT NULL DEFAULT 'open',   -- open | closed
   notified         BOOLEAN NOT NULL DEFAULT FALSE,
-  min_experience   INT,                            -- years the description demands as a MINIMUM; NULL = unknown
-  is_pm_role       BOOLEAN NOT NULL DEFAULT FALSE, -- the description frames the role as product/people management
-  desc_checked     BOOLEAN NOT NULL DEFAULT FALSE  -- the description has been read once; never read twice
+  min_experience    INT,                            -- years the description demands as a MINIMUM; NULL = unknown
+  is_pm_role        BOOLEAN NOT NULL DEFAULT FALSE, -- the description frames the role as product/people management
+  desc_checked      BOOLEAN NOT NULL DEFAULT FALSE, -- the description has been read once; never read twice
+  desc_fetch_failed BOOLEAN NOT NULL DEFAULT FALSE, -- we looked and could not read it; retried occasionally
+  desc_checked_at   TIMESTAMPTZ                     -- when we last looked; NULL = never (or before this column)
 );
 CREATE INDEX IF NOT EXISTS jobs_company_status_idx ON jobs (company_id, status);
 
--- The same three columns for a database created before they existed. Additive
+-- The same five columns for a database created before they existed. Additive
 -- and idempotent, exactly like the preferences.max_level migration below: the
 -- DEFAULTs backfill every existing row (FALSE / FALSE), and min_experience is
 -- deliberately nullable because "we have not looked" and "no minimum stated"
@@ -49,6 +51,39 @@ CREATE INDEX IF NOT EXISTS jobs_company_status_idx ON jobs (company_id, status);
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS min_experience INT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_pm_role   BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS desc_checked BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- desc_fetch_failed separates the two things desc_checked used to conflate.
+--
+-- "We read the description and it stated no minimum" and "we asked and got
+-- nothing back" both leave min_experience NULL, and both mean KEEP — but only
+-- the second one is worth ever asking about again. Without this flag the only
+-- way to retry a transient failure is to re-read every description forever, so
+-- the previous code never retried at all and a board with no description route
+-- was silently marked "checked, nothing found" for good.
+--
+-- desc_checked_at is what makes the retry occasional rather than constant: a
+-- failed row is re-asked once a day, not once a crawl. See crawler/enrich.py.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS desc_fetch_failed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS desc_checked_at   TIMESTAMPTZ;
+
+-- One-time re-open of the rows the OLD enrichment marked checked without ever
+-- reading anything. Before crawler/enrich.py existed, enrichment ran only in
+-- the digest path, and notify/description.fetch_description had no route for
+-- Workday at all — so every Workday candidate was fetched as None, learned
+-- nothing, and was still stamped desc_checked = TRUE and never asked again.
+-- That is exactly the hole this migration accompanies: an Adobe posting
+-- demanding 4-6 years sat on Home as "experience unknown, therefore keep".
+--
+-- The predicate is "checked, but the check produced no fact", which is the only
+-- state where a re-read can change an answer. `desc_checked_at IS NULL` is what
+-- makes it run exactly once: every row the new pass touches gets a timestamp,
+-- so re-applying this schema afterwards cannot undo a fresh check.
+UPDATE jobs
+   SET desc_checked = FALSE
+ WHERE desc_checked = TRUE
+   AND desc_checked_at IS NULL
+   AND min_experience IS NULL
+   AND is_pm_role = FALSE;
 
 -- discovered_companies: staging area for the (later) discovery script; promoted by hand into companies
 CREATE TABLE IF NOT EXISTS discovered_companies (

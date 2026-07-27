@@ -1,17 +1,24 @@
 """Everything the digest touches in the database, and nothing that decides anything.
 
-Three operations, and the split between them is the whole safety story:
+Five operations, and the split between them is the whole safety story:
 
-    load_preferences        read the filter
-    fetch_candidates        read the queue  (notified=FALSE AND status='open')
-    save_description_facts  write what reading a description taught us
-    record_sent             write the receipt, ONLY after Resend returned an id
+    load_preferences           read the filter
+    fetch_candidates           read the queue  (notified=FALSE AND status='open')
+    fetch_enrichment_targets   read the jobs whose description is unread
+    save_description_facts     write what reading a description taught us
+    record_sent                write the receipt, ONLY after Resend returned an id
 
 save_description_facts is the only write in this file that is not a receipt, and
-it writes three scalars: min_experience, is_pm_role, desc_checked. It has no
-parameter for the description itself, which is the point — see
-notify/description.py. There is no column for one and no statement here that
-could fill it.
+it writes four scalars and a clock reading: min_experience, is_pm_role,
+desc_checked, desc_fetch_failed, desc_checked_at. It has no parameter for the
+description itself, which is the point — see notify/description.py. There is no
+column for one and no statement here that could fill it.
+
+fetch_enrichment_targets is read by the CRAWLER (crawler/enrich.py) rather than
+by the digest, which is why it does not filter on `notified`: the dashboard
+shows every open job that fits, emailed or not, so every open job that fits has
+to have had its description read. That difference is the whole bug fix; the
+digest's own queue is still fetch_candidates and still ends at notified=FALSE.
 
 record_sent is deliberately the last thing that happens in a digest run, after
 the network call has already succeeded. That ordering is the same idea as the
@@ -31,6 +38,7 @@ rather than a mock of them.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Iterable, Mapping, Sequence
 
 from .match import Preferences
@@ -56,6 +64,7 @@ _CANDIDATES_TEMPLATE = """
 SELECT j.canonical_id, j.title, j.location, j.city, j.url,
        j.first_seen_at, j.company_id,
        j.min_experience, j.is_pm_role, j.desc_checked,
+       j.desc_fetch_failed, j.desc_checked_at,
        c.name AS company, c.ats, c.token, c.config
   FROM jobs j
   JOIN companies c ON c.id = j.company_id
@@ -71,23 +80,57 @@ CANDIDATES_SQL = _CANDIDATES_TEMPLATE.format(queue_filter="\n   AND j.notified =
 # rows are all already notified=TRUE.
 CANDIDATES_IGNORING_NOTIFIED_SQL = _CANDIDATES_TEMPLATE.format(queue_filter="")
 
+# Every open job whose description we have not successfully read — the crawl's
+# enrichment queue, before the title filter narrows it in Python.
+#
+# The `$1` cutoff is passed in rather than written as `now() - interval '24
+# hours'` for the reason the module docstring gives about SQL portability: an
+# interval literal is Postgres-only, and this statement has to run verbatim
+# against the SQLite shim in tests. It is compared only against rows that
+# already failed, so a clean read is never re-asked whatever the cutoff says.
+#
+# The status = 'open' clause is not an optimisation. A closed job is not worth a
+# request, and enriching one would be the crawler spending politeness on a
+# posting nobody can apply to.
+ENRICHMENT_TARGETS_SQL = """
+SELECT j.canonical_id, j.title, j.location, j.city, j.url,
+       j.first_seen_at, j.company_id, j.notified,
+       j.min_experience, j.is_pm_role, j.desc_checked,
+       j.desc_fetch_failed, j.desc_checked_at,
+       c.name AS company, c.ats, c.token, c.config
+  FROM jobs j
+  JOIN companies c ON c.id = j.company_id
+ WHERE j.status = 'open'
+   AND (j.desc_checked = FALSE
+        OR (j.desc_fetch_failed = TRUE
+            AND (j.desc_checked_at IS NULL OR j.desc_checked_at < $1)))
+ ORDER BY c.name, j.title
+"""
+
 INSERT_NOTIFICATION_SQL = """
 INSERT INTO notifications (canonical_id, sent_at, digest)
 VALUES ($1, now(), $2)
 """
 
-# Three scalars and a flag flip. Note what is NOT here: any column that could
-# hold the description these three facts were derived from.
+# Two facts and three pieces of bookkeeping. Note what is NOT here: any column
+# that could hold the description those facts were derived from — and, just as
+# deliberately, any column about the job's LIFECYCLE. There is no notified here,
+# no status, no miss_count, no first_seen_at. That is what makes it safe to run
+# this in the middle of a crawl: enrichment cannot re-open a closed job, cannot
+# un-send a sent one, and cannot make a job look newly seen.
 #
 # desc_checked = TRUE is set unconditionally, including when min_experience came
 # back NULL because the fetch failed. "We looked and learned nothing" is a fact
 # worth recording — the alternative is re-fetching the same dead endpoint on
-# every run for as long as the posting stays open.
+# every run for as long as the posting stays open. desc_fetch_failed is what
+# keeps that from meaning "and never look again": see ENRICHMENT_TARGETS_SQL.
 SAVE_DESCRIPTION_FACTS_SQL = """
 UPDATE jobs
-   SET min_experience = $2,
-       is_pm_role     = $3,
-       desc_checked   = TRUE
+   SET min_experience    = $2,
+       is_pm_role        = $3,
+       desc_checked      = TRUE,
+       desc_fetch_failed = $4,
+       desc_checked_at   = now()
  WHERE canonical_id = $1
 """
 
@@ -126,10 +169,27 @@ async def fetch_candidates(conn, *, ignore_notified: bool = False) -> list[Mappi
     return [dict(row) for row in await conn.fetch(sql)]
 
 
+async def fetch_enrichment_targets(
+    conn, retry_before: datetime
+) -> list[Mapping[str, Any]]:
+    """Open jobs whose description has not been read successfully — and only those.
+
+    `retry_before` is the cutoff for asking a FAILED read again; a row that was
+    read cleanly is never returned whatever it is set to. The caller then
+    narrows this to the title-stage matches, which is where the cost argument
+    lives: this returns the unchecked half of the board, and only a few dozen of
+    those are worth a request.
+
+    Deliberately not filtered on `notified`. See the module docstring.
+    """
+    rows = await conn.fetch(ENRICHMENT_TARGETS_SQL, retry_before)
+    return [dict(row) for row in rows]
+
+
 async def save_description_facts(
-    conn, facts: Iterable[tuple[str, int | None, bool]]
+    conn, facts: Iterable[tuple[str, int | None, bool, bool]]
 ) -> int:
-    """Persist (canonical_id, min_experience, is_pm_role) for jobs just read.
+    """Persist (canonical_id, min_experience, is_pm_role, fetch_failed) per job.
 
     Returns how many rows were handed to the database. Not in a transaction, and
     it does not need to be: each row is independent, every write is idempotent,
@@ -144,7 +204,9 @@ async def save_description_facts(
     whether an email went out, and re-reading the descriptions to rediscover
     them would be the only cost of not writing them here.
     """
-    records = [(cid, years, bool(is_pm)) for cid, years, is_pm in facts]
+    records = [
+        (cid, years, bool(is_pm), bool(failed)) for cid, years, is_pm, failed in facts
+    ]
     if not records:
         return 0
 

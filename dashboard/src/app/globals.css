@@ -1,0 +1,684 @@
+/*
+ * One stylesheet, no framework. The dashboard has four screens and one user;
+ * a build-time CSS toolchain would be more machinery than the thing it styles.
+ *
+ * Two rules shape everything below:
+ *   - it has to be readable on a phone, because that is where a job alert gets
+ *     opened. Tables become stacked cards under 640px rather than scrolling
+ *     sideways.
+ *   - it follows the system colour scheme. Both palettes are real; neither is
+ *     an afterthought inverted from the other.
+ */
+
+:root {
+  --bg: #fbfbfa;
+  --panel: #ffffff;
+  --panel-2: #f4f4f2;
+  --line: #e2e1dd;
+  --ink: #1a1a19;
+  --ink-2: #55534e;
+  --ink-3: #8b8880;
+  --accent: #2f6f4f;
+  --accent-ink: #ffffff;
+  --danger: #a8342a;
+  --warn: #8a5a12;
+  --radius: 10px;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15161a;
+    --panel: #1c1e23;
+    --panel-2: #23262c;
+    --line: #33373f;
+    --ink: #eceef2;
+    --ink-2: #a8adb8;
+    --ink-3: #767c88;
+    --accent: #5cbb8b;
+    --accent-ink: #10241a;
+    --danger: #f08a80;
+    --warn: #e0b061;
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+a {
+  color: var(--accent);
+}
+
+code,
+.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+/* --- shell --------------------------------------------------------------- */
+
+.shell {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 0 16px 64px;
+}
+
+header.top {
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+header.top .shell {
+  padding-block: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  align-items: baseline;
+}
+
+.brand {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin-right: auto;
+}
+
+.brand span {
+  color: var(--ink-3);
+  font-weight: 400;
+  font-size: 13px;
+  margin-left: 8px;
+}
+
+nav.tabs {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+nav.tabs a {
+  padding: 6px 11px;
+  border-radius: 8px;
+  text-decoration: none;
+  color: var(--ink-2);
+  font-size: 14px;
+}
+
+nav.tabs a:hover {
+  background: var(--panel-2);
+  color: var(--ink);
+}
+
+nav.tabs a[aria-current="page"] {
+  background: var(--panel-2);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.whoami {
+  font-size: 12.5px;
+  color: var(--ink-3);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+h1 {
+  font-size: 21px;
+  letter-spacing: -0.015em;
+  margin: 28px 0 4px;
+}
+
+.lede {
+  color: var(--ink-2);
+  margin: 0 0 20px;
+  max-width: 66ch;
+  font-size: 14px;
+}
+
+/* --- panels -------------------------------------------------------------- */
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.panel h2 {
+  font-size: 15px;
+  margin: 0 0 4px;
+}
+
+.panel .hint {
+  color: var(--ink-3);
+  font-size: 13px;
+  margin: 0 0 14px;
+}
+
+/* --- table / cards ------------------------------------------------------- */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+th {
+  text-align: left;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  font-weight: 600;
+  padding: 0 10px 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+td {
+  padding: 10px 10px 10px 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+tr:last-child td {
+  border-bottom: none;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 640px) {
+  table,
+  tbody,
+  tr,
+  td {
+    display: block;
+    width: 100%;
+  }
+
+  thead {
+    display: none;
+  }
+
+  tr {
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    background: var(--panel);
+  }
+
+  td {
+    border: none;
+    padding: 3px 0;
+    display: flex;
+    gap: 12px;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+
+  td::before {
+    content: attr(data-label);
+    color: var(--ink-3);
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    flex: none;
+  }
+
+  td[data-label=""]::before {
+    display: none;
+  }
+}
+
+/* --- company list (Home and Jobs are the same list) ----------------------- */
+
+/*
+ * The collapsible row. Both screens render this; only what is inside an open
+ * row differs. The header is a flex line that wraps rather than a table, because
+ * the counts have to stay next to the name on a phone — the one place this gets
+ * read — and a table would either scroll sideways or restack into a card that
+ * loses the association between a number and its label.
+ */
+
+ul.companies,
+ul.jobs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+li.company {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-bottom: 8px;
+}
+
+li.company.untracked {
+  background: none;
+  border-style: dashed;
+}
+
+/* Dimmed, not hidden: an untracked company is still a company you own. */
+li.company.untracked .company-head {
+  opacity: 0.62;
+}
+
+.company-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 4px 12px 4px 4px;
+}
+
+button.disclose {
+  flex: 1 1 260px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  padding: 9px 10px;
+  color: inherit;
+}
+
+button.disclose:hover {
+  background: var(--panel-2);
+  border-color: transparent;
+}
+
+.chev {
+  color: var(--ink-3);
+  font-size: 11px;
+  width: 10px;
+  flex: none;
+}
+
+.company-name {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-weight: 600;
+}
+
+.counts {
+  margin-left: auto;
+  display: flex;
+  gap: 18px;
+  align-items: baseline;
+  flex: none;
+}
+
+.count {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.count strong {
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--ink-3);
+}
+
+/* The only number on the page worth a colour: how many jobs actually fit. */
+.count.hit strong {
+  color: var(--accent);
+}
+
+.company-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+
+/* Low prominence on purpose — a hand-tag that is edited once and read rarely. */
+.cat select {
+  width: auto;
+  padding: 2px 6px;
+  font-size: 12px;
+  color: var(--ink-3);
+  background: none;
+  border-color: transparent;
+}
+
+.cat select:hover,
+.cat select:focus {
+  border-color: var(--line);
+  color: var(--ink-2);
+}
+
+.untracked-note {
+  margin: -2px 14px 10px;
+  max-width: 70ch;
+}
+
+.company-body {
+  border-top: 1px solid var(--line);
+  padding: 10px 14px 12px;
+}
+
+.company-body[hidden] {
+  display: none;
+}
+
+li.job {
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+li.job:last-child {
+  border-bottom: none;
+}
+
+li.job > a {
+  font-weight: 550;
+}
+
+.job-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  margin-top: 2px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  .counts {
+    margin-left: 0;
+    width: 100%;
+    gap: 14px;
+  }
+
+  button.disclose {
+    flex-wrap: wrap;
+  }
+}
+
+/* --- bits ---------------------------------------------------------------- */
+
+.tag {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--ink-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.tag.on {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+  color: var(--accent);
+}
+
+.tag.off {
+  color: var(--ink-3);
+}
+
+button,
+.btn {
+  font: inherit;
+  font-size: 14px;
+  padding: 7px 13px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--ink);
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+
+button:hover:not(:disabled),
+.btn:hover {
+  border-color: var(--ink-3);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+button.small {
+  padding: 4px 10px;
+  font-size: 13px;
+}
+
+button.linky {
+  background: none;
+  border: none;
+  color: var(--danger);
+  padding: 0 0 0 6px;
+  font-size: 13px;
+  line-height: 1;
+}
+
+input[type="text"],
+input[type="url"],
+input[type="number"],
+select {
+  font: inherit;
+  font-size: 14px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink);
+  width: 100%;
+  max-width: 100%;
+}
+
+label.field {
+  display: block;
+  margin-bottom: 12px;
+}
+
+label.field > span {
+  display: block;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  margin-bottom: 5px;
+  font-weight: 550;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+
+.row > * {
+  flex: 1 1 180px;
+}
+
+.row > .fixed {
+  flex: 0 0 auto;
+}
+
+/* toggle */
+
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.switch input {
+  appearance: none;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  position: relative;
+  cursor: pointer;
+  margin: 0;
+  flex: none;
+  transition: background 0.12s;
+}
+
+.switch input::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--ink-3);
+  transition: transform 0.12s, background 0.12s;
+}
+
+.switch input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.switch input:checked::after {
+  transform: translateX(16px);
+  background: var(--accent-ink);
+}
+
+.switch input:disabled {
+  opacity: 0.5;
+}
+
+/* chips (keywords, cities, exclusions) */
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding: 0;
+  list-style: none;
+}
+
+.chips li {
+  display: inline-flex;
+  align-items: center;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 3px 5px 3px 11px;
+  font-size: 13px;
+}
+
+.chips.empty-note {
+  color: var(--ink-3);
+  font-size: 13px;
+}
+
+/* messages */
+
+.msg {
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13.5px;
+  margin: 12px 0 0;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  white-space: pre-wrap;
+}
+
+.msg.ok {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.msg.bad {
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
+}
+
+.msg.warn {
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+
+.muted {
+  color: var(--ink-3);
+}
+
+.small {
+  font-size: 13px;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+hr.rule {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 20px 0;
+}
+
+/* sign-in */
+
+.signin {
+  min-height: 78vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.signin .card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 28px;
+  max-width: 420px;
+  width: 100%;
+}
+
+.signin h1 {
+  margin: 0 0 6px;
+  font-size: 20px;
+}

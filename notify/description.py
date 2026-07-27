@@ -11,7 +11,7 @@ So this module reads descriptions — and stores none of them.
     fetch_description   network -> plain text, in memory only
     detect_min_experience   text -> int | None
     detect_pm_role          text -> bool
-    enrich_candidates       the three columns, written once per job, forever
+    enrich_candidates       the five columns, written once per job, forever
 
 Why never store the text
 ------------------------
@@ -22,18 +22,41 @@ tens of megabytes of text nobody will ever read again, to answer two questions
 that fit in an integer and a boolean.
 
 The discipline is therefore structural rather than a habit: there is no column
-to write text into, `enrich_candidates` hands the store three scalars, and the
+to write text into, `enrich_candidates` hands the store five scalars, and the
 string goes out of scope when the loop iteration ends.
 
-Why this runs in the digest path and not in the crawl loop
-----------------------------------------------------------
-The crawler sees the whole board — every city, every title, thousands of rows.
-Fetching a description for each would be a second network request per job per
-crawl, forever, to answer a question that only matters for the handful that
-already passed the title filter. So enrichment runs where the small set is:
-after city + keyword + exclusions + level have already cut the board down to a
-few candidates, and only for those whose desc_checked is still FALSE. Once read,
-a description is never read again.
+Where this runs, and why it moved
+---------------------------------
+It runs in the CRAWL now (crawler/enrich.py), and it used to run only in the
+digest path. The move closes a real hole rather than tidying anything.
+
+The old arrangement enriched a job the first time a DIGEST considered it, which
+meant the first time it was in the notified=FALSE queue. The dashboard's Home
+screen is not that queue — it shows everything open that fits, emailed or not —
+so a job the crawler had just discovered appeared on Home with desc_checked =
+FALSE, no experience known, and therefore kept. A real Adobe posting
+("Computer Scientist - Fullstack", 4-6 years) sat there for exactly that reason.
+
+What did NOT change is the cost argument. The crawler sees the whole board —
+788 open rows here — and fetching a description for each would be a second
+request per job per crawl forever. So the pass still runs only over jobs that
+already passed every TITLE test (36 of those 788), and still reads each one's
+description exactly once. What changed is when that once happens: within one
+crawl cycle of the job appearing, rather than whenever an email next goes out.
+
+Why a failed fetch is now a different fact from a quiet one
+-----------------------------------------------------------
+`desc_checked` used to carry two meanings: "we read it and it said nothing
+disqualifying" and "we asked and got nothing back". Both leave min_experience
+NULL and both mean KEEP, so conflating them looked harmless — and it was not.
+It meant a board with no description route was marked read-and-clean the first
+time it was considered, permanently, on evidence that was never gathered. Every
+Workday candidate in the table was in that state, because until this change
+fetch_description had no Workday route at all.
+
+So a failure now sets desc_fetch_failed as well, which lets crawler/enrich.py
+ask again tomorrow (desc_checked_at is the "not more often than that" half)
+without re-reading the descriptions that were genuinely read.
 
 The inclusion bias, again
 -------------------------
@@ -51,10 +74,14 @@ deletes a real job from the inbox and nothing downstream reports it. So:
 from __future__ import annotations
 
 import html
+import json
 import re
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
+from urllib.parse import urlsplit
 
 from fetchers.http import polite_get
+from fetchers.workday import PER_HOST_DELAY as WORKDAY_DELAY
 
 from .store import save_description_facts
 
@@ -312,6 +339,20 @@ def detect_pm_role(title: Any, text: Any) -> bool:
 
 GREENHOUSE_JOB_URL = "https://boards-api.greenhouse.io/v1/boards/{token}/jobs/{job_id}"
 
+# Workday's own detail route, and the reason this file exists in its current
+# form. The board search endpoint the crawler pages through carries no
+# description at all — but the CXS host serves one per posting at the same path
+# the public job URL uses, minus the language segment:
+#
+#   public : https://{host}/en-US/{site}/job/Bangalore/Computer-Scientist_R168336
+#   detail : https://{host}/wday/cxs/{tenant}/{site}/job/Bangalore/Computer-Scientist_R168336
+#            -> {"jobPostingInfo": {"jobDescription": "<div>…", …}, …}
+#
+# Verified live against the Adobe tenant: 200, ~14 KB of HTML, and the line
+# "4-6 years of experience in software engineering." inside it — which is the
+# posting this whole change exists to stop showing.
+WORKDAY_JOB_URL = "https://{host}/wday/cxs/{tenant}/{site}{path}"
+
 # The list endpoints, identical to the ones in fetchers/tier1.py. Duplicated as
 # a mapping rather than imported because tier1 returns NORMALISED rows, which by
 # design have already dropped the description; what is needed here is the raw row.
@@ -452,6 +493,59 @@ async def _greenhouse_description(token: str, job_id: str) -> str | None:
     return _joined(parts)
 
 
+def workday_external_path(site: str, url: Any) -> str | None:
+    """`https://h/en-US/mysite/job/Bangalore/X_R1` -> `/job/Bangalore/X_R1`.
+
+    Recovered from the stored URL rather than kept in a column, because the URL
+    is what fetchers.workday.build_url already assembled out of the externalPath
+    and it is the only piece of the posting we persist. The site segment is the
+    landmark: everything to the right of it is the path the CXS route wants, and
+    the language segment to its left is exactly what that route must not carry.
+
+    None when the URL is not of that shape — an unknown shape is not something
+    to guess at, and "we could not build a request" is a fetch failure, which is
+    a state this module knows how to hold.
+    """
+    site = str(site or "").strip().strip("/")
+    path = urlsplit(str(url or "")).path
+    if not site or not path:
+        return None
+    marker = f"/{site}/"
+    index = path.find(marker)
+    if index == -1:
+        return None
+    return path[index + len(site) + 1 :]
+
+
+async def _workday_description(company: Mapping[str, Any], job: Mapping[str, Any]) -> str | None:
+    """One Workday posting's description, from the tenant's own CXS detail route.
+
+    Paced at Workday's gentler 2 s/host rather than the global 1 s — the same
+    number fetchers/workday.py uses for the board itself, imported rather than
+    repeated so a future decision to slow down only has to be taken once. It is
+    the same shared client, semaphore and backoff as every other fetch here.
+    """
+    config = config_of(company)
+    host = str(config.get("host") or "").strip().rstrip("/")
+    site = str(config.get("site") or "").strip().strip("/")
+    path = workday_external_path(site, job.get("url"))
+    tenant = str(company.get("token") or "").strip()
+    if not host or not site or not path or not tenant:
+        return None
+
+    res = await polite_get(
+        WORKDAY_JOB_URL.format(host=host, tenant=tenant, site=site, path=path),
+        min_delay=WORKDAY_DELAY,
+    )
+    if not res.ok or not isinstance(res.json, dict):
+        return None
+
+    info = res.json.get("jobPostingInfo")
+    if not isinstance(info, dict):
+        return None
+    return html_to_text(info.get("jobDescription"))
+
+
 async def fetch_description(
     company: Mapping[str, Any], job: Mapping[str, Any]
 ) -> str | None:
@@ -477,14 +571,19 @@ async def fetch_description(
     if ats == "greenhouse":
         return await _greenhouse_description(token, str(native_id)) if native_id else None
 
+    if ats == "workday":
+        return await _workday_description(company, job)
+
     if ats in _BOARD_URLS:
         if not native_id:
             return None
         row = (await _board_index(ats, token)).get(str(native_id))
         return description_from_row(ats, row) if row else None
 
-    # smartrecruiters, workday and the custom scrapers publish no description
-    # route this module has verified. Unknown, therefore kept.
+    # smartrecruiters and the custom scrapers publish no description route this
+    # module has verified. Unknown, therefore kept — and now recorded as a
+    # FAILED read rather than a clean one, so it is asked about again tomorrow
+    # instead of being believed forever.
     return None
 
 
@@ -496,25 +595,94 @@ def company_of(job: Mapping[str, Any]) -> dict[str, Any]:
     return {"ats": job.get("ats"), "token": job.get("token"), "config": job.get("config")}
 
 
+def config_of(company: Mapping[str, Any]) -> dict[str, Any]:
+    """companies.config as a dict, whatever the driver handed us.
+
+    asyncpg returns JSONB as a string unless a codec is registered, and the
+    SQLite shim stores it as text — the same accommodation crawler.loop.Company
+    already makes. Workday is the first ATS here whose request cannot be built
+    without reading it, so the decode had to stop being someone else's problem.
+    """
+    config = company.get("config")
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except ValueError:
+            return {}
+    return config if isinstance(config, dict) else {}
+
+
 def as_bool(value: Any) -> bool:
     """asyncpg hands back a real bool; the SQLite shim hands back 0/1."""
     return bool(value)
 
 
+def _as_datetime(value: Any) -> datetime | None:
+    """A stored timestamp as an aware datetime, or None if it is not one.
+
+    asyncpg gives a real datetime; the SQLite shim gives the ISO string it wrote.
+    A naive value is read as UTC, because that is what both sides store.
+    """
+    if isinstance(value, datetime):
+        stamp = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            stamp = datetime.fromisoformat(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def needs_description_check(job: Mapping[str, Any], *, retry_before: datetime | None = None) -> bool:
+    """Is this job's description worth a request right now?
+
+    Never read     -> yes, always. This is the ordinary case and the only one
+                      the digest path has ever used.
+    Read cleanly   -> no, ever. The facts are on the row; the text is gone and
+                      re-deriving it would cost a request to learn nothing.
+    Read and FAILED-> only if that failure is older than `retry_before`.
+
+    `retry_before` is None for callers that do not want retries at all, which
+    makes the third case behave exactly like the second. crawler/enrich.py is
+    the one caller that passes a cutoff: a dead board is worth one more question
+    tomorrow, and worth none at all thirty minutes from now.
+
+    A failed row with no timestamp is retried once — that is a row the old
+    schema wrote, before there was a column to record when we looked.
+    """
+    if not as_bool(job.get("desc_checked")):
+        return True
+    if retry_before is None or not as_bool(job.get("desc_fetch_failed")):
+        return False
+    checked_at = _as_datetime(job.get("desc_checked_at"))
+    return checked_at is None or checked_at < retry_before
+
+
 async def enrich_candidates(
-    conn, candidates: Iterable[Mapping[str, Any]], *, fetcher=None
+    conn,
+    candidates: Iterable[Mapping[str, Any]],
+    *,
+    fetcher=None,
+    retry_before: datetime | None = None,
 ) -> list[dict[str, Any]]:
-    """Read the description of every unchecked candidate; store the three facts.
+    """Read the description of every candidate that needs one; store the facts.
 
     Returns one small dict per job it looked at — canonical_id, title, the two
     computed facts, and whether a description was actually retrieved — so a
-    preview run can explain itself. The description text is in none of them, and
-    is unreachable the moment the loop moves on.
+    crawl or a preview run can explain itself. The description text is in none
+    of them, and is unreachable the moment the loop moves on.
 
-    Idempotent by construction: desc_checked gates the whole loop, so a second
-    run in the same day fetches nothing. A job whose description could not be
-    fetched is still marked checked — retrying a dead endpoint every thirty
-    minutes forever is not persistence, it is a loop.
+    Idempotent by construction: needs_description_check gates the whole loop, so
+    a second run in the same cycle fetches nothing. A job whose description
+    could not be fetched is still marked checked — retrying a dead endpoint
+    every thirty minutes forever is not persistence, it is a loop — but it is
+    marked desc_fetch_failed too, so `retry_before` can bring it back tomorrow.
+
+    What this writes is deliberately five columns and no more: it must not be
+    able to disturb `notified`, `status`, `miss_count` or `first_seen_at`. See
+    SAVE_DESCRIPTION_FACTS_SQL, which has no clause that could.
 
     Sequential rather than gathered, on purpose. The set is a handful by the
     time it gets here, the shared client already paces itself per host, and one
@@ -523,13 +691,14 @@ async def enrich_candidates(
     """
     fetch = fetcher or fetch_description
     report: list[dict[str, Any]] = []
-    facts: list[tuple[str, int | None, bool]] = []
+    facts: list[tuple[str, int | None, bool, bool]] = []
 
     for job in candidates:
-        if as_bool(job.get("desc_checked")):
+        if not needs_description_check(job, retry_before=retry_before):
             continue
 
         text = await fetch(company_of(job), job)
+        failed = text is None
         min_experience = detect_min_experience(text)
         is_pm_role = detect_pm_role(job.get("title"), text)
 
@@ -538,8 +707,9 @@ async def enrich_candidates(
         job["min_experience"] = min_experience  # type: ignore[index]
         job["is_pm_role"] = is_pm_role  # type: ignore[index]
         job["desc_checked"] = True  # type: ignore[index]
+        job["desc_fetch_failed"] = failed  # type: ignore[index]
 
-        facts.append((job["canonical_id"], min_experience, is_pm_role))
+        facts.append((job["canonical_id"], min_experience, is_pm_role, failed))
         report.append(
             {
                 "canonical_id": job["canonical_id"],
@@ -547,7 +717,7 @@ async def enrich_candidates(
                 "company": job.get("company"),
                 "min_experience": min_experience,
                 "is_pm_role": is_pm_role,
-                "fetched": text is not None,
+                "fetched": not failed,
             }
         )
         # `text` is rebound on the next iteration and never leaves this scope.
