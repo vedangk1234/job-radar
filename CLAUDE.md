@@ -469,11 +469,12 @@ seconds and wrong silently. Deriving it costs one boolean per row and cannot go
 stale. `dashboard/src/lib/badges.ts` states the rule; the `matches` half comes
 from `lib/match.ts`, the same parity-checked port the "for you" count uses.
 
-Today every stored match is `notified = TRUE`, because the table was silently
-seeded and no digest cron exists yet, so Home reads NOTIFIED throughout. NEW is
-not speculative — it is what the crawler writes for a genuinely new posting, and
-it was verified by temporarily flipping one live match to `notified = FALSE`,
-confirming the badge, and restoring the row.
+NEW is not speculative. It was originally verified by temporarily flipping one
+live match to `notified = FALSE`, confirming the badge, and restoring the row —
+because at that point the table had been silently seeded and nothing else had
+ever been queued. Since Step 6 it is simply the ordinary state: the hourly crawl
+queues genuinely-new postings at `notified = FALSE`, and they read NEW on Home
+until that hour's digest sends and flips them.
 
 ### The Applied checkbox
 
@@ -593,6 +594,114 @@ naming the actual constraint rather than as a 403 that reads like an auth error.
 
 ---
 
+## Automation — the hourly cron
+
+`.github/workflows/crawl.yml` is the whole of it. It orchestrates the two
+scripts that were already proven by hand and adds no logic of its own:
+
+```
+every hour (cron '0 * * * *', UTC)   or   Actions -> crawl -> Run workflow
+  └─ checkout -> setup-python 3.12 -> pip install -r requirements.txt
+     └─ verify secrets -> python scripts/crawl.py -> python scripts/send_digest.py --tag cron
+```
+
+The repo is public, so Actions minutes are free and unlimited.
+
+**Why hourly for everything.** An earlier note here planned two tiers — 30
+minutes for `tracked` companies, daily for the rest. There is no second tier to
+run: `tracked = FALSE` means the company is excluded from crawls entirely, so
+"daily for the others" would be a schedule for an empty set. One cadence for the
+one set of companies is the whole requirement.
+
+**`requirements.txt`, never `requirements-dev.txt`.** Nothing on the crawl or
+digest path imports pytest — verified by grep over `crawler/`, `db/`,
+`fetchers/`, `notify/` and the two entrypoints, and then by building a venv
+containing only `requirements.txt` and running the full pipeline through it.
+(`lxml` is pinned in `requirements.txt` but currently imported by nothing —
+`fetchers/tier3.py` parses JSON-LD with `json` and `re`. It is harmless and
+installs from a wheel; it is noted here so the next person does not go looking
+for the import.)
+
+### The three reliability properties
+
+- **`concurrency.group` with `cancel-in-progress: false`.** Two runs must never
+  overlap, because both write the same tables and a crawl reading a
+  half-reconciled state would diff against a snapshot that was never really
+  stored. Cancelling is the wrong way to enforce that: it would kill a run at an
+  arbitrary statement and keep the *newer* one, when the older may already have
+  jobs queued and an email in flight. Queueing means a slow run only delays the
+  next one.
+- **`timeout-minutes: 20`.** A full crawl of 14 boards takes ~2 minutes. The
+  ceiling is for a vendor that accepts a connection and then never answers, and
+  it sits well under the hourly cadence so a hung run cannot still hold the
+  concurrency group when the next is due.
+- **A bad board does not fail the job.** `crawl.py` exits non-zero only on a
+  hard failure — an unreachable database, or a bug. One company's board being
+  down is not that: Guard 1 in `crawler/loop.py` catches per company, records a
+  tripped guard, writes nothing for it, and the loop continues. That shows as a
+  `GUARD` cell in the step log on a green run, which is correct — one dead
+  vendor is not a broken crawler. The corollary is worth knowing: a run in which
+  *every* company tripped a guard is also green. The step log is what
+  distinguishes them.
+
+### Why the workflow checks the secrets before running anything
+
+Zero matches is the normal hourly outcome, and `run_digest` reads
+`RESEND_API_KEY` / `FROM_EMAIL` / `MY_EMAIL` only *after* it has decided
+something matched. So a missing or misspelled email secret is invisible on every
+quiet run and would first surface on the one hour a job actually matched — the
+worst possible moment to discover it. The `Verify required secrets are present`
+step asserts all four are non-empty up front, so a misconfiguration is a red run
+on the very first execution instead. It tests presence only and never prints a
+value.
+
+### Secrets
+
+Repository **Settings → Secrets and variables → Actions → New repository secret**.
+Four, and only four — the values are the ones already in the local `.env`:
+
+| Secret | Source | Note |
+|---|---|---|
+| `CRAWLER_DB_URL` | `.env` | Supabase **session** pooler, port **5432** |
+| `RESEND_API_KEY` | `.env` | |
+| `FROM_EMAIL` | `.env` | `onboarding@resend.dev` |
+| `MY_EMAIL` | `.env` | must be the Resend account address |
+
+`DASHBOARD_DB_URL`, `GOOGLE_*`, `AUTH_SECRET` and `ALLOWED_EMAIL` are
+dashboard-only and are deliberately **not** set here; the crawler never reads
+them.
+
+`CRAWLER_DB_URL` must be the **session pooler on 5432**, for the same reason
+Step 1 chose it: the direct `db.<ref>.supabase.co` endpoint is IPv6-only and
+GitHub runners are IPv4-only, so it would fail to connect from Actions even
+though it works from a laptop. Copy it from `.env` rather than retyping it — the
+password contains characters that must stay percent-encoded in a DSN, and an
+unencoded one splits the URL at the wrong `@`.
+
+### Running it by hand
+
+Actions tab → **crawl** in the left sidebar → **Run workflow** → the green
+button. `workflow_dispatch` exists for exactly this. It runs the identical
+steps, so a manual run is a real crawl and a real digest, not a rehearsal.
+
+### Reading a failed run
+
+Actions → the red run → the `crawl` job → expand the step that failed.
+
+| Step that failed | Almost certainly |
+|---|---|
+| `Verify required secrets` | a secret is unset or misspelled; the error names which |
+| `Install runtime dependencies` | a dependency yanked or a wheel missing for 3.12 |
+| `Crawl every tracked board` | the database is unreachable — check the DSN is the 5432 pooler, and that the Supabase project is not paused |
+| `Send the digest` | Resend rejected the send; the message names the HTTP status |
+
+A red `Send the digest` **loses nothing**. A failed send is a no-write, so the
+matched jobs stay `notified = FALSE` and the next hourly run picks them up. The
+same is true of a run that never started: the queue is a database column, not an
+in-memory list, so a skipped hour is deferred rather than dropped. GitHub's
+scheduler is best-effort and does run late under load — the cron is a floor on
+the interval, not a promise.
+
 ## Build status / changelog
 
 Newest last. Append here as the project evolves.
@@ -643,12 +752,19 @@ Newest last. Append here as the project evolves.
   dashboard owns, with `tests/test_applied_column.py` proving the crawler never
   writes them.
 
+- **2026-07-27 — Step 6.** The hourly GitHub Actions cron — the step that makes
+  the tool self-running. `.github/workflows/crawl.yml` runs `crawl.py` then
+  `send_digest.py --tag cron` every hour, behind a concurrency group, a 20
+  minute timeout and a preflight secret check. The preflight exists because
+  `run_digest` reads the email credentials only after something has matched, so
+  a missing secret would have stayed invisible until the first real match.
+  Verified before push by running the whole pipeline through a venv built from
+  `requirements.txt` alone.
+
 **Pending**
 
 - Deploy the dashboard to Vercel (and register the production OAuth redirect
   URI, which cannot exist until the domain does).
-- GitHub Actions cron for the crawler (30-min tier for `tracked`, daily
-  otherwise).
 - The discovery script that fills `discovered_companies`.
 - Rotate the Supabase database password.
 

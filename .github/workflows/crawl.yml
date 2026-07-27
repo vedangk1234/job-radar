@@ -1,0 +1,129 @@
+name: crawl
+
+# The scheduled half of job-radar. Once an hour it runs the same two scripts
+# that were proven by hand locally, in the same order, against the same
+# database — this workflow orchestrates them and adds nothing to them.
+#
+#   scripts/crawl.py        fetch every tracked board, diff, store, enrich
+#   scripts/send_digest.py  email whatever is notified=FALSE + open + matching
+#
+# Nothing is emailed unless something matched: send_digest treats zero matches
+# as a success and returns before it builds a message. So a quiet hour is a
+# green run with an empty inbox, which is the normal case.
+
+on:
+  schedule:
+    # Hourly, on the hour (UTC — GitHub cron has no timezone).
+    # GitHub's scheduler is best-effort and runs late under load; it is a
+    # floor on the interval, not a guarantee. That is fine here: the queue is
+    # a database column, so a skipped hour is picked up by the next run
+    # rather than lost.
+    - cron: '0 * * * *'
+  workflow_dispatch: # manual run from the Actions tab
+
+# Never let two runs overlap. Both scripts write to the same tables, and a
+# second crawl starting while the first is mid-reconcile could read a
+# half-written state — so the diff would be computed against a snapshot that
+# is not actually what we stored.
+#
+# cancel-in-progress is deliberately FALSE. Cancelling a running crawl would
+# kill it at an arbitrary statement, and the run that survives would be the
+# NEWER one, which is the wrong choice: the older run may already have jobs
+# queued at notified=FALSE with an email half-sent. Queuing instead means a
+# slow run delays the next one by a few minutes and nothing is ever torn in
+# half. If the hour is missed entirely, the next cron picks the work up.
+concurrency:
+  group: job-radar-crawl
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+
+    # A whole crawl of 14 boards takes ~2-4 minutes. 20 is generous headroom
+    # for a vendor that accepts a connection and then never answers, while
+    # still being far below the hourly cadence, so a hung run cannot still be
+    # holding the concurrency group when the next one is due.
+    timeout-minutes: 20
+
+    env:
+      # Every credential comes from GitHub Secrets. Nothing is hardcoded, and
+      # nothing here is echoed — Actions masks a secret's value in the log,
+      # but the discipline is to never print one in the first place.
+      #
+      # CRAWLER_DB_URL must be the SESSION pooler (port 5432). The direct
+      # db.<ref>.supabase.co endpoint is IPv6-only and these runners are
+      # IPv4-only, so it would fail to connect here even though it works from
+      # a laptop. db/connection.py warns if the DSN looks like that endpoint.
+      CRAWLER_DB_URL: ${{ secrets.CRAWLER_DB_URL }}
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+      MY_EMAIL: ${{ secrets.MY_EMAIL }}
+      # DASHBOARD_DB_URL, GOOGLE_* and AUTH_* are dashboard-only. The crawler
+      # never reads them, so they are deliberately absent.
+      PYTHONUNBUFFERED: '1' # interleave print() with step output in real time
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # The code targets 3.11+ and uses no version-specific syntax; 3.12
+          # is pinned rather than floating so a new interpreter landing in the
+          # runner image can never change behaviour on an unattended cron.
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install runtime dependencies
+        # requirements.txt ONLY — not requirements-dev.txt. Nothing on the
+        # crawl or digest path imports pytest, so the test dependencies would
+        # be install time bought for nothing.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify required secrets are present
+        # This step exists because of a real gap in the happy path. Zero
+        # matches is the normal hourly outcome, and notify/digest.py reads
+        # RESEND_API_KEY / FROM_EMAIL / MY_EMAIL only AFTER it has decided
+        # something matched — so a missing or misspelled email secret would
+        # sit undetected through every quiet run and first surface on the one
+        # hour a job actually matched. Checking presence up front turns that
+        # into an immediate, obvious red run on the very first execution.
+        #
+        # Presence only. The values are never printed or compared.
+        run: |
+          missing=
+          for name in CRAWLER_DB_URL RESEND_API_KEY FROM_EMAIL MY_EMAIL; do
+            if [ -z "${!name}" ]; then
+              missing="$missing $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing"
+            echo "Set them at Settings -> Secrets and variables -> Actions." >&2
+            exit 1
+          fi
+          echo "All four required secrets are present."
+
+      - name: Crawl every tracked board
+        # Exits non-zero only on a hard failure (the database is unreachable,
+        # or a bug raises). A single company's board being down is NOT that:
+        # crawler/loop.py Guard 1 catches the exception per company, records
+        # it as a tripped guard, writes nothing for that company, and the loop
+        # moves on. A dead board therefore shows as a GUARD cell in the run
+        # log and leaves the job green — which is correct, because one
+        # unreachable vendor is not a broken crawler.
+        run: python scripts/crawl.py
+
+      - name: Send the digest
+        # Emails only jobs that are notified=FALSE, open, and match the
+        # preferences row, then flips exactly those to notified=TRUE. Zero
+        # matches sends nothing and writes nothing.
+        #
+        # A failed send is also a no-write, so the jobs stay queued and the
+        # next hourly run retries them. Nothing is lost by a red run here.
+        run: python scripts/send_digest.py --tag cron
