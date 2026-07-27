@@ -18,16 +18,41 @@ rather than one per guess.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Sequence
 from urllib.parse import urlsplit
 
 from .normalize import norm
-from .tier1 import fetch_ashby, fetch_greenhouse, fetch_lever
+from .tier1 import (
+    fetch_ashby,
+    fetch_greenhouse,
+    fetch_lever,
+    fetch_recruitee,
+    fetch_smartrecruiters,
+    fetch_workable,
+)
 
 RESOLVE_ORDER: tuple[tuple[str, Callable[..., Coroutine]], ...] = (
     ("greenhouse", fetch_greenhouse),
     ("lever", fetch_lever),
     ("ashby", fetch_ashby),
+)
+
+# The wide order, for the discovery sweep (crawler/discover.py). It is a
+# SUPERSET of RESOLVE_ORDER and keeps that order's three vendors in front, so a
+# company the dashboard would resolve to greenhouse resolves to greenhouse here
+# too — discovery can only ever find boards the "add by name" flow would miss,
+# never a different board for the same name.
+#
+# It is deliberately a separate constant rather than a widening of
+# RESOLVE_ORDER. The dashboard ships a TypeScript port of this module and has no
+# Python to call; widening the shared order would make the two disagree the
+# moment a name resolved on vendor four, five or six. Discovery runs from a
+# laptop with the whole crawler available, so it can afford three more probes
+# per token that a serverless request cannot.
+DISCOVERY_ORDER: tuple[tuple[str, Callable[..., Coroutine]], ...] = RESOLVE_ORDER + (
+    ("smartrecruiters", fetch_smartrecruiters),
+    ("workable", fetch_workable),
+    ("recruitee", fetch_recruitee),
 )
 
 # Tokens that no mechanical rule produces, confirmed by hand against the live
@@ -64,14 +89,46 @@ def token_variants(company_name: str) -> list[str]:
     return ordered
 
 
-async def resolve(company_name: str) -> tuple[str, str, int] | None:
-    """Return (ats, token, job_count) for the first live board, else None."""
-    for token in token_variants(company_name):
-        for ats, fetcher in RESOLVE_ORDER:
+async def probe_boards(
+    company_name: str,
+    *,
+    order: Sequence[tuple[str, Callable[..., Coroutine]]] = RESOLVE_ORDER,
+    max_variants: int | None = None,
+) -> tuple[str, str, list[dict]] | None:
+    """Like resolve(), but hands back the JOBS the winning board returned.
+
+    Same search: token variants outermost, vendors innermost, first non-empty
+    board wins. The difference is only what comes back — a caller that needs to
+    look at the postings (discovery has to ask "are any of these in Bangalore?")
+    would otherwise have to re-fetch the board it just fetched.
+
+    `max_variants` caps how many guesses a name is worth. A discovery sweep over
+    a hundred names multiplies every extra variant by the size of `order`, and
+    the tail variants are the weakest guesses, so trading them for a shorter run
+    is a knob worth having. None means "all of them", which is what resolve()
+    has always done.
+
+    Nothing here writes a fixture: these are probes, and most of them are wrong.
+    """
+    variants = token_variants(company_name)
+    if max_variants is not None:
+        variants = variants[:max_variants]
+
+    for token in variants:
+        for ats, fetcher in order:
             jobs = await fetcher(token, save_raw=False)
             if jobs:
-                return ats, token, len(jobs)
+                return ats, token, jobs
     return None
+
+
+async def resolve(company_name: str) -> tuple[str, str, int] | None:
+    """Return (ats, token, job_count) for the first live board, else None."""
+    found = await probe_boards(company_name, order=RESOLVE_ORDER)
+    if found is None:
+        return None
+    ats, token, jobs = found
+    return ats, token, len(jobs)
 
 
 # --- Workday -------------------------------------------------------------

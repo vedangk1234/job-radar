@@ -42,6 +42,12 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 
 _PARAM = re.compile(r"\$(\d+)")
 
+# Postgres casts a parameter into a jsonb/text column with `$1::jsonb`. SQLite
+# has no such syntax and does not need one, so the cast is stripped rather than
+# the statement being rewritten for the test — what runs here is otherwise the
+# production statement, character for character.
+_CAST = re.compile(r"::(?:jsonb|json|text|int|integer|timestamptz)\b", re.IGNORECASE)
+
 # SQLite mirror of the jobs table in db/schema.sql. Same column names, same
 # constraints that matter (PK, NOT NULLs, defaults) — the types differ only in
 # ways SQLite does not enforce anyway.
@@ -77,6 +83,10 @@ CREATE TABLE jobs (
 # is handled once, in Preferences.from_row, which accepts either a real list
 # (asyncpg) or a JSON string (here) — the same accommodation Company.from_row
 # already makes for JSONB arriving as text.
+#
+# UNIQUE (ats, token) is not decoration here: it is the constraint every
+# "add a company" path relies on to be idempotent, so the ON CONFLICT clauses
+# in crawler/discover.py have something real to conflict against.
 COMPANIES_DDL = """
 CREATE TABLE companies (
   id            INTEGER PRIMARY KEY,
@@ -87,7 +97,30 @@ CREATE TABLE companies (
   category      TEXT,
   tracked       INTEGER NOT NULL DEFAULT 0,
   india_scoped  INTEGER NOT NULL DEFAULT 0,
-  created_at    TEXT
+  created_at    TEXT,
+  UNIQUE (ats, token)
+)
+"""
+
+# The discovery script's staging table. `city_hits` is TEXT[] in Postgres and
+# TEXT holding JSON here — the same divergence `preferences` already has, and
+# handled the same way: an adapter converts a bound list to JSON on the way in
+# (see FakeConn), so the production statement binds a real Python list in both.
+DISCOVERED_DDL = """
+CREATE TABLE discovered_companies (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  name                TEXT,
+  ats                 TEXT NOT NULL,
+  token               TEXT NOT NULL,
+  config              TEXT NOT NULL DEFAULT '{}',
+  job_count           INTEGER,
+  last_posting_at     TEXT,
+  city_hits           TEXT,
+  looks_like_services INTEGER NOT NULL DEFAULT 0,
+  source              TEXT,
+  discovered_at       TEXT,
+  promoted            INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (ats, token)
 )
 """
 
@@ -132,7 +165,7 @@ def _translate(sql: str, args: Sequence[Any]) -> tuple[str, list[Any]]:
         order.append(int(match.group(1)) - 1)
         return "?"
 
-    return _PARAM.sub(replace, sql), [args[i] for i in order]
+    return _CAST.sub("", _PARAM.sub(replace, sql)), [args[i] for i in order]
 
 
 class FakeConn:
@@ -146,7 +179,12 @@ class FakeConn:
         # Python 3.12 deprecated the implicit datetime adapter; be explicit
         # rather than depend on a shim that is on its way out.
         sqlite3.register_adapter(datetime, lambda d: d.isoformat())
-        for ddl in (JOBS_DDL, COMPANIES_DDL, NOTIFICATIONS_DDL, PREFERENCES_DDL):
+        # asyncpg binds a Python list straight into a TEXT[] column
+        # (discovered_companies.city_hits). SQLite has no array type, so the
+        # list becomes the JSON the mirrored DDL declares — the binding in the
+        # production statement is unchanged either way.
+        sqlite3.register_adapter(list, lambda v: json.dumps(v))
+        for ddl in (JOBS_DDL, COMPANIES_DDL, NOTIFICATIONS_DDL, PREFERENCES_DDL, DISCOVERED_DDL):
             self._db.execute(ddl)
 
     def transaction(self) -> "FakeTransaction":
@@ -192,9 +230,29 @@ class FakeConn:
         rows = await self.fetch("SELECT * FROM notifications ORDER BY id")
         return [dict(row) for row in rows]
 
-    async def add_company(self, company_id: int, name: str) -> None:
+    async def add_company(
+        self,
+        company_id: int,
+        name: str,
+        *,
+        ats: str = "greenhouse",
+        token: str | None = None,
+        tracked: bool = True,
+    ) -> None:
+        """Insert one companies row. The token defaults to a per-id unique one.
+
+        Unique by default because the table carries UNIQUE (ats, token) exactly
+        as production does, so two companies sharing the DDL's default token
+        would collide — and a test that wanted two companies would fail for a
+        reason that has nothing to do with what it was testing.
+        """
         await self.execute(
-            "INSERT INTO companies (id, name) VALUES ($1, $2)", company_id, name
+            "INSERT INTO companies (id, name, ats, token, tracked) VALUES ($1, $2, $3, $4, $5)",
+            company_id,
+            name,
+            ats,
+            token or f"testco{company_id}",
+            1 if tracked else 0,
         )
 
     async def add_job(

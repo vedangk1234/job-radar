@@ -138,10 +138,26 @@ and by ticking a row and running whole crawl cycles over it.
 about again. `desc_checked_at` is what makes that retry occasional (once a day)
 rather than once per crawl.
 
-### `discovered_companies`
-Staging area for the not-yet-written discovery script — `job_count`,
-`last_posting_at`, `city_hits`, `looks_like_services`, `source`, `promoted`.
-Rows are promoted into `companies` by hand.
+### `discovered_companies` — everything the sweep looked at
+Written by `scripts/run_discovery.py`: `job_count`, `last_posting_at`,
+`city_hits`, `looks_like_services`, `source`, `promoted`, `UNIQUE (ats, token)`.
+
+It is the **audit log of the discovery sweep, not a queue** — a company that
+cleared both bars is already in `companies` and is recorded here with
+`promoted = TRUE` as well. What makes the table worth reading is the rest: the
+boards that answered but had no job in the three cities, and the names no board
+answered for at all.
+
+Two conventions the schema does not state:
+
+- `ats` and `token` are `NOT NULL`, so a name that resolved to nothing is
+  logged under the placeholder ATS `unresolved`, keyed by its normalised name.
+  That row is what stops the next run spending thirty requests on it again.
+- `promoted` is OR-ed rather than assigned on re-run, so a row promoted by hand
+  between two sweeps stays promoted even if its board has since gone quiet.
+
+`config` carries the free-text extras the table has no column for: the candidate
+name as typed, the city spread, a probe error, and the `"try Workday"` note.
 
 ### `notifications`
 The sent-log: `canonical_id`, `sent_at`, `digest` (e.g. `2026-07-25-am`). A
@@ -230,6 +246,13 @@ location, it does not decide whether the label is interesting.
 `fetchers/http.py` provides the shared politeness: one client, a global
 semaphore, per-host pacing, and 429/5xx backoff. Its User-Agent carries a
 contact address read from `MY_EMAIL`, falling back to `unknown@example.com`.
+
+Two modules in `fetchers/` fetch something other than a board.
+`fetchers/resolve.py` guesses a board token from a company name (and takes a
+pasted Workday URL apart), and `fetchers/discovery.py` mines GitHub for company
+names and board tokens. Both go through the same `polite_get`; the GitHub search
+endpoints ask for a slower pace than the shared default, because their
+unauthenticated budget is ten requests a minute. See **Discovery** below.
 
 ### Workday, in more detail
 
@@ -405,6 +428,131 @@ marker?" from the data instead of from English, and `scripts/relabel_cities.py`
 recomputes `jobs.city` for stored rows. The relabel pass hashes every column
 *except* `city` before and after and asserts they are identical, so "the UPDATE
 only touches city" is evidence rather than an argument.
+
+---
+
+## Discovery — how a company gets onto the watch list
+
+Everything above assumes a watch list exists. For the first six steps that list
+was hand-typed. `scripts/run_discovery.py` is the machine that grows it.
+
+```
+NAMES                    PROBE                        VERDICT
+seed list ─┐
+seed file ─┼─ dedupe ─▶  resolve name -> board  ─▶   both bars   -> companies (tracked)
+github    ─┘             fetch board, label cities   one bar     -> discovered_companies
+                                                     neither     -> discovered_companies
+```
+
+**The two bars, and nothing else.** A candidate is auto-tracked iff (a) it
+resolves to one of the six Tier-1 boards, and (b) that board has at least one
+open job labelled `blr`, `hyd` or `pune`. No name heuristic, no size threshold,
+no allowlist. `looks_like_services` is *recorded* rather than acted on — a
+staffing firm with real Bangalore engineering reqs clears both bars like anyone
+else, and the flag is there so a person reading the table knows why a board is
+full of client-site postings.
+
+**Why the city test happens before tracking rather than after.** It is the only
+filtering decision in this project that runs ahead of storage, and it looks like
+a violation of *store loosely, notify tightly*. It is not: that rule is about
+which **jobs** are worth keeping, and this is about which **boards** are worth an
+hourly request. A hundred boards with no Indian presence would be a hundred
+fetches an hour and several thousand rows of San Francisco job history, to drop
+all of it at the last step. The bar is applied once, at the door, against the
+board the sweep has just fetched — using the same `city_label` the crawler will
+apply an hour later, so the two cannot disagree about what it found.
+
+### Where the names come from
+
+| Source | Module | Yield |
+|---|---|---|
+| Seed list | `scripts/discovery_seed.py` | ~210 hand-typed names, in two sections |
+| GitHub | `fetchers/discovery.py` | board tokens mined out of README job tables |
+| `--seed-file` | any text file, one name per line | whatever you drop in, no code change |
+
+The seed list's two sections differ in exactly one way. `ENTERPRISE_AND_GCC` are
+the tech-park tenants — Manyata, Bagmane, Embassy, Hitec City, Hinjewadi — and
+almost none of them resolve, because an enterprise that size is on Workday,
+Taleo or SuccessFactors. Membership there earns an unresolved name a
+`"try Workday"` note in `discovered_companies`, so the manual `add_workday.py`
+queue writes itself. **The sweep never attempts Workday**: a tenant, a pod host
+and a site name are three independent unguessable strings, and guessing them is
+how you get a companies row that fails every hour forever.
+
+GitHub mining is not what it first looks like. The obvious query — code search
+for `boards.greenhouse.io` — is **401 without a token**, flatly. The
+unauthenticated fallback is repository search with `in:readme`, and its top hits
+are the community job-list repos ("new grad 2020", "companies sponsoring
+visas"), whose READMEs are tables of hundreds of careers links. So the second
+step reads those READMEs from `raw.githubusercontent.com` — a different rate
+budget from the 60/hour API core limit — and pulls board tokens straight out of
+the URLs. A token lifted from `jobs.lever.co/acme` is not a guess that has to
+survive `token_variants`; it is the board's real name, and it costs **one**
+request to confirm instead of thirty. `GITHUB_TOKEN` is honoured when set and
+never required.
+
+### What the sweep is not allowed to do
+
+- **Never writes `jobs`.** A newly-tracked company has zero stored rows, so the
+  next `crawl.py` detects a first-ever crawl and seeds its whole back catalogue
+  with `notified = TRUE` — the same silent seed every other company got. That is
+  the entire reason a run that tracks forty boards does not produce forty
+  boards' worth of email, and `tests/test_discovery.py` asserts it twice: once
+  against the statement text, once by counting rows after a track.
+- **Never `DO UPDATE` on `companies`.** The upsert is `ON CONFLICT DO NOTHING`.
+  An existing row knows things the sweep does not — a corrected name, a
+  hand-tagged category, a Workday config, or the fact that a person set
+  `tracked = FALSE` on purpose. `DO UPDATE` would undo that decision on every
+  run, and "the board still has Bangalore jobs" was never the thing in dispute.
+  `RETURNING id` therefore yields a row only on a genuine insert, which is
+  exactly the "newly tracked" count the report prints.
+- **Never stores descriptions**, and never re-fetches a board it has already
+  read: `probe_boards` hands back the jobs of the board it settled on, so the
+  city test costs no extra request.
+
+### Resolve order: two constants, on purpose
+
+`fetchers/resolve.py` now carries `RESOLVE_ORDER` (greenhouse → lever → ashby)
+and `DISCOVERY_ORDER`, which appends smartrecruiters, workable and recruitee.
+The wide one is a strict **prefix-preserving superset**, so a name that resolves
+to greenhouse for the dashboard resolves to greenhouse here too — discovery can
+find boards the "add by name" flow would miss, never a *different* board for the
+same name. They are two constants rather than one because `RESOLVE_ORDER` is
+ported to TypeScript for a runtime with no Python and a request budget measured
+in seconds; discovery runs from a laptop and can afford three more probes per
+token. `resolve()` is now a thin wrapper over `probe_boards`, so the shared half
+is genuinely shared rather than restated.
+
+### Why the sweep probes 24 candidates at once
+
+Not because 24 is fast — `fetchers/http.py` caps in-flight requests at 8 and
+paces every host to one request a second, and nothing in the sweep can raise
+either. It is about keeping the **six host lanes busy**, and the first version
+got that wrong in a way worth writing down.
+
+It probed in lockstep batches of ten. Ten candidates all walk the vendor list in
+the same order at the same time, so ten requests pile onto the Greenhouse lane
+while Lever, Ashby, SmartRecruiters, Workable and Recruitee sit idle — then all
+ten move to Lever together. Six lanes, one of them working, and the barrier at
+the end of each batch meant the slowest candidate held up nine others.
+Measured: **2 candidates/minute**.
+
+Queueing every candidate at once behind a semaphore and recording results in
+completion order lets them pipeline instead — one is on its fourth vendor while
+another starts its first, so every lane has somebody waiting on it. Same
+politeness, same request count, same code path per candidate. Measured after the
+change: **6 candidates/minute**, and the write-every-ten is now a reporting
+interval rather than a barrier.
+
+### Resuming
+
+Interrupt it and run it again. Every candidate already in `companies` or already
+in `discovered_companies` is skipped without a request, matched on the
+normalised name (and on `(ats, token)` when the source supplied one). Results are
+written **every ten candidates rather than at the end** — a sweep that only wrote
+on a clean exit would have nothing to resume from. `--recheck` re-probes the
+logged near-misses, which is the flag worth running monthly: a board with no
+Bangalore job in July may have one in August.
 
 ---
 
@@ -586,6 +734,7 @@ placeholders.
 | `ALLOWED_EMAIL` | `dashboard/src/lib/env.ts` | the one account allowed to sign in. **No default** — `required()` throws when unset, and every fallback path authorises nobody |
 | `AUTH_URL` | Auth.js | *optional* — only if Auth.js cannot infer its own URL. Local dev and Vercel both infer it correctly |
 | `PERSONAL_DENYLIST` | `scripts/githooks/pre-commit` | *optional* — extra values the personal-data guard should block |
+| `GITHUB_TOKEN` | `fetchers/discovery.py` | *optional* — unlocks GitHub **code** search, which is 401 unauthenticated. Without it the sweep falls back to repository search + README mining and works fine, just narrower |
 
 Because the sandbox sender can only deliver to the address that owns the API
 key, `notify/digest.py` asserts locally that the recipient equals `MY_EMAIL`
@@ -761,11 +910,33 @@ Newest last. Append here as the project evolves.
   Verified before push by running the whole pipeline through a venv built from
   `requirements.txt` alone.
 
+- **2026-07-27 — Step 7.** Discovery. `scripts/run_discovery.py` sweeps every
+  candidate name it can get — a 212-name seed list, GitHub README mining, and
+  any `--seed-file` — and auto-tracks the ones that clear two bars: resolves to
+  a Tier-1 board, and has a real open job in Bangalore, Hyderabad or Pune.
+  **`companies` went 14 → 50**; 311 candidates tried, 86 resolved to a live
+  board, 36 auto-tracked, 50 resolved with nothing in the three cities (logged,
+  not tracked), 199 unresolved of which 96 are flagged `try Workday`.
+  `discovered_companies` holds all 310 as the audit trail.
+
+  Two things it deliberately does not do, both asserted in the tests rather than
+  promised: it never writes `jobs` (so the next crawl still silently seeds every
+  new company), and it never `DO UPDATE`s a `companies` row (so a hand-edited
+  name, a hand-tagged category, or a deliberate `tracked = FALSE` survives every
+  future run). Both were then confirmed against the live database: the hourly
+  cron seeded **6,496 rows** for the new companies while the sweep was still
+  running, and not one of them was queued for email.
+
+  Also here: the lockstep-batching mistake and its fix (see *Why the sweep
+  probes 24 candidates at once*), which is the difference between a 2.5-hour
+  sweep and a 45-minute one at identical politeness.
+
 **Pending**
 
 - Deploy the dashboard to Vercel (and register the production OAuth redirect
   URI, which cannot exist until the domain does).
-- The discovery script that fills `discovered_companies`.
+- Work the `discovered_companies` "try Workday" queue by hand with
+  `scripts/add_workday.py` — the sweep cannot resolve a Workday site.
 - Rotate the Supabase database password.
 
 ---
