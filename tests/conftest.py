@@ -63,7 +63,9 @@ CREATE TABLE jobs (
   is_pm_role        INTEGER NOT NULL DEFAULT 0,
   desc_checked      INTEGER NOT NULL DEFAULT 0,
   desc_fetch_failed INTEGER NOT NULL DEFAULT 0,
-  desc_checked_at   TEXT
+  desc_checked_at   TEXT,
+  applied           INTEGER NOT NULL DEFAULT 0,
+  applied_at        TEXT
 )
 """
 
@@ -211,6 +213,8 @@ class FakeConn:
         desc_checked: bool = False,
         desc_fetch_failed: bool = False,
         desc_checked_at: str | None = None,
+        applied: bool = False,
+        applied_at: str | None = None,
     ) -> None:
         """Insert one jobs row directly.
 
@@ -220,14 +224,17 @@ class FakeConn:
         The five description-derived columns default to exactly what a crawled
         row starts life as — unknown, not a PM role, never read, never failed,
         never looked at — so a test that says nothing about them is testing the
-        ordinary case.
+        ordinary case. `applied` defaults the same way, and for the stronger
+        reason: a crawled row can only ever start there, because the crawler has
+        no statement that writes the column at all.
         """
         stamp = self.clock.tick()
         await self.execute(
             "INSERT INTO jobs (canonical_id, company_id, title, location, city, url, "
             "first_seen_at, last_seen_at, status, notified, "
-            "min_experience, is_pm_role, desc_checked, desc_fetch_failed, desc_checked_at) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12, $13, $14)",
+            "min_experience, is_pm_role, desc_checked, desc_fetch_failed, desc_checked_at, "
+            "applied, applied_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
             canonical_id,
             company_id,
             title,
@@ -242,6 +249,8 @@ class FakeConn:
             1 if desc_checked else 0,
             1 if desc_fetch_failed else 0,
             desc_checked_at,
+            1 if applied else 0,
+            applied_at,
         )
 
     async def set_preferences(

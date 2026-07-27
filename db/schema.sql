@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   is_pm_role        BOOLEAN NOT NULL DEFAULT FALSE, -- the description frames the role as product/people management
   desc_checked      BOOLEAN NOT NULL DEFAULT FALSE, -- the description has been read once; never read twice
   desc_fetch_failed BOOLEAN NOT NULL DEFAULT FALSE, -- we looked and could not read it; retried occasionally
-  desc_checked_at   TIMESTAMPTZ                     -- when we last looked; NULL = never (or before this column)
+  desc_checked_at   TIMESTAMPTZ,                    -- when we last looked; NULL = never (or before this column)
+  applied           BOOLEAN NOT NULL DEFAULT FALSE, -- DASHBOARD-OWNED: I have applied to this. The crawler never writes it.
+  applied_at        TIMESTAMPTZ                     -- when the checkbox was ticked; NULL whenever applied is FALSE
 );
 CREATE INDEX IF NOT EXISTS jobs_company_status_idx ON jobs (company_id, status);
 
@@ -65,6 +67,27 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS desc_checked BOOLEAN NOT NULL DEFAULT 
 -- failed row is re-asked once a day, not once a crawl. See crawler/enrich.py.
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS desc_fetch_failed BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS desc_checked_at   TIMESTAMPTZ;
+
+-- applied / applied_at — the ONLY two columns on this table the DASHBOARD owns.
+--
+-- Every other column here is the crawler's: it observed the posting, so it is
+-- the only thing entitled to say when the posting appeared, whether it is still
+-- open, or whether it has been emailed. These two are the opposite — they record
+-- something only a person can know, which no fetch can ever discover and no
+-- crawl may ever overwrite.
+--
+-- That ownership is enforced by the SQL rather than by a rule anyone has to
+-- remember. crawler/store.UPSERT_SEEN names neither column in its INSERT list
+-- nor in its ON CONFLICT DO UPDATE clause, so a re-sighting cannot clear the
+-- tick; notify/store.SAVE_DESCRIPTION_FACTS_SQL names neither either, so
+-- enrichment cannot. tests/test_applied_column.py asserts both, against the
+-- production statements, so the guarantee fails loudly rather than silently.
+--
+-- applied_at is nullable and is cleared whenever applied goes back to FALSE, so
+-- the pair can never say "not applied, on the 3rd of August". The dashboard's
+-- PATCH route writes both in one statement for exactly that reason.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS applied    BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ;
 
 -- One-time re-open of the rows the OLD enrichment marked checked without ever
 -- reading anything. Before crawler/enrich.py existed, enrichment ran only in

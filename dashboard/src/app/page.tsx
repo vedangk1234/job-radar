@@ -15,7 +15,14 @@ export const dynamic = "force-dynamic";
  * anyone has to notice a number looked wrong.
  *
  * One thing is deliberately NOT part of the filter: `notified`. A job that was
- * already emailed still fits, so it still shows. Home is not the outbox.
+ * already emailed still fits, so it still shows. Home is not the outbox. It is
+ * however what the NEW / NOTIFIED badge on each row reports — the same flag,
+ * shown rather than filtered on, so "has the digest told me about this yet" is
+ * answerable at a glance without hiding anything.
+ *
+ * Ticking "Applied" on a row is the one write either screen makes to the jobs
+ * table. See lib/jobs.setApplied for why those two columns are the dashboard's
+ * while the rest of the table is the crawler's.
  *
  * Rendered on the server — the page is already behind the session gate, so
  * reading the database directly beats making the browser round-trip through an
@@ -37,10 +44,18 @@ export default async function HomePage() {
         {withMatches} of {companies.length} companies. Same filter as the digest email — city,
         keyword, no excluded word, no level above your ceiling, and nothing the description
         marked as a PM role or a 3+-years role. Expand a company to see its matches; the title
-        is the apply link.
+        is the apply link, and the checkbox beside it records that you took it.
       </p>
       <CompanyList initial={companies} mode="matches" />
       <p className="muted small" style={{ marginTop: 14 }}>
+        Each row carries one badge: <span className="badge new">new</span> for a match no digest
+        has mentioned yet, <span className="badge notified">notified</span> for one already
+        emailed. Both are computed from the row as it stands — neither is stored, so editing
+        your preferences re-decides every badge on the next load. Ticking{" "}
+        <strong>Applied</strong> dims the job, strikes the title through and sinks it to the
+        bottom of its company; the link still works, and the crawler never clears the tick.
+      </p>
+      <p className="muted small" style={{ marginTop: 10 }}>
         A job already sent in a digest still appears here — this is what fits, not what is
         unsent. Descriptions are read during the crawl, so a matching job&rsquo;s experience
         requirement is known within one crawl of it appearing.{" "}

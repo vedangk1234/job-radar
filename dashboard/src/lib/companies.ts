@@ -1,5 +1,5 @@
 import { sql } from "./db";
-import { matchCountsByCompany } from "./jobs";
+import { matchCountsByCompany, type CompanyJobCounts } from "./jobs";
 import { loadPreferences } from "./preferences";
 
 /**
@@ -22,15 +22,22 @@ export type CompanyRow = {
 };
 
 /**
- * A company row plus the two numbers both screens print next to its name.
+ * A company row plus the numbers both screens print next to its name.
  *
- *   open_jobs   every open job stored for it — the row's "Total jobs"
- *   match_jobs  how many of those pass the digest filter — the row's "For you"
+ *   open_jobs     every open job stored for it — the row's "Total jobs"
+ *   match_jobs    how many of those pass the digest filter — the row's "For you"
+ *   applied_jobs  how many of THOSE MATCHES are already ticked as applied to
  *
  * The second number is the whole point of Home, and it is computed here rather
  * than in the browser: a count is 2 bytes and the rows behind it are 300 KB.
+ *
+ * The third rides along for free — it is counted in the same pass over the same
+ * candidate rows, so the "3 applied" note beside a company costs no query. It
+ * counts matches rather than all open jobs on purpose: it sits next to the "for
+ * you" number and has to be a share of it, not a total from a wider population
+ * that could exceed the figure printed beside it.
  */
-export type CompanyCard = CompanyRow & { match_jobs: number };
+export type CompanyCard = CompanyRow & { match_jobs: number; applied_jobs: number };
 
 /** The company rows and their open/total counts. One aggregate, no job rows. */
 async function companyRows(id: number | null = null): Promise<CompanyRow[]> {
@@ -70,15 +77,20 @@ export async function listCompanies(): Promise<CompanyRow[]> {
 export async function listCompanyCards(): Promise<CompanyCard[]> {
   const prefs = await loadPreferences();
   const [rows, counts] = await Promise.all([companyRows(), matchCountsByCompany(prefs)]);
-  return rows.map((row) => ({ ...row, match_jobs: counts.get(row.id) ?? 0 }));
+  return rows.map((row) => withCounts(row, counts));
 }
 
-/** One company, with both counts. For the response to a PATCH. */
+/** One company, with every count. For the response to a PATCH. */
 export async function companyCard(id: number): Promise<CompanyCard | null> {
   const prefs = await loadPreferences();
   const [rows, counts] = await Promise.all([companyRows(id), matchCountsByCompany(prefs)]);
-  const row = rows[0];
-  return row ? { ...row, match_jobs: counts.get(row.id) ?? 0 } : null;
+  return rows[0] ? withCounts(rows[0], counts) : null;
+}
+
+/** A company with no matching jobs is absent from the map, not zero in it. */
+function withCounts(row: CompanyRow, counts: Map<number, CompanyJobCounts>): CompanyCard {
+  const found = counts.get(row.id);
+  return { ...row, match_jobs: found?.match ?? 0, applied_jobs: found?.applied ?? 0 };
 }
 
 /**

@@ -111,12 +111,26 @@ that re-applying the schema can never reset a value the dashboard has edited.
 | `desc_checked` | the description has been read once; never read twice |
 | `desc_fetch_failed` | we looked and could not read it — retried, occasionally |
 | `desc_checked_at` | when we last looked. NULL = never |
+| `applied` | **dashboard-owned.** I applied to this. The crawler never writes it |
+| `applied_at` | when the box was first ticked. NULL whenever `applied` is FALSE |
 
 The five description-derived columns are the **only** trace a job description
 ever leaves in this database. There is no description column, on purpose: two
 scalars per job cost nothing, and 10 KB of HTML per job across a growing board
 is how a free tier turns into a bill. The discipline is structural rather than a
 habit — there is nowhere to put the text.
+
+`applied` / `applied_at` are the exception to "the crawler owns `jobs`", and the
+exception is about **ownership rather than about writing**. Every other column
+here records something a fetch observed, so the thing that fetched it is the only
+thing entitled to say what it is. These record something no fetch can discover
+and no crawl can recompute — so the dashboard writes them and the crawler never
+does. That is a property of the SQL, not a promise: `crawler/store.UPSERT_SEEN`
+names neither column in its INSERT list nor in its `ON CONFLICT DO UPDATE`
+clause, and `notify/store.SAVE_DESCRIPTION_FACTS_SQL` names neither either, so a
+re-sighting, a rename, a close and a reopen all leave the tick alone.
+`tests/test_applied_column.py` asserts that twice — against the statement text,
+and by ticking a row and running whole crawl cycles over it.
 
 `desc_fetch_failed` exists because `desc_checked` used to conflate two states:
 "read it, no minimum stated" and "asked, got nothing". Both leave
@@ -399,14 +413,18 @@ only touches city" is evidence rather than an argument.
 Next.js App Router + TypeScript in `dashboard/`. Read-mostly.
 
 - **Home (`/`)** — per-company collapsible rows showing **matches only**, with a
-  "for you" count per company. `notified` is deliberately *not* part of this
-  filter: Home answers "what fits me right now", not "what has not been emailed
-  yet" — a job sent in this morning's digest is still worth applying to this
-  afternoon.
+  "for you" count per company and, once there is one, an "N applied" count
+  beside it. `notified` is deliberately *not* part of this filter: Home answers
+  "what fits me right now", not "what has not been emailed yet" — a job sent in
+  this morning's digest is still worth applying to this afternoon. It is shown
+  as a badge instead. Every job row carries an **Applied** checkbox.
 - **Jobs (`/jobs`)** — literally the same component with one prop different
   (`mode="all"`), showing every open posting unfiltered. This is the screen that
   answers "did the crawler miss it, or did the filter drop it?". In this mode
-  each job additionally shows its `status` and whether it is notified.
+  each job additionally shows its `status`, whether it is notified, and a
+  SUGGESTED badge if it also passes the filter. There is no Applied checkbox
+  here: this screen is the raw reference, and the tick belongs on the list of
+  jobs worth applying to.
 - **Add (`/add`)** — resolve a company **by name** (guess the board token from
   the name, trying mechanical variants against greenhouse → lever → ashby, first
   non-empty board wins) or **by URL** (including Workday, parsed for
@@ -428,6 +446,58 @@ minimum years) so an unenriched row says so rather than looking judged.
 `dashboard/src/lib/jobs.ts` require `status = 'open'`, so a job closed by
 Guard 3 (`miss_count >= 3`) disappears from both screens.
 
+### Status badges — derived, never stored
+
+One badge per job row, computed at render from data the row already carries:
+
+| Badge | Screen | Rule |
+|---|---|---|
+| `NEW` | Home | is a match **and** `notified = FALSE` — queued, not yet emailed |
+| `NOTIFIED` | Home | is a match **and** `notified = TRUE` — already went out |
+| `SUGGESTED` | Jobs | passes the same shared filter, on a list that does not apply it |
+
+A non-matching row on Jobs gets no badge, which is the point — that screen is
+several hundred postings including the sales roles, and SUGGESTED is what makes
+the few that fit findable in it. Showing NEW/NOTIFIED there, or SUGGESTED on
+Home, would put the same badge on every row and therefore say nothing.
+
+There is **no column** for any of this and there must not be. A badge is a
+reading of the match rules plus `notified`, and the match rules read the
+`preferences` row, which is editable from another tab — so a stored badge would
+be a cached answer to a question whose inputs change under it, wrong within
+seconds and wrong silently. Deriving it costs one boolean per row and cannot go
+stale. `dashboard/src/lib/badges.ts` states the rule; the `matches` half comes
+from `lib/match.ts`, the same parity-checked port the "for you" count uses.
+
+Today every stored match is `notified = TRUE`, because the table was silently
+seeded and no digest cron exists yet, so Home reads NOTIFIED throughout. NEW is
+not speculative — it is what the crawler writes for a genuinely new posting, and
+it was verified by temporarily flipping one live match to `notified = FALSE`,
+confirming the badge, and restoring the row.
+
+### The Applied checkbox
+
+Every job row on Home carries one. Ticking it `PATCH`es `/api/jobs/applied` with
+the job's `canonical_id`; the route sets `applied` and stamps `applied_at`, and
+unticking clears both. The row then dims, strikes its title through and sinks to
+the bottom of its company — the apply link still works, because having applied
+is the most likely reason to want to open the posting again.
+
+Three details that are decisions rather than defaults:
+
+- **The id travels in the body, not the path.** A `canonical_id` is built from a
+  vendor's own identifier, and an id containing an encoded slash is a router 404
+  before any handler runs — which would look like a missing job rather than a
+  routing quirk. `/api/companies/:id` can use a path segment because that id is
+  an integer.
+- **`applied_at` is `COALESCE`d, not overwritten**, so it records when the box
+  was *first* ticked and a repeated PATCH is genuinely idempotent. Unticking sets
+  it to NULL, so the pair can never say "not applied, on the 3rd of August".
+- **The sink-to-the-bottom ordering lives in the browser, not in the `ORDER BY`.**
+  Ticking has to move the row immediately and the list is not refetched when it
+  does, so the comparator has to exist client-side anyway; a second ordering rule
+  in SQL would be a definition the client overrides a moment later.
+
 **Auth**: Google OAuth via Auth.js v5, locked to exactly one account. Google's
 "sign in" authenticates *any* Google account, so authentication is not
 authorisation and the gap between them is the whole security model. The lock is
@@ -442,11 +512,17 @@ and **every fallback is the closed one**: a missing `ALLOWED_EMAIL` authorises
 nobody.
 
 **Writes the dashboard is allowed to make**, and nothing else:
-`companies.tracked`, `companies.category`, the single `preferences` row, and
-inserting a company. The `jobs` views are strictly read-only — the crawler owns
-`jobs`, and a dashboard able to edit `notified` or `status` could silently
-un-send or re-send a digest. It has no cron, sends no email, and never fetches a
-job description.
+`companies.tracked`, `companies.category`, the single `preferences` row,
+inserting a company, and `jobs.applied` / `jobs.applied_at`. Everything else
+about a job stays read-only — the crawler owns the lifecycle, and a dashboard
+able to edit `notified` or `status` could silently un-send or re-send a digest.
+The applied pair is not a hole in that rule but the other side of it: those two
+columns record something no crawl can observe, so nothing but the dashboard
+could write them. `lib/jobs.setApplied` is the one statement in the app that
+writes to `jobs`, and it names those two columns and no others; the route that
+*lists* jobs is deliberately a different file, so "the listing route cannot
+change a job" stays true by inspection. The dashboard still has no cron, sends
+no email, and never fetches a job description.
 
 ---
 
@@ -468,6 +544,16 @@ disagreement:
 
 Run `match-parity` after touching either matcher; its total is directly
 comparable to `python scripts/preview_digest.py --dry-run --ignore-notified`.
+
+A third check answers a different question. `npm run ui-check` needs a **running**
+dev server: it fetches real rows from the real API over HTTP with a minted
+session, renders the shipped `JobLine` component with them, and asserts the
+checkbox and the badges are actually in the markup. It exists because the Applied
+checkbox and the badges were once specified, agreed and never built, and nothing
+in the repo could tell the difference — a type checker proves the props line up
+and a query proves the column exists, but neither proves a person opening the
+page sees anything. What it does not cover is CSS and clicking, where a browser
+would be needed and where the failure is visible rather than silent.
 
 The city label is **not** ported. It is computed once in Python at crawl time
 and stored in `jobs.city`; both sides read the column and neither recomputes it.
@@ -547,6 +633,15 @@ Newest last. Append here as the project evolves.
   with a personal-data check (real-contact-address detection, git-identity
   derivation, `PERSONAL_DENYLIST`); the unpushed dashboard history squashed so
   no blob in it carries a contact address.
+- **2026-07-27 — Step 5c.** The Applied checkbox and the derived NEW / NOTIFIED /
+  SUGGESTED badges — both specified in an earlier round, agreed to, and never
+  actually built. The gap survived because nothing in the repo could tell a
+  rendered feature from a designed one, so this step also added
+  `npm run ui-check`: it renders the shipped row component over live rows from a
+  running server and fails if the markup does not contain them. Schema gained
+  `jobs.applied` / `jobs.applied_at`, the only two columns on that table the
+  dashboard owns, with `tests/test_applied_column.py` proving the crawler never
+  writes them.
 
 **Pending**
 

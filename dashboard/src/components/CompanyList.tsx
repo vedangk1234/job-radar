@@ -1,11 +1,11 @@
 "use client";
 
-import { useCallback, useId, useState } from "react";
+import { useCallback, useId, useMemo, useState } from "react";
 
+import { JobLine, type Mode } from "@/components/JobLine";
 import type { CompanyCard } from "@/lib/companies";
-import type { JobRow } from "@/lib/jobs";
+import type { JobView } from "@/lib/jobs";
 import { CATEGORIES } from "@/lib/labels";
-import { descriptionHint } from "@/lib/match";
 
 /**
  * The company list, and the one collapsible row both screens are made of.
@@ -27,7 +27,9 @@ import { descriptionHint } from "@/lib/match";
  * answer is kept, so reopening is instant and closing costs nothing.
  */
 
-export type Mode = "matches" | "all";
+// Re-exported from the row component, which is where the two screens actually
+// diverge. Importers of this file kept the name they had.
+export type { Mode };
 
 export function CompanyList({ initial, mode }: { initial: CompanyCard[]; mode: Mode }) {
   const [rows, setRows] = useState(initial);
@@ -87,13 +89,30 @@ function CompanyRow({
   onError: (message: string | null) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [jobs, setJobs] = useState<JobRow[] | null>(null);
+  const [jobs, setJobs] = useState<JobView[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const panelId = useId();
 
   const shown = mode === "matches" ? company.match_jobs : company.open_jobs;
+
+  /**
+   * Applied jobs sink to the bottom of the list, in the browser rather than in
+   * the ORDER BY.
+   *
+   * It has to happen here anyway: ticking a box must move the row immediately,
+   * and the list is not refetched when it does. Putting the same rule in the SQL
+   * as well would be a second ordering that the client overrides a moment later
+   * — one definition, in the place that has to own it.
+   *
+   * Array.prototype.sort is stable, so within each group the server's order —
+   * newest first, then title — is exactly preserved. This is the only comparator.
+   */
+  const ordered = useMemo(() => {
+    if (jobs === null) return null;
+    return [...jobs].sort((a, b) => Number(a.applied) - Number(b.applied));
+  }, [jobs]);
 
   async function toggleOpen() {
     const next = !open;
@@ -106,11 +125,65 @@ function CompanyRow({
       const res = await fetch(`/api/companies/${company.id}/jobs?filter=${mode}`);
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
-      setJobs(data.jobs as JobRow[]);
+      setJobs(data.jobs as JobView[]);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
+    }
+  }
+
+  /**
+   * Tick or untick "applied" on one job.
+   *
+   * Optimistic like the company switch above and for the same reason — the round
+   * trip to Tokyo is long enough that a checkbox which waits for it feels broken
+   * — but with one extra step: the response carries the re-read row, and that is
+   * what finally lands in state, because `applied_at` is the database clock's to
+   * decide and the browser cannot guess it.
+   *
+   * The company's "N applied" note is nudged in the same breath. It was computed
+   * server-side over the match set, so a tick that did not move it would leave
+   * the header disagreeing with the list directly underneath it until a reload.
+   */
+  async function toggleApplied(job: JobView, applied: boolean) {
+    const before = jobs;
+    const beforeCard = company;
+    onError(null);
+
+    setJobs((current) =>
+      (current ?? []).map((j) => (j.canonical_id === job.canonical_id ? { ...j, applied } : j)),
+    );
+    onPatched({
+      ...company,
+      applied_jobs: Math.max(0, company.applied_jobs + (applied ? 1 : -1)),
+    });
+
+    try {
+      const res = await fetch("/api/jobs/applied", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ canonical_id: job.canonical_id, applied }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+
+      const saved = data.job as JobView;
+      setJobs((current) =>
+        (current ?? []).map((j) =>
+          // `matches` is not a column, so the server's row does not carry it;
+          // keep the one this list was rendered with rather than dropping the
+          // badge on the row that was just ticked.
+          j.canonical_id === saved.canonical_id ? { ...saved, matches: j.matches } : j,
+        ),
+      );
+    } catch (err) {
+      setJobs(before);
+      onPatched(beforeCard);
+      onError(
+        `Could not mark "${job.title}" as ${applied ? "applied" : "not applied"}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -179,6 +252,21 @@ function CompanyRow({
                 <span className="muted small">for you</span>
               </span>
             ) : null}
+            {/*
+              Shown only when there is one. A permanent "0 applied" on every
+              company would be eleven zeroes reporting that nothing has happened,
+              which is worse than silence; a number that appears when it becomes
+              true reads as progress.
+            */}
+            {mode === "matches" && company.applied_jobs > 0 ? (
+              <span
+                className="count applied-count"
+                title={`${company.applied_jobs} of the ${company.match_jobs} jobs that fit you here are ticked as applied.`}
+              >
+                <strong className="num">{company.applied_jobs}</strong>
+                <span className="muted small">applied</span>
+              </span>
+            ) : null}
             <span className="count">
               <strong className="num">{company.open_jobs}</strong>
               <span
@@ -234,11 +322,16 @@ function CompanyRow({
       <div id={panelId} hidden={!open} className="company-body">
         {loading ? <p className="muted small">Loading…</p> : null}
         {loadError ? <p className="msg bad">Could not load jobs: {loadError}</p> : null}
-        {!loading && !loadError && jobs !== null ? (
-          jobs.length ? (
+        {!loading && !loadError && ordered !== null ? (
+          ordered.length ? (
             <ul className="jobs">
-              {jobs.map((job) => (
-                <JobLine key={job.canonical_id} job={job} mode={mode} />
+              {ordered.map((job) => (
+                <JobLine
+                  key={job.canonical_id}
+                  job={job}
+                  mode={mode}
+                  onApplied={toggleApplied}
+                />
               ))}
             </ul>
           ) : (
@@ -254,55 +347,6 @@ function CompanyRow({
             The row said {shown}; the database now says {jobs.length}. The crawler has run since
             this page loaded — reload to refresh the counts.
           </p>
-        ) : null}
-      </div>
-    </li>
-  );
-}
-
-/**
- * One job. The title IS the apply link: it is what a person wants to click, and
- * making them hunt for a separate "apply" affordance next to it would be
- * decoration standing between them and the posting.
- *
- * `rel="noopener noreferrer"` on every one of them. `noopener` because a tab
- * opened with target=_blank can otherwise reach back through window.opener and
- * navigate this page somewhere else; `noreferrer` because which dashboard sent
- * a click is nobody's business but this dashboard's.
- */
-function JobLine({ job, mode }: { job: JobRow; mode: Mode }) {
-  const hint = descriptionHint(job);
-
-  return (
-    <li className="job">
-      <a href={job.url} target="_blank" rel="noopener noreferrer">
-        {job.title}
-      </a>
-      <div className="job-meta">
-        <span className="tag">{job.city ?? "—"}</span>
-        {job.location ? <span className="muted small">{job.location}</span> : null}
-        {job.is_pm_role ? (
-          <span className="tag" title="The description frames this as a product/people management role.">
-            PM
-          </span>
-        ) : null}
-        {hint ? (
-          <span
-            className="muted small"
-            title={
-              hint === "desc not checked"
-                ? "Nobody has read this description yet, so the experience and PM tests had nothing to judge. It passed every test that reads the title."
-                : "The minimum years of experience the description states."
-            }
-          >
-            {hint}
-          </span>
-        ) : null}
-        {mode === "all" ? (
-          <>
-            <span className={job.status === "open" ? "tag on" : "tag off"}>{job.status}</span>
-            <span className="muted small">{job.notified ? "notified" : "not notified"}</span>
-          </>
         ) : null}
       </div>
     </li>

@@ -346,6 +346,12 @@ button.disclose:hover {
   color: var(--accent);
 }
 
+/* A share of the number to its left, so it reads as progress rather than as a
+   third independent total competing with the other two. */
+.count.applied-count strong {
+  font-size: 14px;
+}
+
 .company-controls {
   display: flex;
   align-items: center;
@@ -392,7 +398,14 @@ li.job:last-child {
   border-bottom: none;
 }
 
-li.job > a {
+.job-line {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 9px;
+}
+
+a.job-title {
   font-weight: 550;
 }
 
@@ -402,6 +415,128 @@ li.job > a {
   align-items: baseline;
   gap: 4px 10px;
   margin-top: 2px;
+}
+
+/*
+ * An applied job: dimmed and struck through, and sunk to the bottom of its
+ * company by the comparator in CompanyList. Still legible, still clickable —
+ * the strike says "dealt with", not "gone". Hiding it would delete the record of
+ * having applied, which is the one thing the tick exists to keep.
+ *
+ * The link keeps its full opacity relative to the row rather than being dimmed
+ * twice, because the most likely reason to look at an applied job is to open it
+ * again.
+ */
+li.job.applied {
+  opacity: 0.55;
+}
+
+li.job.applied a.job-title {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  color: var(--ink-2);
+}
+
+li.job.applied:hover {
+  opacity: 0.85;
+}
+
+/*
+ * The tick box. A real checkbox rather than the pill switch used for `tracked`:
+ * a switch says "this setting is on", a checkbox says "this item is done", and
+ * these are one per row in a list rather than one per screen.
+ *
+ * The word "Applied" is hidden below 640px — on a phone the row is already two
+ * lines and the box next to a struck-through title says the same thing.
+ */
+.applied-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  cursor: pointer;
+  user-select: none;
+  align-self: center;
+}
+
+.applied-box input {
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  flex: none;
+  border: 1px solid var(--ink-3);
+  border-radius: 4px;
+  background: var(--bg);
+  cursor: pointer;
+  position: relative;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.applied-box input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.applied-box input:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid var(--accent-ink);
+  border-width: 0 2px 2px 0;
+  transform: rotate(42deg);
+}
+
+.applied-box:hover input:not(:checked) {
+  border-color: var(--accent);
+}
+
+.applied-word {
+  font-size: 12px;
+}
+
+@media (max-width: 640px) {
+  .applied-word {
+    display: none;
+  }
+}
+
+/*
+ * The status badges: NEW / NOTIFIED on Home, SUGGESTED on Jobs. One per row.
+ *
+ * Smaller and louder than a `.tag` — uppercase, tracked out, and only NEW and
+ * SUGGESTED carry the accent colour. NOTIFIED is deliberately the quiet one: it
+ * is what almost every row says today, and a page of coloured badges is a page
+ * with no signal on it. The colour marks the rows that want attention.
+ */
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--ink-3);
+  position: relative;
+  top: -1px;
+}
+
+.badge.new,
+.badge.suggested {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  color: var(--accent);
+}
+
+li.job.applied .badge {
+  background: none;
 }
 
 .sr-only {

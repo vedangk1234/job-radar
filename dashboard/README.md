@@ -87,9 +87,50 @@ to every open posting including the sales roles, and is the screen that answers
 Neither ships job rows with the page. Both ship counts; a row fetches its own
 jobs from `/api/companies/:id/jobs?filter=matches|all` the first time it opens.
 
-`notified` is deliberately absent from the Home filter. Home is "what fits me
+`notified` is deliberately absent from the Home **filter**. Home is "what fits me
 right now", not "what has not been emailed yet" — a job sent in this morning's
-digest is still a job worth applying to this afternoon.
+digest is still a job worth applying to this afternoon. It is shown as a
+**badge** instead, which is the same flag reported rather than acted on.
+
+### Status badges
+
+One per row, derived at render from data the row already has. There is no column
+for any of them and there must not be: a badge is a reading of the match rules
+plus `notified`, and the match rules depend on the `preferences` row, which is
+editable from another tab. A stored badge would be a cached answer to a question
+whose inputs change under it.
+
+| Badge | Where | Means |
+| --- | --- | --- |
+| **NEW** | Home | a match with `notified = false` — in the digest queue, not yet emailed |
+| **NOTIFIED** | Home | a match with `notified = true` — already went out in a digest |
+| **SUGGESTED** | Jobs | this raw-list row also passes the filter |
+
+Non-matching rows on Jobs get no badge at all, which is the point: that screen is
+several hundred postings including the sales roles, and SUGGESTED is how the few
+that fit are findable in it.
+
+Every match in the database is currently `notified = true`, because the table was
+silently seeded and the digest cron does not exist yet — so Home reads NOTIFIED
+everywhere until the cron starts leaving fresh jobs unsent.
+
+### The Applied checkbox
+
+Home only. Ticking it `PATCH`es `/api/jobs/applied` with the job's
+`canonical_id`, which sets `applied = true` and stamps `applied_at`; unticking
+clears both. The row then dims, strikes its title through and sinks to the bottom
+of its company — the apply link still works, because having applied is the most
+likely reason to want to open it again. A small "N applied" count appears beside
+the company's "for you" number.
+
+These two columns are the **only** ones on `jobs` the dashboard writes, and the
+distinction is ownership rather than read-versus-write. Every other column
+records something a fetch observed, so the crawler owns it. These record
+something no fetch can discover and no crawl can recompute. The crawler
+correspondingly never writes them: `crawler/store.UPSERT_SEEN` and
+`notify/store.SAVE_DESCRIPTION_FACTS_SQL` name neither column, and
+`tests/test_applied_column.py` asserts that both textually and by ticking a row
+and running whole crawl cycles — close, reopen, rename — over it.
 
 ## Scripts
 
@@ -101,18 +142,22 @@ digest is still a job worth applying to this afternoon.
 | `npm run db:check` | proves the transaction pooler works with `prepare: false` |
 | `npm run parity` | diffs the TS ports against the Python originals |
 | `npm run match-parity` | diffs the match filter against `notify/match.py` over the live table |
+| `npm run ui-check` | renders the real job row over live rows from a **running** dev server and asserts the checkbox and badges are actually in the markup |
 | `npm run mint-session` | a local test session cookie — see the file header |
 
 ## What this app does not do
 
-No cron, no email, no writes to the crawler's Python code. The jobs views are
-strictly read-only: the crawler owns `jobs`, and a dashboard able to edit
-`notified` or `status` could silently un-send or re-send a digest.
+No cron, no email, no writes to the crawler's Python code. It cannot touch the
+lifecycle of a job: the crawler owns `jobs.notified` and `jobs.status`, and a
+dashboard able to edit either could silently un-send or re-send a digest.
 
 It also never fetches a job description. The `desc not checked` hint on Home
 reports that `desc_checked` is still false for that row and stops there —
-reading the description is the digest run's job, and doing it from a page load
-would make opening a screen cost a few hundred network requests.
+reading the description happens during the **crawl** (`crawler/enrich.py`, moved
+there in Step 5d), so the hint marks the minutes between a job appearing and the
+next crawl reaching it. Doing it from a page load would make opening a screen
+cost a few hundred network requests.
 
-The only writes it performs are `companies.tracked`, `companies.category`, the
-single `preferences` row, and inserting a company.
+The writes it performs are `companies.tracked`, `companies.category`, the single
+`preferences` row, inserting a company, and `jobs.applied` / `jobs.applied_at` —
+see below for why those last two are the exception that proves the rule.

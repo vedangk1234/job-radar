@@ -1,0 +1,17 @@
+{
+  // For `npm run ui-check` only, which is the one script that imports a React
+  // component and renders it.
+  //
+  // The main tsconfig sets `jsx: "preserve"` because Next's own compiler does
+  // the JSX transform. tsx/esbuild reads the same field and, seeing "preserve",
+  // falls back to the CLASSIC transform — it emits `React.createElement` into a
+  // module that never imports React, and the script dies with
+  // "React is not defined" the moment it renders anything.
+  //
+  // react-jsx is the automatic runtime: the transform imports what it needs.
+  // Scoped to this file so nothing about the actual build changes.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx"
+  }
+}

@@ -17,9 +17,16 @@ export const dynamic = "force-dynamic";
  * Ordered by name rather than by count. Home ranks; this one is a reference,
  * and a reference you look things up in should be where you left it.
  *
- * `notified` is shown here and nowhere else. It was only ever dangerous as an
- * editable field — the crawler owns it, and a dashboard that could flip it could
- * silently re-send or un-send a digest. Reading it is just a fact about the row.
+ * `notified` is shown here as text. It was only ever dangerous as an editable
+ * field — the crawler owns it, and a dashboard that could flip it could silently
+ * re-send or un-send a digest. Reading it is just a fact about the row.
+ *
+ * The one badge this screen shows is SUGGESTED, on the rows that also pass the
+ * filter. It is the same shared matcher Home uses, applied to a list that is not
+ * filtered by it — which is what makes it worth showing here and pointless on
+ * Home, where it would be on every row. There is no Applied checkbox here: this
+ * screen is the raw reference, and the tick belongs on the list of jobs worth
+ * applying to.
  */
 export default async function JobsPage() {
   await requirePage();
@@ -37,8 +44,11 @@ export default async function JobsPage() {
       </p>
       <CompanyList initial={companies} mode="all" />
       <p className="muted small" style={{ marginTop: 14 }}>
+        A <span className="badge suggested">suggested</span> badge marks the postings that also
+        pass your filter — the same matcher Home uses, run over this unfiltered list. Everything
+        without one is a job the filter would drop, which is exactly what this screen is for.
         Counts are open jobs only; hover a count to see how many closed postings are also
-        stored. For the filtered view — what actually fits you — see Home.
+        stored.
       </p>
     </>
   );
