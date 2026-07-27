@@ -12,16 +12,18 @@
 # yourself to remember, and the failure mode is a rotated Supabase password and
 # a rewritten history. Treat a block as correct until proven otherwise.
 #
-# Two checks, both against staged content rather than the working tree, so a
+# Three checks, all against staged content rather than the working tree, so a
 # `git add -p` of a hunk containing a key is caught even when the file on disk
 # looks clean:
 #
 #   1. FORBIDDEN NAMES — files that exist only to hold real values.
 #   2. SECRET SHAPES   — literals shaped like credentials, wherever they
 #                        appear, including inside a file with an innocent name.
+#   3. PERSONAL DATA   — a contact address or the committer's own identity
+#                        baked into a committed file instead of read from env.
 #
-# Check 2 reads the whole staged blob, not just the added lines. Slightly
-# stricter than it needs to be, and deliberately: a secret three commits old
+# Checks 2 and 3 read the whole staged blob, not just the added lines. Slightly
+# stricter than they need to be, and deliberately: a secret three commits old
 # that you are now editing around is still a secret.
 #
 # Self-reference note: this script names the shapes it hunts for, so two
@@ -66,6 +68,76 @@ OPENAI_KEY='\bsk-[A-Za-z0-9_-]{16,}'
 PG_URL_WITH_PASSWORD='postgres(ql)?://[^:@/[:space:]]+:[^<>@[:space:]]{3,}@'
 
 PATTERNS="$RESEND_KEY|$GOOGLE_SECRET|$OPENAI_KEY|$SUPABASE_REF|$PG_URL_WITH_PASSWORD"
+
+# --- 3. personal data -----------------------------------------------------
+# A contact address or handle belongs in .env, read at runtime with a neutral
+# fallback (see fetchers/http.py and dashboard/src/lib/ats.ts), never as a
+# literal in a committed file. Enforcing that needs to know the values — and
+# writing them here would put them in the repo, which is the exact thing being
+# prevented. So none of the three rules below names a person:
+#
+#   A. STRUCTURAL  any address on a domain that is not reserved for examples.
+#                  Catches a real contact address without knowing which one,
+#                  and keeps catching it after the owner's address changes.
+#   B. IDENTITY    git config user.email / user.name, read at run time. Whoever
+#                  is making the commit is precisely who must not appear in its
+#                  content, so the guard needs no configuration to work.
+#   C. EXPLICIT    PERSONAL_DENYLIST in the environment, or git config
+#                  jobradar.personalDenylist, for what the first two miss: an
+#                  old address, or a handle that differs from user.name.
+#
+# Rule A is the one that matters, and it is a whitelist inverted rather than a
+# denylist: RFC 2606 and 6761 reserve example.com/.net/.org/.edu and the .test,
+# .example, .invalid and .localhost TLDs so that documentation and fixtures can
+# name an address that can never be a person's. An address on one of those is
+# not personal data; anything else is assumed to be until proven otherwise.
+
+# The leading class excludes ':' so that the credentials in a connection URL of
+# the form postgres://user:<password>@host are not read as an address, the user
+# being followed by ':' where a local part never is. That shape is check 2's job
+# and this file's own test carries one on purpose. (The placeholder spelling
+# here is not incidental: check 2 would flag the literal form, correctly.)
+EMAIL_RE='(^|[^:A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+
+# Anchored at the end because grep -o emits one address per line, so '$' is the
+# end of the address itself. onboarding@resend.dev is Resend's shared sandbox
+# sender — a published vendor constant, not a person, and the documented FROM
+# for an account with no verified domain, so .env.example, notify/digest.py and
+# the digest tests all name it.
+EMAIL_ALLOWED='@(example\.(com|net|org|edu)|localhost)$|\.(test|example|invalid|localhost)$|onboarding@resend\.dev$'
+
+# Never treated as personal even when they are the git identity: a CI robot or
+# a placeholder name would otherwise match half the repo and teach you to reach
+# for --no-verify. Short tokens are dropped for the same reason (below).
+GENERIC_IDENTITY=' user admin administrator test tests dev devel root ubuntu runner github actions gitlab jenkins docker node python local localhost example unknown nobody noreply none null your name email '
+
+# Rules B and C, resolved to one alternation. Lowercased and matched with -i:
+# an address is case-insensitive in its domain and conventionally in its local
+# part, and a handle gets typed both ways.
+DENY_RE=''
+for value in $(
+	{
+		git config user.email
+		git config user.name
+		git config user.email | sed 's/@.*//'
+		git config --get-all jobradar.personalDenylist
+		printf '%s\n' "${PERSONAL_DENYLIST:-}" | tr ',;' '  '
+	} 2>/dev/null | tr 'A-Z' 'a-z' | sort -u
+); do
+	# 5 characters is the floor because a 4-letter identity ("dave", "test") is
+	# a substring of too much ordinary text. A name that short needs
+	# PERSONAL_DENYLIST and an explicit decision.
+	[ "${#value}" -lt 5 ] && continue
+	case "$GENERIC_IDENTITY" in
+	*" $value "*) continue ;;
+	esac
+	escaped=$(printf '%s' "$value" | sed 's/[][\.^$*+?(){}|]/\\&/g')
+	if [ -z "$DENY_RE" ]; then
+		DENY_RE=$escaped
+	else
+		DENY_RE="$DENY_RE|$escaped"
+	fi
+done
 
 RED='' BOLD='' DIM='' RESET=''
 if [ -t 2 ]; then
@@ -125,6 +197,41 @@ while IFS= read -r path; do
 		printf '    %smatched one of: re_… | %s… | sk-… | supabase project ref | postgres:// with password%s\n\n' \
 			"$DIM" "$GOOGLE_SECRET" "$RESET" >&2
 	fi
+
+	# Check 3A. grep -o prints one address per line so the allow-list can anchor
+	# on the address rather than on the surrounding text; -n survives -o, giving
+	# `LINE:address`. The address IS printed here, unlike a secret above: it is
+	# what makes the block actionable, it is not a credential, and it is already
+	# in a file you are holding.
+	mail=$(git show ":$path" 2>/dev/null |
+		grep -I -n -o -E "$EMAIL_RE" 2>/dev/null |
+		grep -i -v -E "$EMAIL_ALLOWED" 2>/dev/null | head -5)
+	if [ -n "$mail" ]; then
+		header
+		printf '  %sreal contact address%s  %s\n' "$BOLD" "$RESET" "$path" >&2
+		printf '%s\n' "$mail" | while IFS= read -r hit; do
+			printf '    line %s%s\n' "$hit" "$RESET" >&2
+		done
+		printf '    %sread it from the environment instead (MY_EMAIL, ALLOWED_EMAIL) with an\n' "$DIM" >&2
+		printf '    example.com fallback; a fixture address needs an example/.test domain%s\n\n' "$RESET" >&2
+	fi
+
+	# Check 3B/3C. Line numbers only: the matched token is the committer's own
+	# name or address, and echoing it into a terminal is what the report of a
+	# personal-data leak should not do.
+	if [ -n "$DENY_RE" ]; then
+		own=$(git show ":$path" 2>/dev/null |
+			grep -I -n -i -E "$DENY_RE" 2>/dev/null | head -5)
+		if [ -n "$own" ]; then
+			header
+			printf '  %spersonal identity%s  %s\n' "$BOLD" "$RESET" "$path" >&2
+			printf '%s\n' "$own" | while IFS= read -r hit; do
+				printf '    line %s%s\n' "${hit%%:*}" "$RESET" >&2
+			done
+			printf '    %smatched your git identity or PERSONAL_DENYLIST — keep your name and\n' "$DIM" >&2
+			printf '    handle out of committed files; read them from env at run time%s\n\n' "$RESET" >&2
+		fi
+	fi
 done <<EOF
 $list
 EOF
@@ -135,6 +242,8 @@ Fix it, do not bypass it:
   - move the value into .env (gitignored) and reference it by name
   - `git restore --staged <path>` to unstage the file
   - if the value already reached a remote, it is burned: rotate it first
+  - a personal-data hit that is genuinely a false positive belongs in the
+    allow-list in this hook, with a note saying why it is not a person
 
 --no-verify exists and this hook cannot stop you. It can only make sure
 the decision is one you made on purpose.

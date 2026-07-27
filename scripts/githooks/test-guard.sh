@@ -122,7 +122,52 @@ case_ block scratch.md    'nothing secret in here at all'
 case_ block sub/.env      'a forbidden name in a subdirectory is still forbidden'
 
 echo
+echo "personal data (must be blocked):"
+# The split is BEFORE the '@' rather than inside the local part, because the
+# email rule needs at least one local-part character immediately left of the
+# '@'. A bare quote there matches nothing, so this source file is committable
+# while the file it writes to disk is byte-for-byte a real address.
+P_MAIL='someone.real''@gmail.com'
+P_MAIL2='hire''@acme-corp.co.in'
+case_ block contact.ts    "const UA = \"job-radar/0.1 (+$P_MAIL)\";"
+case_ block nested/ua.py  "email = \"$P_MAIL2\""
+
+# Rule B, and the reason it needs no fixture: the values come from the git
+# identity at run time, so the probe is generated rather than written down and
+# this file still names nobody. Skipped rather than failed when git has no
+# identity configured — a fresh CI clone often has none, and a skip that says
+# so is honest where a pass would not be.
+IDENT_MAIL=$(git config user.email 2>/dev/null)
+IDENT_NAME=$(git config user.name 2>/dev/null)
+if [ -n "$IDENT_MAIL" ]; then
+	case_ block identity-email.md "contact: $IDENT_MAIL"
+else
+	echo "  skip  block   identity-email.md (git config user.email unset)"
+fi
+if [ -n "$IDENT_NAME" ] && [ "${#IDENT_NAME}" -ge 5 ]; then
+	case_ block identity-name.md "author: $IDENT_NAME"
+else
+	echo "  skip  block   identity-name.md (git config user.name unset or under 5 chars)"
+fi
+
+# Rule C, exercised through the environment the same way it is meant to be used.
+# Exported explicitly rather than as a `VAR=x case_ ...` prefix: POSIX leaves
+# what that means for a FUNCTION unspecified, and the value has to reach a
+# grandchild process (case_ runs `sh "$HOOK"`), which needs a real export.
+PERSONAL_DENYLIST='oldhandle42'
+export PERSONAL_DENYLIST
+case_ block denylist.txt  'see github.com/oldhandle42/x'
+case_ allow notdeny.txt   'see github.com/someoneelse/x'
+unset PERSONAL_DENYLIST
+
+echo
 echo "false positives (must be ALLOWED — a guard that cries wolf gets bypassed):"
+case_ allow fixture.py    'monkeypatch.setenv("MY_EMAIL", "me@example.test")'
+case_ allow fallback.ts   'process.env.MY_EMAIL?.trim() || "unknown@example.com"'
+case_ allow template.txt  'ALLOWED_EMAIL=you@example.com'
+# Resend's sandbox sender is a vendor constant the digest genuinely depends on.
+case_ allow sandbox.py    'SANDBOX_FROM = "onboarding@resend.dev"'
+case_ allow localpart.md  'the local part before the @ is called the local part'
 case_ allow prose.md      'risk-free task-runner disk-usage: none of these are sk- keys'
 case_ allow example.txt   'DASHBOARD_DB_URL=postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:6543/postgres'
 case_ allow shortre.txt   'RESEND_API_KEY=re_xxxxxxxx'
