@@ -104,7 +104,20 @@ EMAIL_RE='(^|[^:A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
 # sender — a published vendor constant, not a person, and the documented FROM
 # for an account with no verified domain, so .env.example, notify/digest.py and
 # the digest tests all name it.
-EMAIL_ALLOWED='@(example\.(com|net|org|edu)|localhost)$|\.(test|example|invalid|localhost)$|onboarding@resend\.dev$'
+#
+# That vendor constant needs a LEFT boundary as well as the '$'. With only the
+# right anchor it read as "any address ENDING in the allowed one", so a local
+# part with anything glued to the front of 'onboarding' — x…, evil…, a real
+# mailbox — inherited the exemption by suffix. (Those examples are described
+# rather than spelled: written out in full they are addresses this very check
+# now blocks, and the hook must not block its own source. Same reason the two
+# patterns above are assembled from halves.) The boundary is
+# not a bare '^' because EMAIL_RE captures the character in front of the
+# address (see the note above it), so grep -o emits " onboarding@resend.dev"
+# with its leading separator; '^' would never match. '(^|[^A-Za-z0-9._%+-])'
+# accepts either the start of the line or exactly the separator EMAIL_RE ate,
+# and rejects a local part that merely ends in the allowed one.
+EMAIL_ALLOWED='@(example\.(com|net|org|edu)|localhost)$|\.(test|example|invalid|localhost)$|(^|[^A-Za-z0-9._%+-])onboarding@resend\.dev$'
 
 # Never treated as personal even when they are the git identity: a CI robot or
 # a placeholder name would otherwise match half the repo and teach you to reach
