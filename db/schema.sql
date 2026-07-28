@@ -165,7 +165,10 @@ ALTER TABLE preferences ADD COLUMN IF NOT EXISTS max_level INT NOT NULL DEFAULT 
 INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at)
 VALUES (
   1,
-  ARRAY['blr', 'pune', 'hyd', 'india-unclear'],
+  -- Three cities, strictly. 'india-unclear' was here and is not any more: see
+  -- notify/match.DEFAULT_CITIES for why, and add it back from the preferences
+  -- screen (not here) if the noise turns out to be worth it.
+  ARRAY['blr', 'pune', 'hyd'],
   ARRAY['software engineer', 'software developer', 'software development engineer',
         'sde', 'associate software engineer', 'member of technical staff', 'mts',
         'application developer', 'programmer', 'forward deployed engineer',

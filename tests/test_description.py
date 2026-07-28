@@ -185,11 +185,76 @@ def test_the_adobe_line_is_read_the_same_way_out_of_its_markup():
 def test_a_range_may_be_anchored_anywhere_on_its_own_line_but_not_across_one():
     """`N-M years` is a shape prose does not produce by accident, so it gets room.
 
-    A newline still stops it, because a benefits paragraph must not lend the word
-    "experience" to a duration in the bullet above it.
+    A newline still stops the LANGUAGE anchor, because a benefits paragraph must
+    not lend the word "experience" to a duration in the bullet above it. The
+    probe has to be a duration that does not lead its line, since a leading one
+    is anchored by position instead and would pass for the other reason — see
+    test_a_bullet_that_opens_with_a_duration_is_a_requirement.
     """
     assert detect_min_experience("2-4 years designing and shipping backend experience") == 2
-    assert detect_min_experience("2-4 years\nexperience is valued here") is None
+    assert detect_min_experience("we shipped it in 2-4 years\nexperience is valued here") is None
+
+
+def test_the_inmobi_bullet_that_leaked_a_lucknow_sde_2_into_the_digest():
+    """The exact line, verbatim, from InMobi's "SDE 2" (greenhouse:38:7956882).
+
+    It reached the inbox as a match. Both existing anchors missed it and for
+    reasons that were individually correct: _RANGE_RE found "3–6 years" and
+    _line_has_context threw it away because the bullet says "engineering" rather
+    than "experience", and _YEARS_RE is forbidden from reaching the word on the
+    NEXT bullet. So a requirements list that never uses the word "experience" —
+    an entirely ordinary way to write one — stated no requirement at all.
+
+    Asserted as the raw line and as the surrounding bullets, because the bug was
+    about what the neighbouring lines could and could not contribute.
+    """
+    assert detect_min_experience("3–6 years in data/platform engineering") == 3
+
+    section = (
+        "Required Skills\n"
+        "3–6 years in data/platform engineering\n"
+        "Experience with Airflow (or similar orchestration tools)\n"
+        "Kafka / streaming systems experience"
+    )
+    assert detect_min_experience(section) == 3
+
+    # ... and the sibling posting, "SDE II - Salesforce AI", which leaked on the
+    # single-bound form of the same shape.
+    assert detect_min_experience("4+ years of Salesforce development (Lightning Platform)") == 4
+
+
+def test_the_leaked_inmobi_job_is_now_hidden_by_the_experience_filter():
+    """min 3 is above the ceiling, so the row stops being a match. End to end."""
+    from notify.match import Preferences, is_match
+
+    prefs = Preferences()
+    job = {"title": "SDE 2", "city": "blr", "min_experience": None, "is_pm_role": False}
+    assert is_match(job, prefs), "it passed every title test — that was never in doubt"
+
+    job["min_experience"] = detect_min_experience("3–6 years in data/platform engineering")
+    assert job["min_experience"] == 3
+    assert not is_match(job, prefs)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "5 years of service award",
+        "4 years of vesting, with a one-year cliff",
+        "3 years warranty on every device we ship",
+        "10 years ago we started in a garage",
+        "12 years of growth across 40 markets",
+        "8 years in business and profitable since 2019",
+    ],
+)
+def test_a_duration_leading_a_perks_or_about_us_bullet_is_not_a_requirement(line):
+    """Position alone is not enough, because a perks list is bulleted too.
+
+    Every one of these leads its line exactly the way a requirement does. If the
+    leading-duration rule read them as minimums it would delete real jobs and
+    say nothing — the one-directional failure this module is arranged against.
+    """
+    assert detect_min_experience(line) is None
 
 
 def test_a_single_duration_in_ordinary_prose_is_still_not_a_requirement():
@@ -317,10 +382,15 @@ def test_real_html_with_literal_escaped_brackets_is_not_mangled():
 
 def test_block_tags_become_line_breaks_so_list_items_stay_apart():
     """Fusing two bullets would invent sentences neither of them said."""
-    text = html_to_text("<ul><li>2 years</li><li>experience with Kafka</li></ul>")
-    assert text == "2 years\nexperience with Kafka"
+    text = html_to_text("<ul><li>we shipped in 2 years</li><li>experience with Kafka</li></ul>")
+    assert text == "we shipped in 2 years\nexperience with Kafka"
     # ... and the fused version would have read as a requirement it never stated.
     assert detect_min_experience(text) is None
+
+    # The line break is still there when the duration DOES lead its bullet — the
+    # verdict changes because position anchors it, not because the bullets fused.
+    leading = html_to_text("<ul><li>2 years</li><li>experience with Kafka</li></ul>")
+    assert leading == "2 years\nexperience with Kafka"
 
 
 def test_scripts_and_styles_are_dropped_entirely():
@@ -394,12 +464,180 @@ def test_workable_and_recruitee_read_requirements_as_well_as_description():
 def test_an_ats_with_no_verified_description_route_returns_none():
     """Unknown is a real answer, and it means keep the job.
 
-    Workday is absent from this list on purpose now — it has a route of its own
-    (the CXS detail endpoint), which does not go through description_from_row
-    because it is a separate request rather than a row of the board payload.
+    Workday and SmartRecruiters are both absent from this list on purpose now —
+    each has a route of its own (the CXS detail endpoint, the public posting
+    API), and neither goes through description_from_row, because both are a
+    separate request rather than a row of the board payload already in hand.
     """
     assert description_from_row("smartrecruiters", {"name": "Engineer"}) is None
     assert description_from_row("custom_sitemap", {}) is None
+
+
+# --- smartrecruiters: the public single-posting route ----------------------
+#
+# The payload below is the real shape, taken from a live 200 against
+# api.smartrecruiters.com/v1/companies/continental/postings/{id} — four sections,
+# each `{title, text}` with HTML in the text. No network here: polite_get is
+# replaced, so what is under test is the assembly and the parse, not httpx.
+
+# Bound at import time on purpose. conftest.py's autouse `no_description_fetches`
+# fixture rebinds notify.description.fetch_description to an offline stub, which
+# is right for every other test and is exactly what these four need to see past:
+# the thing being tested IS the dispatch. The fixture replaces the module
+# attribute, not this reference, so this name stays the real function — and each
+# test still patches `polite_get`, so no board is contacted either way.
+from notify.description import fetch_description as _real_fetch_description  # noqa: E402
+
+
+SR_PAYLOAD = {
+    "id": "744000116156242",
+    "name": "Automation Platform Engineer",
+    "jobAd": {
+        "sections": {
+            "companyDescription": {
+                "title": "Company Description",
+                "text": "<p>Headquartered in Hannover, the division contributes "
+                        "Euro 6B+ to Continental's Euro 40B+ turnover. Founded in 1871.</p>",
+            },
+            "jobDescription": {
+                "title": "Job Description",
+                "text": "<p>Ensure stability, availability and scalability of the "
+                        "automation platform.</p>",
+            },
+            "qualifications": {
+                "title": "Qualifications",
+                "text": "<ul><li>Bachelor's degree in Information Technology</li>"
+                        "<li>5–8 years in platform and automation engineering</li>"
+                        "<li>Solid Experience with software architecture</li></ul>",
+            },
+            "additionalInformation": {
+                "title": "Additional Information",
+                "text": "<ul><li>5 years of service award</li>"
+                        "<li>Ready to drive with us? Fill in the online application.</li></ul>",
+            },
+        }
+    },
+}
+
+
+class _FakeFetched:
+    def __init__(self, payload, ok=True):
+        self.ok = ok
+        self.json = payload
+
+
+@pytest.mark.asyncio
+async def test_smartrecruiters_reads_all_four_sections_of_the_job_ad(monkeypatch):
+    """The requirement lives in `qualifications`, so a partial read is no read.
+
+    This is Lever's trap on a different vendor: `jobDescription` is the prose
+    about the work and `qualifications` is where every years-of-experience line
+    actually sits. Reading only the first would make every SmartRecruiters
+    posting look like it stated no minimum — the exact bug the route exists to
+    fix, reintroduced one field lower down.
+    """
+    import notify.description as desc
+
+    seen = {}
+
+    async def fake_get(url, **kwargs):
+        seen["url"] = url
+        return _FakeFetched(SR_PAYLOAD)
+
+    monkeypatch.setattr(desc, "polite_get", fake_get)
+
+    text = await _real_fetch_description(
+        {"ats": "smartrecruiters", "token": "continental"},
+        {"canonical_id": "smartrecruiters:31:744000116156242"},
+    )
+
+    assert seen["url"] == (
+        "https://api.smartrecruiters.com/v1/companies/continental"
+        "/postings/744000116156242"
+    )
+    # Every section is present, headings included.
+    for fragment in ("Company Description", "Hannover", "Qualifications",
+                     "Bachelor's degree", "Additional Information"):
+        assert fragment in text
+
+    # The bullet is anchored by POSITION — it never says the word "experience" —
+    # which is the InMobi fix reaching a second ATS.
+    assert desc.detect_min_experience(text) == 5
+    assert desc.detect_pm_role(text, "Automation Platform Engineer") is False
+
+
+@pytest.mark.asyncio
+async def test_the_perk_bullet_in_additional_information_is_not_a_requirement(monkeypatch):
+    """`additionalInformation` is the perks bucket, and it is read anyway.
+
+    "5 years of service award" leads a bullet exactly the way a requirement
+    does. It is here rather than in a unit test of the regex because this is the
+    real section it turns up in, and the reason the leading-duration anchor
+    carries a lookahead instead of trusting position alone.
+    """
+    import notify.description as desc
+
+    payload = {"jobAd": {"sections": {
+        "jobDescription": {"title": "Job Description", "text": "<p>Build things.</p>"},
+        "additionalInformation": {
+            "title": "Additional Information",
+            "text": "<ul><li>5 years of service award</li>"
+                    "<li>10 years ago we started in a garage</li></ul>",
+        },
+    }}}
+
+    async def fake_get(url, **kwargs):
+        return _FakeFetched(payload)
+
+    monkeypatch.setattr(desc, "polite_get", fake_get)
+
+    text = await _real_fetch_description(
+        {"ats": "smartrecruiters", "token": "acme"},
+        {"canonical_id": "smartrecruiters:1:99"},
+    )
+    assert "5 years of service award" in text
+    assert desc.detect_min_experience(text) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload,ok,why",
+    [
+        (None, False, "the request failed"),
+        ({}, True, "200 with no jobAd at all"),
+        ({"jobAd": {}}, True, "a jobAd carrying no sections"),
+        ({"jobAd": {"sections": {}}}, True, "sections present but empty"),
+    ],
+)
+async def test_a_smartrecruiters_posting_we_cannot_read_is_none_not_a_crash(
+    monkeypatch, payload, ok, why
+):
+    """None is the answer "we do not know", and every caller keeps the job."""
+    import notify.description as desc
+
+    async def fake_get(url, **kwargs):
+        return _FakeFetched(payload, ok=ok)
+
+    monkeypatch.setattr(desc, "polite_get", fake_get)
+
+    assert await _real_fetch_description(
+        {"ats": "smartrecruiters", "token": "acme"}, {"canonical_id": "smartrecruiters:1:99"}
+    ) is None, why
+
+
+@pytest.mark.asyncio
+async def test_a_smartrecruiters_row_with_no_vendor_id_asks_nobody(monkeypatch):
+    """A `hash:` id names no posting, so there is nothing to request."""
+    import notify.description as desc
+
+    async def boom(url, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("no request should be made without a vendor id")
+
+    monkeypatch.setattr(desc, "polite_get", boom)
+
+    assert await _real_fetch_description(
+        {"ats": "smartrecruiters", "token": "acme"}, {"canonical_id": "hash:abc123"}
+    ) is None
 
 
 # --- workday: the public URL back to the CXS detail path ------------------

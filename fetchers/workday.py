@@ -56,7 +56,7 @@ from urllib.parse import quote
 
 from .fixtures import save_fixture
 from .http import polite_post
-from .normalize import city_label, join_parts, make_job
+from .normalize import india_funnel, join_parts, make_job
 
 # limit=100 is rejected with HTTP 400 by every tenant tested. 20 is the cap.
 PAGE_SIZE = 20
@@ -309,7 +309,7 @@ def _india_share(postings: list, host: str, site: str, lang: str | None) -> floa
     rows = [map_posting(p, host, site, lang) for p in postings if isinstance(p, dict)]
     if not rows:
         return 0.0
-    hits = sum(1 for r in rows if city_label(r["location"]) != "other")
+    hits = sum(1 for r in rows if india_funnel(r["location"]))
     return hits / len(rows)
 
 
@@ -451,9 +451,12 @@ async def fetch_workday_detailed(
     rows = list(jobs.values())
 
     if not scoped:
-        # No source-side filter, so filter here. `other` is the only label that
-        # is confidently not-India; india-unclear stays in, as everywhere else.
-        kept = [r for r in rows if city_label(r["location"]) != "other"]
+        # No source-side filter, so filter here. The test is "could this be in
+        # India at all" — normalize.india_funnel — and NOT `city_label != other`,
+        # which stopped meaning the same thing when named Indian cities outside
+        # our three began labelling `other`. A Mumbai row is dropped by the city
+        # FILTER, later; dropping it here would be the crawler judging a job.
+        kept = [r for r in rows if india_funnel(r["location"])]
         print(
             f"  workday:{token} unfiltered fallback kept {len(kept)}/{len(rows)} "
             f"fetched row(s) by city label (board total {total})",

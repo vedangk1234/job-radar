@@ -55,8 +55,11 @@ async def test_seed_run_stores_every_job_already_notified(conn):
     assert await queued(conn) == set()  # zero would-be notifications
 
     # The city label is computed and stored, and is not used to drop anything:
-    # the "Mumbai, India" rows are stored exactly like the Bengaluru ones.
-    assert {r["city"] for r in rows.values()} == {"blr", "india-unclear"}
+    # the "Mumbai, India" rows are stored exactly like the Bengaluru ones. They
+    # label `other` now rather than `india-unclear` — Mumbai is a named city and
+    # naming one is an answer — and STORING them anyway is the point of the
+    # assertion. Store loosely; the label decides nothing until the digest.
+    assert {r["city"] for r in rows.values()} == {"blr", "india-unclear", "other"}
     assert sum(1 for r in rows.values() if r["city"] != "blr") == 5
 
 

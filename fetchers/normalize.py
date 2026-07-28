@@ -64,8 +64,28 @@ def canonical_id(
 #
 # Matching is generous on purpose. A missed Bangalore posting is a job we never
 # see; a false positive is one line of noise in a digest. When a string is
-# ambiguous we bias toward india-unclear rather than other, because
+# AMBIGUOUS we bias toward india-unclear rather than other, because
 # india-unclear stays in the funnel and other drops out of it.
+#
+# AMBIGUOUS IS NOT THE SAME AS "INDIAN BUT ELSEWHERE"
+# ---------------------------------------------------
+# That distinction used to be missing, and it leaked jobs. Every India signal —
+# the country name, a state, and every named Indian city — collapsed into one
+# bucket that resolved to `india-unclear`. So "Lucknow" and "Remote" got the
+# same label, even though one of them is a confident statement that the posting
+# is NOT in Bangalore, Hyderabad or Pune and the other is no statement at all.
+# With india-unclear in preferences.cities, an InMobi "SDE 2" posted in Lucknow
+# read as a match; so did Noida, Mohali and Gurgaon rows.
+#
+# `india-unclear` now means only what its name says: we could not tell. A string
+# that NAMES an Indian place we do not want is as certain as a string naming
+# London, and it labels `other` for the same reason — the uncertainty the
+# inclusion bias exists to protect is simply not present.
+#
+# The three home states are the deliberate exception and stay unclear:
+# "Karnataka" alone may well be Bengaluru, "Maharashtra" may be Pune,
+# "Telangana" may be Hyderabad. A state that CONTAINS a target city is genuinely
+# ambiguous, which is exactly the case the unclear label is for.
 
 # SHORT CODES, AND WHY THEY ARE SAFE HERE
 # ---------------------------------------
@@ -156,18 +176,32 @@ _CITY_MARKERS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Elsewhere in India: real postings, just not our three cities.
-_INDIA_MARKERS = (
-    "india", "bharat",
+# Elsewhere in India: real postings, in a named place that is definitely not
+# Bangalore, Hyderabad or Pune. These are CONFIDENT — "Lucknow" is as precise
+# about where the job is not as "London" is — so they label `other`, and only
+# their India-ness (used by the Workday volume fallback, below) is remembered.
+#
+# Every state here excludes all three target cities. The three that do not —
+# Karnataka, Maharashtra, Telangana — are in _INDIA_VAGUE_MARKERS instead.
+_INDIA_ELSEWHERE_MARKERS = (
     "mumbai", "bombay", "navi mumbai", "thane", "delhi", "new delhi", "ncr",
     "gurgaon", "gurugram", "noida", "ghaziabad", "faridabad", "chennai",
     "madras", "kolkata", "calcutta", "ahmedabad", "gandhinagar", "surat",
     "jaipur", "indore", "bhopal", "nagpur", "coimbatore", "kochi", "cochin",
     "trivandrum", "thiruvananthapuram", "chandigarh", "mohali", "lucknow",
     "bhubaneswar", "vizag", "visakhapatnam", "mysore", "mysuru", "vadodara",
-    "karnataka", "maharashtra", "telangana", "andhra pradesh", "tamil nadu",
-    "kerala", "gujarat", "haryana", "uttar pradesh", "west bengal", "punjab",
-    "rajasthan", "odisha", "apac", "asia pacific",
+    "andhra pradesh", "tamil nadu", "kerala", "gujarat", "haryana",
+    "uttar pradesh", "west bengal", "punjab", "rajasthan", "odisha",
+)
+
+# India signals that name no city at all, so they cannot rule a target city out.
+# "India" is the country; the three states each CONTAIN one of our cities; APAC
+# is a sales region. All of them are genuine uncertainty, which is the one thing
+# `india-unclear` is for.
+_INDIA_VAGUE_MARKERS = (
+    "india", "bharat",
+    "karnataka", "maharashtra", "telangana",
+    "apac", "asia pacific",
 )
 
 # Anchors that place a posting outside India with enough confidence to say so.
@@ -181,7 +215,12 @@ _NON_INDIA_MARKERS = (
     "krakow", "romania", "bucharest", "czech", "prague", "hungary", "budapest",
     "sweden", "stockholm", "norway", "oslo", "denmark", "copenhagen", "finland",
     "helsinki", "italy", "rome", "milan", "greece", "athens", "turkey",
-    "istanbul", "israel", "tel aviv", "uae", "dubai", "abu dhabi", "qatar",
+    "istanbul", "israel", "tel aviv", "uae", "united arab emirates", "dubai",
+    # "bay area" is here for the same reason "banglore" is a blr marker: a real
+    # row was mislabelled by it. samsara posts "Remote - SF Bay Area", which
+    # named no marker at all and fell through to the vague test as though the
+    # location were unknown. It is not unknown; it is California.
+    "bay area", "abu dhabi", "qatar",
     "doha", "saudi", "riyadh", "egypt", "cairo", "nigeria", "lagos", "kenya",
     "nairobi", "south africa", "cape town", "johannesburg", "australia",
     "sydney", "melbourne", "new zealand", "auckland", "singapore", "malaysia",
@@ -218,13 +257,31 @@ def _hit(haystack: str, marker: str) -> bool:
     return re.search(rf"\b{re.escape(marker.strip())}\b", haystack) is not None
 
 
-def city_label(location_str: Any) -> str:
-    """One of: blr | pune | hyd | india-unclear | other.
+# The finer verdict city_label collapses. Six values rather than five, because
+# two questions are being asked of the same string and they have different
+# answers: "does this job sit in one of my cities?" (city_label, which is what
+# jobs.city stores and the filter reads) and "is this posting plausibly in India
+# at all?" (india_funnel, which is what the Workday volume fallback needs).
+#
+# `india-elsewhere` and `non-india` both collapse to `other` for the first
+# question and part company on the second. Keeping them apart HERE rather than
+# giving jobs.city a sixth value is deliberate: the stored label is read by two
+# runtimes and a preferences editor, and a label nothing filters on would be a
+# vocabulary change for every one of them to buy one call site a predicate.
+_INDIA_FUNNEL = frozenset({"blr", "hyd", "pune", "india-elsewhere", "india-unclear"})
 
-    Precedence: a named target city wins; then any other India signal; then a
+
+def _classify(location_str: Any) -> str:
+    """blr | hyd | pune | india-elsewhere | india-unclear | non-india | unknown.
+
+    Precedence: a named target city wins; then a named Indian place that is not
+    one of them; then a country/state/region signal that names no city; then a
     confident non-India anchor; then vagueness, which resolves to india-unclear.
     An empty location is india-unclear — an unlabelled posting on an Indian
     company's board is far more likely to be Indian than not.
+
+    The elsewhere test sits ABOVE the non-India one so "Mumbai, India" is read
+    as Mumbai, and BELOW the target cities so "Mumbai / Bangalore" is still blr.
     """
     text = norm(location_str)
     if not text:
@@ -236,16 +293,47 @@ def city_label(location_str: Any) -> str:
         if any(_hit(padded, m) for m in _CITY_MARKERS[label]):
             return label
 
-    if any(_hit(padded, m) for m in _INDIA_MARKERS):
+    if any(_hit(padded, m) for m in _INDIA_ELSEWHERE_MARKERS):
+        return "india-elsewhere"
+
+    if any(_hit(padded, m) for m in _INDIA_VAGUE_MARKERS):
         return "india-unclear"
 
     if any(_hit(padded, m) for m in _NON_INDIA_MARKERS):
-        return "other"
+        return "non-india"
 
     if any(_hit(padded, m) for m in _VAGUE_MARKERS):
         return "india-unclear"
 
-    return "other"
+    return "unknown"
+
+
+def city_label(location_str: Any) -> str:
+    """One of: blr | pune | hyd | india-unclear | other.
+
+    `other` is every posting we are confident is not in one of the three cities,
+    whether it says so by naming Lucknow or by naming London. `india-unclear` is
+    reserved for the strings that make no such statement — "Remote", "India",
+    "Multiple Locations", a state that contains a target city, and the empty
+    string. That split is the whole point: the inclusion bias protects genuine
+    uncertainty, and a posting that names its city is not uncertain.
+    """
+    verdict = _classify(location_str)
+    return verdict if verdict in ("blr", "hyd", "pune", "india-unclear") else "other"
+
+
+def india_funnel(location_str: Any) -> bool:
+    """Could this posting plausibly be in India? Vagueness counts as yes.
+
+    Not the same question as `city_label(...) != "other"`, and the difference is
+    exactly the rows that changed meaning when `india-elsewhere` stopped being
+    called `india-unclear`. fetchers/workday.py uses this to trim an UNSCOPED
+    board — a tenant with no India facet, where the alternative is paging a
+    2000-req worldwide board — and it must go on keeping the Mumbai rows it has
+    always kept. Storing loosely is a promise about the jobs table; the city
+    filter runs later and is where a Mumbai row is supposed to be dropped.
+    """
+    return _classify(location_str) in _INDIA_FUNNEL
 
 
 # --- small helpers used by the fetchers -----------------------------------

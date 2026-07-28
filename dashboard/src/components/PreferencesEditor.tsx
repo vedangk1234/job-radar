@@ -58,9 +58,13 @@ export function PreferencesEditor({ initial }: { initial: Preferences }) {
       <div className="panel">
         <h2>Cities</h2>
         <p className="hint">
-          Which <code>city_label</code> values may be sent. <code>india-unclear</code> is the
-          catch-all for a posting that is Indian but does not name one of the three cities —
-          dropping it loses real jobs.
+          Which <code>city_label</code> values may be sent. <code>india-unclear</code> now means
+          only &ldquo;we could not tell&rdquo; &mdash; &ldquo;Remote&rdquo;, bare
+          &ldquo;India&rdquo;, or a state that contains one of the three cities. A posting that
+          names an Indian city we did not ask for (Lucknow, Noida, Mohali) is{" "}
+          <code>other</code>, the same as London. It is off by default because it used to be on
+          and leaked 14 wrong-city jobs into one digest; turning it back on costs noise, not
+          correctness.
         </p>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
           {CITY_LABELS.map((label) => (

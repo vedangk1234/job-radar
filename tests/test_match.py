@@ -93,10 +93,46 @@ def test_backend_role_in_another_city_is_dropped_on_city():
     assert not is_match(j, PREFS)
 
 
-def test_india_unclear_backend_role_is_included():
-    """'Remote, India' is a job worth seeing; ambiguity stays in the funnel."""
+def test_india_unclear_backend_role_is_dropped_under_the_strict_default():
+    """The city gate has no inclusion bias, and this is where that shows.
+
+    'Remote - India' used to match, because DEFAULT_CITIES carried
+    'india-unclear'. The argument was that ambiguity should stay in the funnel —
+    sound in itself, and undone by the labeller, which put every named Indian
+    city into the same bucket. "Lucknow" and "Remote" were indistinguishable to
+    the filter, and an InMobi SDE 2 in Lucknow reached the inbox because of it.
+
+    Both halves were fixed. Lucknow is `other` now (see test_city_variants.py),
+    and the gate below is strict: three labels, nothing else.
+    """
     j = job("Backend Engineer", city="india-unclear", location="Remote - India")
-    assert is_match(j, PREFS)
+    assert keyword_ok(j, PREFS) and not excluded(j, PREFS)
+    assert not city_ok(j, PREFS)
+    assert not is_match(j, PREFS)
+
+
+def test_a_null_city_is_not_a_pass():
+    """An unlabelled row must never slip through on "we do not know".
+
+    `or ""` in city_ok is what makes this true, and the empty string is in no
+    preferences list by construction — the API rejects a blank city entry.
+    """
+    for missing in (None, ""):
+        j = job("Backend Engineer", city=missing, location="")
+        assert not city_ok(j, PREFS)
+        assert not is_match(j, PREFS)
+
+
+def test_the_unclear_label_is_still_available_to_anyone_who_wants_it():
+    """Strictness is the DEFAULT, not a rule the preferences row cannot change.
+
+    The filter is data, and this is the whole reason it is: re-adding
+    'india-unclear' from the preferences screen brings the old behaviour back on
+    the very next digest, with no redeploy and no commit.
+    """
+    lenient = Preferences(cities=("blr", "pune", "hyd", "india-unclear"))
+    j = job("Backend Engineer", city="india-unclear", location="Remote - India")
+    assert is_match(j, lenient)
 
 
 # --- word boundaries ------------------------------------------------------

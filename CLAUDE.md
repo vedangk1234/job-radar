@@ -323,12 +323,23 @@ every open job. The last two read columns, not text, and the seam is named
 explicitly because the enrichment pass needs to know which jobs are worth a
 network request: the ones that already pass every title test.
 
-**Every ambiguity resolves toward keeping the job.** `min_experience IS NULL`
-covers three different situations — never read, read and no minimum stated, and
-fetch failed — and all three mean *we do not know, so do not hide it*. Only a
-confident minimum above 2, or a detected PM role, hides a posting. Likewise a
-title stating no level survives: treating silence as senior would empty the
-digest.
+**Every ambiguity resolves toward keeping the job — except the city.**
+`min_experience IS NULL` covers three different situations — never read, read
+and no minimum stated, and fetch failed — and all three mean *we do not know, so
+do not hide it*. Only a confident minimum above 2, or a detected PM role, hides
+a posting. Likewise a title stating no level survives: treating silence as
+senior would empty the digest.
+
+`city_ok` is the one test with no inclusion bias, and the asymmetry is the
+point. A description can be absent and a level can go unstated, but a location
+string is always present and always readable — so a label outside
+`preferences.cities` is an answer rather than a gap, and a NULL label is a bug
+rather than a doubt. `or ""` turns an unlabelled row into the empty string,
+which is in no preferences list, so "we never labelled it" can never read as a
+pass. The seeded default is three cities exactly; `india-unclear` used to be
+there too and is not any more (see *City labelling*). Re-adding it from the
+preferences screen restores the old behaviour on the next digest — the filter is
+data, which is the whole reason it is.
 
 **Word boundaries, not substrings.** Every term compiles to a `\b`-anchored
 regex. The naive `term in title.lower()` is wrong in both directions and fails
@@ -382,19 +393,59 @@ Enrichment must never touch a lifecycle column, and that is a property of the
 SQL rather than a promise: the `UPDATE` in `notify/store.py` names only the five
 description columns, so it cannot re-open a closed job or clear a notified flag.
 
+**Where the description comes from**, per ATS — and the split is one request
+versus zero:
+
+| Route | ATSes | Cost |
+|---|---|---|
+| Already in the board payload the crawler fetched | `lever`, `ashby`, `workable` (`details=true`), `recruitee` | 0 extra requests; one board fetch cached per `(ats, token)` per process |
+| A single-posting endpoint | `greenhouse` (`?content=true&questions=true`), `smartrecruiters` (public posting API), `workday` (the tenant's own CXS detail path) | 1 request per candidate |
+| No verified route | `custom_jsonld`, `custom_sitemap` | none — recorded as a **failed** read, so it is asked again tomorrow rather than believed forever |
+
+An ATS with no route is not a neutral gap, and treating it as one is how jobs
+leak. `min_experience` stays NULL, NULL means keep, and the posting goes into the
+digest with nothing known about it — so the whole second-stage filter is silently
+switched off for that vendor. SmartRecruiters was in this state until 2026-07-28
+and it cost 12 of 46 matches; Workday was in it before that. `desc_fetch_failed`
+exists so the difference between "read it, it said nothing" and "never managed to
+read it" is visible in the table instead of being a thing someone has to remember.
+
 ### City labelling
 
 `fetchers/normalize.city_label` returns `blr` | `pune` | `hyd` |
-`india-unclear` | `other`. Precedence: a named target city wins, then any other
-India signal, then a confident non-India anchor, then vagueness ("Remote",
-"Multiple Locations") which resolves to `india-unclear`. An empty location is
-`india-unclear` — an unlabelled posting on an Indian company's board is more
-likely Indian than not.
+`india-unclear` | `other`. Precedence: a named target city wins, then a **named
+Indian place that is not one of them** (`other`), then a country/state/region
+signal that names no city (`india-unclear`), then a confident non-India anchor
+(`other`), then vagueness — "Remote", "Multiple Locations" — which resolves to
+`india-unclear`. An empty location is `india-unclear`; an unlabelled posting on
+an Indian company's board is more likely Indian than not.
 
 Matching is generous on purpose: a missed Bangalore posting is a job never seen,
-a false positive is one line of noise. When a string is ambiguous the bias is
-`india-unclear` rather than `other`, because `india-unclear` stays in the funnel
-and `other` drops out of it.
+a false positive is one line of noise. When a string is **ambiguous** the bias
+is `india-unclear` rather than `other`, because `india-unclear` stays in the
+funnel and `other` drops out of it.
+
+**Ambiguous is not the same as "Indian, elsewhere", and conflating them leaked
+jobs.** Every India signal used to share one bucket, so "Lucknow" and "Remote"
+got the same label — even though one is a confident statement that the posting
+is not in any of the three cities and the other is no statement at all. With
+`india-unclear` in `preferences.cities`, an InMobi "SDE 2" in Lucknow read as a
+match, and so did Noida, Mohali and Gurgaon rows: 14 of 61. A string that names
+an Indian place we did not ask for is now `other`, for the same reason "London"
+is — the uncertainty the inclusion bias protects is simply not present.
+
+The three home states are the deliberate exception and stay `india-unclear`:
+Karnataka contains Bengaluru, Maharashtra contains Pune, Telangana contains
+Hyderabad, so a posting labelled with only one of them may well be in a city we
+want. "Uttar Pradesh" cannot be, and is `other`.
+
+`other` therefore now answers "not one of my cities" rather than "not India",
+and one call site needed the older question kept: the Workday **unfiltered
+fallback**, which trims an unscoped tenant's board before storing it. It asks
+`normalize.india_funnel` instead — target city, Indian elsewhere, or vague — so
+it goes on storing the Mumbai rows it always did. Had it been left reading
+`city_label(...) != "other"` it would have silently begun dropping them, which
+would be the crawler filtering jobs: exactly what *store loosely* forbids.
 
 Beyond full city names, the markers include:
 
@@ -428,6 +479,23 @@ marker?" from the data instead of from English, and `scripts/relabel_cities.py`
 recomputes `jobs.city` for stored rows. The relabel pass hashes every column
 *except* `city` before and after and asserts they are identical, so "the UPDATE
 only touches city" is evidence rather than an argument.
+
+### Re-deciding what a description said
+
+`scripts/recheck_descriptions.py` is `relabel_cities.py`'s argument applied to
+the other pair of read-once columns, and it is shaped differently because the
+evidence is gone. `city` can be recomputed from the location string still on the
+row; `min_experience` and `is_pm_role` cannot, because the description was
+deliberately discarded. So the script computes nothing — it clears
+`desc_checked` on the rows a detector change could newly decide differently
+(open, read cleanly, no minimum found, *and* still a title-stage match), and the
+next ordinary crawl does the fetching through the ordinary polite path.
+
+It is **not idempotent**, unlike the relabel, and that is the one thing to know
+before running it: most descriptions state no minimum, so a row re-read
+successfully returns to exactly the state the script selects on. It is a manual
+step taken once after `notify/description.py` actually changes — never on the
+crawl path, never in the cron.
 
 ---
 
@@ -931,13 +999,112 @@ Newest last. Append here as the project evolves.
   probes 24 candidates at once*), which is the difference between a 2.5-hour
   sweep and a 45-minute one at identical politeness.
 
+- **2026-07-28 — Step 7b. The Lucknow leak.** An InMobi "SDE 2" posted in
+  Lucknow, asking for 3–6 years, reached the inbox as a match. Two independent
+  filters should each have stopped it and neither did, and the diagnosis matters
+  more than either fix because the first hypothesis was wrong: enrichment was
+  **not** skipping the 36 discovery-added companies. All 100 open title-stage
+  matches were enriched, InMobi's included — `ENRICHMENT_TARGETS_SQL` never
+  filtered on company and `crawl.py` runs the pass after every board.
+
+  What actually happened was two separate things.
+
+  *City.* `city_label` put every India signal in one bucket, so "Lucknow"
+  labelled `india-unclear` — the same label as "Remote" — and `india-unclear`
+  was in `preferences.cities`. Named Indian places outside the three cities are
+  `other` now, and the seeded city list is three cities exactly. A sweep found
+  this was never one job: **14 of 61 matches** were `india-unclear` and every one
+  of them named a place — Noida (Adobe, Cadence), Mohali (Zscaler), Lucknow
+  (InMobi), plus "Remote, United Arab Emirates" and "Remote - SF Bay Area",
+  which reached that label by naming no marker at all. `relabel_cities.py` moved
+  **501 stored rows** `india-unclear -> other`, one transition and no other, with
+  the lifecycle fingerprint identical before and after.
+
+  *Experience.* The row was read, cleanly, and the parser found nothing in
+  "3–6 years in data/platform engineering". Both existing anchors were
+  individually right to miss it: `_RANGE_RE` found the range and
+  `_line_has_context` threw it away because the bullet says "engineering" rather
+  than "experience", and `_YEARS_RE` is forbidden from reaching the word on the
+  next bullet. A requirements list that never uses the word "experience" is
+  completely ordinary, and it stated no requirement at all. So position is now a
+  third anchor: a duration that OPENS its own line is a requirement — with a
+  lookahead excluding the shapes that can lead a line and still not be a career
+  ("5 years of service award", "10 years ago"), because a perks list is bulleted
+  exactly like a requirements list and reading one as a minimum deletes a job
+  silently.
+
+  Two things this step also produced. `normalize.india_funnel` — because `other`
+  stopped meaning "not India", and the Workday unfiltered fallback was still
+  asking it that question; left alone it would have quietly stopped *storing*
+  Mumbai rows. And `scripts/recheck_descriptions.py`, because a parser change
+  does not reach rows that already hold a conclusion, which is the same problem
+  `relabel_cities.py` exists for and needed a differently-shaped answer.
+
+- **2026-07-28 — Step 7c. The SmartRecruiters description route.** Finishing 7b
+  turned up the third way the same failure could happen, and it was not a bug in
+  a detector — it was a detector that never ran. `fetch_description` had no
+  SmartRecruiters route, so 12 of the 46 surviving matches (10 Continental, 1
+  Lendingkart, 1 Unacademy) came back `desc_fetch_failed`, and unknown means
+  KEEP. Twelve jobs were in the digest on no evidence at all about their
+  experience requirement — the exact state the InMobi row was in, on a quarter of
+  the list.
+
+  The public posting API answers it, unauthenticated:
+  `api.smartrecruiters.com/v1/companies/{token}/postings/{id}` ->
+  `jobAd.sections.{companyDescription, jobDescription, qualifications,
+  additionalInformation}`. All four are read. `qualifications` is the
+  load-bearing one and is Lever's trap on a different vendor: it is where every
+  years-of-experience line lives, so reading only `jobDescription` would have
+  reintroduced the bug one field lower down. `additionalInformation` is the perks
+  bucket and is read anyway — the detectors are built to survive a perks list
+  rather than to be kept away from one, which is precisely what the new
+  leading-duration lookahead is for.
+
+  It worked immediately and the numbers moved again: **31 descriptions read, 0
+  failed** (was 12 failing), and **8 Continental roles turned out to want 3–6
+  years**. So the final count is **61 -> 38**, not the 46 that 7b alone
+  predicted — 46 was only ever "46 that survived the two filters we could
+  actually run". `match-parity` agrees with `notify/match.py` on all 7,693 live
+  rows, `preview_digest --dry-run --ignore-notified` reports the same 38, and of
+  those 38: **0 in the wrong city, 0 unread, 0 unavailable** (blr 34, hyd 3,
+  pune 1).
+
+  One ordering note worth keeping, because the obvious order is wrong.
+  `recheck_descriptions.py` selects on `title_stage_ok`, which reads `jobs.city`
+  — so it must run *after* `relabel_cities.py`, never before. Run first, it would
+  clear `desc_checked` on rows that were about to become wrong-city, and
+  enrichment never asks about those, so the flag would sit at FALSE forever
+  recording "nobody has read this" about a description that had been read. That
+  is the hazard the script's own docstring names, reached from the other side.
+
+  The 24-hour retry gate also had to be stepped around once, deliberately:
+  `RETRY_AFTER` exists so a **down board** is not hammered every half hour, and
+  these twelve rows were not a down board — they were a route that did not exist.
+  Their last look was 14 hours old, so an ordinary crawl would have skipped them
+  for another ten. `enrich_matches(now=...)` is the injection point; shifting
+  `now` forward by exactly `RETRY_AFTER` makes the cutoff the real present, which
+  re-asks every failed row once and cannot touch a clean read (those are never
+  re-read whatever the cutoff says).
+
 **Pending**
 
-- Deploy the dashboard to Vercel (and register the production OAuth redirect
-  URI, which cannot exist until the domain does).
 - Work the `discovered_companies` "try Workday" queue by hand with
   `scripts/add_workday.py` — the sweep cannot resolve a Workday site.
-- Rotate the Supabase database password.
+
+**Won't do (deliberate)**
+
+- **Rotate the Supabase database password.** Decided against, rather than
+  outstanding. The DSN lives in `.env` (gitignored and blocked by filename), in
+  four GitHub Actions secrets and in Vercel's environment — rotating it means
+  updating all three in lockstep, and a miss takes the hourly cron down silently
+  until the next digest fails to send. The password has never been committed:
+  the pre-commit guard blocks credential shapes, and the unpushed dashboard
+  history was squashed so no blob carries one. Revisit only if it actually leaks.
+
+**Done since this list was written**
+
+- Deploy the dashboard to Vercel — **done.** It is deployed with Root Directory
+  = `dashboard`, and the production OAuth redirect URI is registered.
 
 ---
 

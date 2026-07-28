@@ -77,8 +77,8 @@ def test_the_misspelling_never_fires_inside_a_longer_word(location):
 
 def test_west_bengal_is_still_a_state_and_not_a_city():
     """The fuzzy pass's only other near-miss. It is a real place, correctly not ours."""
-    assert city_label("Kolkata, West Bengal") == "india-unclear"
-    assert city_label("West Bengal, India") == "india-unclear"
+    assert city_label("Kolkata, West Bengal") == "other"
+    assert city_label("West Bengal, India") == "other"
 
 
 # --- what was deliberately left out ---------------------------------------
@@ -133,12 +133,14 @@ def test_unevidenced_misspellings_are_not_markers(location):
         ("IND-Hyderabad-CapitaLand", "hyd"),
         ("PUNE 05", "pune"),
         ("India, Pune", "pune"),
-        # Everything the survey listed as a leftover stays exactly where it was.
-        ("Noida", "india-unclear"),
-        ("India - Mumbai", "india-unclear"),
-        ("IND-Mumbai-One World Center", "india-unclear"),
+        # A named Indian city outside the three is `other` — it says where the
+        # job is, and the answer is "not here". Only strings naming no city at
+        # all stay `india-unclear`.
+        ("Noida", "other"),
+        ("India - Mumbai", "other"),
+        ("IND-Mumbai-One World Center", "other"),
+        ("Mysore", "other"),
         ("Remote India", "india-unclear"),
-        ("Mysore", "india-unclear"),
         ("Hubballi", "other"),
         ("Nashik", "other"),
         ("Varanasi", "other"),

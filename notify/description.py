@@ -188,6 +188,56 @@ _MINIMUM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A duration that OPENS ITS OWN LINE is a requirement, whatever else the line
+# says. This is the third anchor, and it exists because the other two both
+# missed a real InMobi posting — "SDE 2", Lucknow — whose Required Skills
+# section reads:
+#
+#     3–6 years in data/platform engineering
+#     Experience with Airflow (or similar orchestration tools)
+#
+# _RANGE_RE finds "3–6 years" and then throws it away, because _line_has_context
+# looks for experience language on that line and the line says "engineering"
+# instead. _YEARS_RE cannot reach the word "experience" on the NEXT line, by
+# design — reading across a bullet break is how a requirement gets invented. So
+# a bullet that states its requirement in the ordinary way, without ever using
+# the word, stated nothing at all. The sibling posting "SDE II - Salesforce AI"
+# leaked the same way on "4+ years of Salesforce development (Lightning
+# Platform)".
+#
+# The position IS the context. html_to_text turns every </li> into a newline, so
+# a line beginning "3–6 years …" or "4+ years …" is a bullet in a requirements
+# list, and prose does not begin a paragraph that way. That makes this a
+# stricter test than it looks: only the leading token counts, so the
+# "3000+ strong team" and "over 100 unicorns" numbers this module was built to
+# ignore stay invisible — they are mid-sentence, and they are not years.
+#
+# Two guards keep it honest. The lower bound of a range is what is captured (a
+# range asks for at least its floor), and the nouns below are excluded outright
+# — the shapes that can genuinely lead a line and still not be a career:
+#
+#     "10 years ago we started in a garage"     retrospective prose
+#     "5 years of service award"                a benefits bullet
+#     "3 years of growth"                       an about-us bullet
+#
+# The last two are the reason this is a lookahead and not just a position test.
+# A perks list is bulleted exactly like a requirements list, so position alone
+# would read "5 years of service" as a five-year minimum and delete the job —
+# the silent, one-directional failure the whole module is arranged against.
+_NOT_A_CAREER = (
+    r"(?:ago|since|back|"
+    r"(?:of[ \t]+|in[ \t]+)?"
+    r"(?:service|vesting|warranty|operation|growth|history|business|tenure)\b)"
+)
+
+_LEADING_DURATION_RE = re.compile(
+    r"^[ \t]*[-–—•*●▪]?[ \t]*"
+    r"(\d{1,2})[ \t]*(?:(?:[-–—]|to)[ \t]*\d{1,2}[ \t]*)?\+?[ \t]*"
+    r"(?:years?|yrs?)\b"
+    r"(?![ \t]*" + _NOT_A_CAREER + r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # Roles that say outright that they want no experience at all.
 _ENTRY_RE = re.compile(
     r"\bfreshers?\b|\bentry[\s\-]?level\b|\bnew\s+grads?\b|\bnew\s+graduates?\b"
@@ -232,6 +282,13 @@ def detect_min_experience(text: Any) -> int | None:
     the overwhelming majority of descriptions and always means KEEP. Silence is
     not a requirement of zero and not a requirement of ten; it is silence.
 
+    Three anchors make a number readable as a requirement, and a duration needs
+    only one of them: experience LANGUAGE beside it (_YEARS_RE, _MINIMUM_RE, and
+    the same-line test _RANGE_RE uses), or POSITION at the head of its own
+    bullet (_LEADING_DURATION_RE). The second was added because a requirements
+    list that never says the word "experience" is completely ordinary, and used
+    to read as stating no requirement at all.
+
     The SMALLEST confident figure wins when a description states several. A JD
     that says "2+ years required, 5+ preferred" is a 2-year job, and reading the
     larger number would drop exactly the roles worth applying to.
@@ -251,7 +308,7 @@ def detect_min_experience(text: Any) -> int | None:
         if low == 0 or _line_has_context(text, *match.span()):
             found.append(low)
 
-    for pattern in (_YEARS_RE, _MINIMUM_RE):
+    for pattern in (_YEARS_RE, _MINIMUM_RE, _LEADING_DURATION_RE):
         for match in pattern.finditer(text):
             years = int(match.group(1))
             if years <= _MAX_PLAUSIBLE_YEARS:
@@ -330,14 +387,50 @@ def detect_pm_role(title: Any, text: Any) -> bool:
 # inside the same list payload the crawler already knows how to ask for, so the
 # whole board is fetched once and every candidate on it is answered from memory.
 #
-# Greenhouse's list endpoint deliberately does NOT carry content — fetchers/
-# tier1.py leaves ?content=true off precisely because it inflates every row with
-# megabytes we never store. The single-job endpoint carries it instead, so
-# Greenhouse costs one request per candidate. Verified live against
+# Greenhouse and SmartRecruiters are the other shape: their list endpoints carry
+# no description at all, so each candidate costs one request. Greenhouse's
+# fetchers/tier1.py leaves ?content=true off precisely because it inflates every
+# row with megabytes we never store. Verified live against
 # boards-api.greenhouse.io/v1/boards/{token}/jobs/{id}?content=true, which
 # answers 200 with an HTML-escaped `content` field.
 
 GREENHOUSE_JOB_URL = "https://boards-api.greenhouse.io/v1/boards/{token}/jobs/{job_id}"
+
+# SmartRecruiters' single-posting route. The board endpoint tier1.py pages
+# through returns summary rows only — `name`, `location`, `department`,
+# `experienceLevel` and no prose — so the description has to be asked for per
+# job, exactly as with Greenhouse. Verified live, unauthenticated, 200:
+#
+#   https://api.smartrecruiters.com/v1/companies/{token}/postings/{id}
+#     -> {"jobAd": {"sections": {"companyDescription": {"title", "text"},
+#                               "jobDescription":     {...},
+#                               "qualifications":     {...},
+#                               "additionalInformation": {...}}}, …}
+#
+# This ATS had NO route here until now, and the cost of that was not theoretical:
+# 12 of the 46 live matches — 10 Continental, 1 Lendingkart, 1 Unacademy — came
+# back with nothing, and `unknown` means KEEP, so every one of them was in the
+# digest on no evidence about its experience requirement. That is precisely the
+# state the InMobi row was in.
+SMARTRECRUITERS_JOB_URL = "https://api.smartrecruiters.com/v1/companies/{token}/postings/{job_id}"
+
+# All four sections, in the order the ad reads them.
+#
+# `qualifications` is the load-bearing one and the reason a partial read would be
+# worse than none: it is where every years-of-experience line lives, the same way
+# Lever keeps requirements in `lists` rather than in `description`. Reading only
+# `jobDescription` would make every SmartRecruiters posting look like it stated
+# no experience at all — which is the bug this route exists to fix, reintroduced
+# one field lower down.
+#
+# `additionalInformation` is the perks bucket ("Attraktive Vergütung: …", a
+# benefits list) and is included anyway, for the same reason fetch of a Workable
+# board reads `benefits`: a real posting does sometimes state its requirement
+# there, and the detectors are built to survive a perks list rather than to be
+# kept away from one. _LEADING_DURATION_RE's _NOT_A_CAREER lookahead is exactly
+# that defence — "5 years of service award" leads a bullet in this section and
+# must not read as a five-year minimum.
+_SR_SECTIONS = ("companyDescription", "jobDescription", "qualifications", "additionalInformation")
 
 # Workday's own detail route, and the reason this file exists in its current
 # form. The board search endpoint the crawler pages through carries no
@@ -493,6 +586,39 @@ async def _greenhouse_description(token: str, job_id: str) -> str | None:
     return _joined(parts)
 
 
+async def _smartrecruiters_description(token: str, job_id: str) -> str | None:
+    """One SmartRecruiters posting's description, from the public posting API.
+
+    The section titles are joined in along with their bodies. That is not
+    decoration: the heading "Qualifications" (or its localised form) is often the
+    only thing marking where boilerplate ends and requirements begin, and it
+    costs a line of text that is thrown away with the rest of the document a
+    moment later.
+
+    Each section's `text` is HTML, so it goes through html_to_text like every
+    other vendor's markup — which is what turns `</li>` into the newline that
+    _LEADING_DURATION_RE anchors on. Politeness is the shared default: the same
+    client, semaphore, per-host pace and backoff as every other fetch here.
+    """
+    res = await polite_get(SMARTRECRUITERS_JOB_URL.format(token=token, job_id=job_id))
+    if not res.ok or not isinstance(res.json, dict):
+        return None
+
+    ad = res.json.get("jobAd")
+    sections = ad.get("sections") if isinstance(ad, dict) else None
+    if not isinstance(sections, dict):
+        return None
+
+    parts: list[Any] = []
+    for key in _SR_SECTIONS:
+        section = sections.get(key)
+        if not isinstance(section, dict):
+            continue
+        parts.append(section.get("title"))
+        parts.append(html_to_text(section.get("text")))
+    return _joined(parts)
+
+
 def workday_external_path(site: str, url: Any) -> str | None:
     """`https://h/en-US/mysite/job/Bangalore/X_R1` -> `/job/Bangalore/X_R1`.
 
@@ -571,6 +697,11 @@ async def fetch_description(
     if ats == "greenhouse":
         return await _greenhouse_description(token, str(native_id)) if native_id else None
 
+    if ats == "smartrecruiters":
+        return (
+            await _smartrecruiters_description(token, str(native_id)) if native_id else None
+        )
+
     if ats == "workday":
         return await _workday_description(company, job)
 
@@ -580,8 +711,8 @@ async def fetch_description(
         row = (await _board_index(ats, token)).get(str(native_id))
         return description_from_row(ats, row) if row else None
 
-    # smartrecruiters and the custom scrapers publish no description route this
-    # module has verified. Unknown, therefore kept — and now recorded as a
+    # The custom scrapers (custom_jsonld, custom_sitemap) publish no description
+    # route this module has verified. Unknown, therefore kept — and recorded as a
     # FAILED read rather than a clean one, so it is asked about again tomorrow
     # instead of being believed forever.
     return None

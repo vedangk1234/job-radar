@@ -107,7 +107,17 @@ from typing import Any, Iterable, Mapping, Sequence
 # well so tests and a --dry-run on a database that has not been migrated yet
 # have something honest to fall back on. The DATABASE is the source of truth at
 # runtime; this is a mirror, never an override.
-DEFAULT_CITIES = ("blr", "pune", "hyd", "india-unclear")
+#
+# `india-unclear` is deliberately NOT here. It used to be, on the argument that
+# a "Remote" posting at an Indian company is worth one line of noise — and the
+# argument was sound but the label was not: fetchers.normalize.city_label put
+# every named Indian city into that bucket too, so "Lucknow", "Noida" and
+# "Mohali" reached the inbox wearing the costume of an unknown location. That
+# labelling is fixed (those are `other` now), and the gate is strict on top of
+# it: three cities, and a posting that cannot prove it is in one of them does
+# not match. Re-add 'india-unclear' from the preferences screen to get the old
+# behaviour back — the row is the source of truth and this is only its mirror.
+DEFAULT_CITIES = ("blr", "pune", "hyd")
 
 # Grounded in the resume rather than in what a job board happens to call things:
 # every term here is a role title, a stack, or a discipline actually worth
@@ -342,10 +352,14 @@ def city_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
     """The job's stored city label is one we asked for.
 
     The label was computed at crawl time by fetchers.normalize.city_label and
-    written to the row; it is read here, never recomputed. 'other' is the only
-    label the default preferences drop, and 'india-unclear' is deliberately
-    kept — a posting whose location string says "Remote" at an Indian company
-    is a job worth seeing, and letting it through costs one line in a digest.
+    written to the row; it is read here, never recomputed.
+
+    The gate is strict and has to be: a label not in the list fails, and so does
+    a NULL one — `or ""` turns an unlabelled row into the empty string, which is
+    in no preferences list, so "we never labelled it" can never read as a pass.
+    This is the one test in the file with NO inclusion bias, because unlike a
+    silent description a location string is always present and always readable:
+    if the label is not one we asked for, that is an answer and not a gap.
     """
     return (job.get("city") or "") in prefs.cities
 
