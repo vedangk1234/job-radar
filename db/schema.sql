@@ -198,3 +198,50 @@ UPDATE preferences
        updated_at = now()
  WHERE id = 1
    AND NOT ('forward deployed engineer' = ANY (keywords));
+
+-- users: the account this whole install belongs to.
+--
+-- Until now the single user was implicit — one preferences row, one ALLOWED_EMAIL,
+-- one MY_EMAIL digest recipient, and nothing in the database naming any of them.
+-- This table is that user made explicit, and it is the anchor the rest of Phase 1
+-- hangs off. Nothing reads it yet: no crawler path, no dashboard route, no foreign
+-- key. It is deliberately inert so that adding it can break nothing.
+--
+-- id is a UUID rather than the SERIAL the rest of this schema uses, for one
+-- forward-looking reason: Phase 2 adds magic-link auth, and both Supabase Auth
+-- (auth.users.id) and the Auth.js database adapters key users by uuid. A SERIAL
+-- here would mean carrying a separate provider-id column to join on. gen_random_uuid()
+-- is built into Postgres 13+, so this needs no extension on Supabase.
+--
+-- SCHEMA-QUALIFIED, unlike every other table in this file, and it has to be:
+-- Supabase ships its own auth.users, so `users` is the one ambiguous table name
+-- on this database. A bare CREATE TABLE IF NOT EXISTS resolves against the
+-- connection's search_path, and db/connection.py sets none — so the target
+-- schema is a server-side default this file does not own. The failure that
+-- guards against is silent rather than loud: with auth ahead of public on the
+-- path, `IF NOT EXISTS` would find auth.users already there, skip, report
+-- success, and leave public.users uncreated. Naming the schema makes the target
+-- a property of the statement instead of of the session.
+CREATE TABLE IF NOT EXISTS public.users (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email       TEXT NOT NULL UNIQUE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  plan        TEXT NOT NULL DEFAULT 'free',   -- free | (future tiers); no CHECK, matching companies.category
+  is_active   BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+-- Email identity is case-insensitive in practice but TEXT UNIQUE is not, so
+-- 'Me@example.com' and 'me@example.com' would be two accounts — and with
+-- magic-link auth in Phase 2 that is two accounts a person cannot tell apart,
+-- silently. The plain
+-- UNIQUE above stays (it is what ON CONFLICT (email) targets); this index is what
+-- actually makes the identity one-per-person.
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_idx ON public.users (lower(email));
+
+-- No seed row here, deliberately, and this is the one place the seed cannot
+-- follow the preferences pattern above. The only user is a real person with a
+-- real address, and "no hardcoded personal data, anywhere" is enforced rather
+-- than requested: scripts/githooks/pre-commit blocks any address outside the
+-- RFC 2606/6761 example domains, so this INSERT could not be committed even if
+-- it were written. The seed lives in scripts/seed_user.py, which reads MY_EMAIL
+-- from the environment exactly as notify/digest.py does.

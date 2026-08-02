@@ -17,7 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from db.connection import get_crawler_conn  # noqa: E402
 
 SCHEMA_PATH = PROJECT_ROOT / "db" / "schema.sql"
-EXPECTED_TABLES = ["companies", "jobs", "discovered_companies", "notifications", "preferences"]
+EXPECTED_TABLES = ["companies", "jobs", "discovered_companies", "notifications", "preferences", "users"]
 
 
 async def main() -> int:
