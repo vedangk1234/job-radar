@@ -48,8 +48,12 @@ from .match import Preferences
 CHUNK = 400
 
 PREFERENCES_SQL = (
-    "SELECT cities, keywords, exclusions, max_level FROM preferences WHERE id = 1"
+    "SELECT cities, keywords, exclusions, max_level FROM preferences WHERE user_id = $1"
 )
+
+# Asked only when the statement above found nothing, and only to tell two very
+# different silences apart. See load_preferences.
+UNOWNED_PREFERENCES_SQL = "SELECT count(*) FROM preferences WHERE user_id IS NULL"
 
 # The queue, joined to its companies so the digest can group by employer without
 # a second round trip. Ordered by company then title so the rendered email is
@@ -145,16 +149,43 @@ def _placeholders(count: int, first: int) -> str:
     return ", ".join(f"${n}" for n in range(first, first + count))
 
 
-async def load_preferences(conn) -> Preferences:
-    """Read the single preferences row.
+async def load_preferences(conn, user_id) -> Preferences:
+    """Read this user's preferences row.
+
+    Keyed on the owner rather than on the old fixed address (`WHERE id = 1`).
+    `user_id` comes from db.users.resolve_current_user_id, which the entrypoints
+    call once per run and thread down — see that module on why the bridge is
+    temporary.
 
     A missing row falls back to the seeded defaults rather than raising, so a
     database that has not had the new schema applied yet still produces a
     correct digest instead of a stack trace. It is a fallback, not a default:
     the row is what the dashboard edits, and the row wins whenever it exists.
+
+    THE ONE SILENCE THAT IS NOT A FALLBACK. That fallback is only honest when
+    "no row for this user" means what it says. There is a second way to get zero
+    rows: db/schema.sql has been applied, adding a nullable user_id, but
+    scripts/backfill_preferences_user.py has not run yet — so the real row is
+    sitting there unowned and this query cannot see it. Falling back then would
+    replace a filter someone tuned with the seeded defaults and email the
+    results, which is exactly the "quietly wrong" failure this codebase spends
+    its guards on. So the two are told apart with one extra query, asked only in
+    the miss path, and the half-applied case raises instead.
     """
-    rows = await conn.fetch(PREFERENCES_SQL)
-    return Preferences.from_row(rows[0] if rows else None)
+    rows = await conn.fetch(PREFERENCES_SQL, user_id)
+    if rows:
+        return Preferences.from_row(rows[0])
+
+    if await conn.fetchval(UNOWNED_PREFERENCES_SQL):
+        raise RuntimeError(
+            "preferences.user_id is unset on an existing row: db/schema.sql has "
+            "been applied but scripts/backfill_preferences_user.py has not run. "
+            "Run it before crawling or sending a digest — until then this user's "
+            "filter is unreadable, and falling back to defaults would silently "
+            "replace it."
+        )
+
+    return Preferences.from_row(None)
 
 
 async def fetch_candidates(conn, *, ignore_notified: bool = False) -> list[Mapping[str, Any]]:

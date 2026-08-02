@@ -245,3 +245,69 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_idx ON public.users (lower(e
 -- RFC 2606/6761 example domains, so this INSERT could not be committed even if
 -- it were written. The seed lives in scripts/seed_user.py, which reads MY_EMAIL
 -- from the environment exactly as notify/digest.py does.
+
+-- preferences.user_id — the filter stops being "the" filter and becomes yours.
+--
+-- Until now "the preferences" was a row at a fixed address: id = 1, pinned by a
+-- CHECK, and every loader in both runtimes said WHERE id = 1. That was correct
+-- while the install had one user and nothing in the database naming them. This
+-- column is what replaces the fixed address with an owner, and it is the first
+-- thing to actually read public.users — the table added above was deliberately
+-- inert, and this is what wires it in.
+--
+-- FK DIRECTION: preferences.user_id -> public.users(id), the child on
+-- preferences. A filter is a property of a person; a person is not a property
+-- of a filter. This is also the direction that lets one user grow several
+-- preference rows later (see the index below); the reverse could not express
+-- that at all.
+--
+-- ON DELETE CASCADE, matching jobs.company_id above. A preferences row that
+-- outlives its owner is a filter deciding what reaches nobody's inbox — not
+-- data worth keeping, and precisely the row a later "the preferences for this
+-- user" lookup would trip over. RESTRICT was the alternative and would make
+-- deleting an account a two-step chore whose only benefit is preserving a row
+-- nothing can read.
+--
+-- NULLABLE, deliberately, and this is the part worth reading twice. ADD COLUMN
+-- ... NOT NULL needs a DEFAULT, and the only correct default is a UUID resolved
+-- from MY_EMAIL at runtime — a value no statement in this file can know, and
+-- one that could not be written here anyway without committing a real address.
+-- So the column arrives nullable, scripts/backfill_preferences_user.py fills
+-- it, and tightening to NOT NULL waits for Phase 2, when auth guarantees a user
+-- for every write. Nullable is also what makes this ALTER safe to re-run.
+--
+-- THE WINDOW THIS OPENS, AND WHAT CLOSES IT: between this ALTER and that
+-- backfill the row exists but is unowned, and a user-scoped loader finds
+-- nothing. Both loaders detect that state explicitly and refuse rather than
+-- falling back to defaults — see notify/store.load_preferences and
+-- dashboard/src/lib/preferences.ts, which distinguish "this user has no row"
+-- from "the migration is half-applied". Apply this file and run the backfill as
+-- one unit, with no crawl or digest in between.
+ALTER TABLE preferences ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES public.users(id) ON DELETE CASCADE;
+
+-- One preferences row per user — for now, and phrased so that "for now" is one
+-- line to undo.
+--
+-- A UNIQUE INDEX rather than ALTER TABLE ... ADD CONSTRAINT, for three reasons
+-- and the first is decisive: ADD CONSTRAINT has no IF NOT EXISTS in Postgres,
+-- so writing it idempotently needs a DO $$ ... $$ block, and this file is
+-- re-runnable plain statements from its first line onwards. Second, an index is
+-- removed by appending one DROP INDEX IF EXISTS, which keeps that removal
+-- append-only too; a table constraint is part of the table's definition and is
+-- the kind of thing a later foreign key would target, turning its removal into
+-- a negotiation. Third, the partial predicate says out loud that the rule is
+-- about OWNED rows, and keeps the pre-backfill state legal.
+--
+-- What this deliberately does NOT wall off: named multi-profiles. Nothing here
+-- says one-row-per-user except this index — the column is a plain nullable
+-- UUID and the foreign key is many-to-one by construction. Adding profiles is
+-- then: add a name column, DROP INDEX preferences_one_per_user_idx, and add
+-- UNIQUE (user_id, name). No table rewrite and no data migration.
+--
+-- One wall that IS still standing and is not this index's doing: the
+-- CHECK (id = 1) on the table above still caps the whole table at one row. That
+-- comes down in whichever sub-phase first needs a second preferences row, along
+-- with giving id a real sequence. Left alone here on purpose — no consumer
+-- today, and a PK reshape is not a change to make speculatively.
+CREATE UNIQUE INDEX IF NOT EXISTS preferences_one_per_user_idx
+    ON preferences (user_id) WHERE user_id IS NOT NULL;

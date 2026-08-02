@@ -20,9 +20,10 @@ export async function GET() {
  * Replace the preferences row wholesale.
  *
  * PUT rather than PATCH because the editor sends the full lists it is showing:
- * with a single shared row and one user, last-write-wins over a complete
- * document is simpler to reason about than merging partial updates, and there
- * is no second writer to lose an edit to.
+ * over one row owned by one user, last-write-wins on a complete document is
+ * simpler to reason about than merging partial updates, and there is no second
+ * writer to lose an edit to. The row is resolved by owner in lib/preferences.ts,
+ * so this route names no id and will not need to when auth lands.
  *
  * Validation is strict about two things, both because the failure is SILENT:
  *

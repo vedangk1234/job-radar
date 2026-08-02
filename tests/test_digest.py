@@ -30,8 +30,10 @@ from notify.digest import (
     run_digest,
     subject_line,
 )
+from db.users import resolve_current_user_id
 from notify.match import Preferences
 from notify.store import fetch_candidates, load_preferences, record_sent
+from tests.conftest import TEST_EMAIL, TEST_USER_ID
 
 TODAY = date(2026, 7, 26)
 
@@ -166,7 +168,87 @@ async def test_preferences_are_read_from_the_database_not_hardcoded(digest_conn)
 
 async def test_load_preferences_falls_back_when_the_row_is_missing(digest_conn):
     await digest_conn.execute("DELETE FROM preferences")
-    assert await load_preferences(digest_conn) == Preferences()
+    assert await load_preferences(digest_conn, TEST_USER_ID) == Preferences()
+
+
+# --- whose filter is it (Phase 1b: preferences belong to a user) -----------
+
+
+async def test_preferences_are_selected_by_owner_not_by_a_fixed_id(digest_conn):
+    """The row is found by user_id. A different user does not see it.
+
+    The point is that the query is keyed on the owner rather than on the old
+    `WHERE id = 1`: ask as somebody else and the seeded row — which is still
+    sitting there at id 1 — is simply not yours, so the defaults answer.
+    """
+    await digest_conn.set_preferences(cities=["blr"], keywords=["backend"])
+
+    mine = await load_preferences(digest_conn, TEST_USER_ID)
+    assert mine.cities == ("blr",)
+    assert mine.keywords == ("backend",)
+
+    stranger = await load_preferences(digest_conn, "00000000-0000-4000-8000-0000000000ff")
+    assert stranger == Preferences()
+
+
+async def test_an_unowned_row_raises_instead_of_falling_back_to_defaults(digest_conn):
+    """The nullable window between applying the schema and running the backfill.
+
+    This is the one silence that must not be treated as "you have no
+    preferences". The row exists and holds a filter someone tuned; it just has
+    no owner yet. Falling back to the seeded defaults here would quietly email
+    the results of a filter nobody chose, which is precisely the class of
+    failure the crawl guards exist to prevent — so it raises, and the message
+    names the script that fixes it.
+    """
+    await digest_conn.set_preferences(cities=["blr"], keywords=["backend"], user_id=None)
+
+    with pytest.raises(RuntimeError, match="backfill_preferences_user"):
+        await load_preferences(digest_conn, TEST_USER_ID)
+
+
+async def test_the_current_user_bridge_resolves_my_email(digest_conn):
+    assert await resolve_current_user_id(digest_conn) == TEST_USER_ID
+
+
+async def test_the_current_user_bridge_is_case_insensitive(digest_conn, monkeypatch):
+    """Matches users_email_lower_idx: identity does not depend on shift keys."""
+    monkeypatch.setenv("MY_EMAIL", TEST_EMAIL.upper())
+    assert await resolve_current_user_id(digest_conn) == TEST_USER_ID
+
+
+async def test_the_current_user_bridge_refuses_an_unset_my_email(digest_conn, monkeypatch):
+    monkeypatch.setenv("MY_EMAIL", "")
+    with pytest.raises(RuntimeError, match="MY_EMAIL is not set"):
+        await resolve_current_user_id(digest_conn)
+
+
+async def test_the_current_user_bridge_refuses_the_placeholder(digest_conn, monkeypatch):
+    monkeypatch.setenv("MY_EMAIL", "you@example.com")
+    with pytest.raises(RuntimeError, match="placeholder"):
+        await resolve_current_user_id(digest_conn)
+
+
+async def test_the_current_user_bridge_refuses_an_unseeded_address(digest_conn, monkeypatch):
+    """A valid address with no users row names the script that creates one."""
+    monkeypatch.setenv("MY_EMAIL", "someone-else@example.test")
+    with pytest.raises(RuntimeError, match="seed_user"):
+        await resolve_current_user_id(digest_conn)
+
+
+async def test_run_digest_resolves_the_user_when_none_is_injected(digest_conn):
+    """Production passes no user_id: the entrypoint resolves it from MY_EMAIL.
+
+    Proves the bridge is wired into the digest path rather than only importable
+    — and, because the seeded row is the one it finds, that the filter it ends
+    up applying is the row this user owns.
+    """
+    await digest_conn.set_preferences(cities=["blr"], keywords=["backend"])
+    await digest_conn.add_job("blr-backend", title="Backend Engineer")
+
+    run = await run_digest(digest_conn, today=TODAY, sender=FakeResend())
+
+    assert [j["canonical_id"] for j in run.matched] == ["blr-backend"]
 
 
 # --- flag update on success ----------------------------------------------

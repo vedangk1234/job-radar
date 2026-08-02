@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
+from db.users import resolve_current_user_id
 from notify.description import enrich_candidates
 from notify.match import Preferences, is_match, title_stage_ok
 from notify.store import fetch_enrichment_targets, load_preferences
@@ -106,6 +107,7 @@ def _newly_hidden(
 async def enrich_matches(
     conn,
     *,
+    user_id=None,
     prefs: Preferences | None = None,
     fetcher=None,
     now: datetime | None = None,
@@ -117,10 +119,16 @@ async def enrich_matches(
     a request and runs over what survived. Doing it in this order is what keeps
     the pass at a few dozen requests instead of 788.
 
-    `prefs`, `fetcher` and `now` are injection points for tests. Production
-    passes none of them.
+    `user_id`, `prefs`, `fetcher` and `now` are injection points for tests.
+    Production passes none of them: this is a crawl entrypoint, so it resolves
+    the current user once here and the lookup never repeats mid-pass. A caller
+    that already has `prefs` skips the resolution entirely — there is nothing
+    left to look a user up for.
     """
-    prefs = prefs if prefs is not None else await load_preferences(conn)
+    if prefs is None:
+        if user_id is None:
+            user_id = await resolve_current_user_id(conn)
+        prefs = await load_preferences(conn, user_id)
     now = now or datetime.now(timezone.utc)
     retry_before = now - RETRY_AFTER
 

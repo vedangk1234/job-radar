@@ -51,6 +51,7 @@ from typing import Any, Iterable, Mapping
 import httpx
 
 from db.connection import load_env
+from db.users import resolve_current_user_id
 
 from .description import enrich_candidates
 from .match import Preferences, select_matches, title_stage_ok
@@ -342,6 +343,7 @@ class DigestRun:
 async def run_digest(
     conn,
     *,
+    user_id=None,
     to: str | None = None,
     today: date | None = None,
     tag_suffix: str = "manual",
@@ -349,6 +351,12 @@ async def run_digest(
     describer=None,
 ) -> DigestRun:
     """Load, filter on titles, read descriptions, match, send, record.
+
+    `user_id` is whose filter to apply. It defaults to None and is resolved from
+    MY_EMAIL exactly once here, at the top of the run, rather than inside
+    load_preferences — this is the entrypoint, so this is where "once per run"
+    is a structural fact instead of a convention. Tests inject it. See
+    db/users.py: the whole mechanism is a Phase-2 bridge.
 
     `to` defaults to MY_EMAIL and is checked against it either way — the
     recipient is not a knob, it is an assertion (see assert_self_send).
@@ -363,7 +371,9 @@ async def run_digest(
     top, so a description is fetched only for a job that has already earned one.
     """
     run = DigestRun()
-    prefs = await load_preferences(conn)
+    if user_id is None:
+        user_id = await resolve_current_user_id(conn)
+    prefs = await load_preferences(conn, user_id)
 
     candidates = await fetch_candidates(conn)
     run.candidates = len(candidates)

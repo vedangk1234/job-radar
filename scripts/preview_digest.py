@@ -50,6 +50,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from db.connection import get_crawler_conn  # noqa: E402
+from db.users import resolve_current_user_id  # noqa: E402
 from fetchers.http import close_client  # noqa: E402
 from notify.description import enrich_candidates  # noqa: E402
 from notify.digest import (  # noqa: E402
@@ -119,7 +120,7 @@ async def main() -> int:
 
     conn = await get_crawler_conn()
     try:
-        prefs = await load_preferences(conn)
+        prefs = await load_preferences(conn, await resolve_current_user_id(conn))
         candidates = await fetch_candidates(conn, ignore_notified=args.ignore_notified)
 
         # Stage 1 (title) decides who is worth a request; stage 2 (description)

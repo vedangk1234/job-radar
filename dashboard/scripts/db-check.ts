@@ -76,12 +76,37 @@ async function main() {
       `jobs=${counts.jobs}  preferences rows=${counts.prefs}`,
   );
 
+  // Resolve the current user the same way src/lib/currentUser.ts does — same
+  // variable, same lowercase comparison, same schema-qualified public.users.
+  // Inlined rather than imported because src/lib/db.ts opens its pool at module
+  // scope, and imports are hoisted above the config() call this script needs
+  // first. (scripts/parity-check.ts and match-parity.ts duplicate findRepoRoot
+  // for the same reason.) This doubles as the dashboard half of the Phase-1b
+  // bridge check: if MY_EMAIL is missing here, it is missing on Vercel too.
+  const email = (process.env.MY_EMAIL ?? "").trim().toLowerCase();
+  if (!email) {
+    throw new Error("MY_EMAIL is not set in .env.local — the current user cannot be resolved.");
+  }
+  const [user] = await sql<{ id: string }[]>`
+    SELECT id FROM public.users WHERE lower(email) = lower(${email})
+  `;
+  if (!user) {
+    throw new Error("MY_EMAIL matches no row in public.users — run `python scripts/seed_user.py`.");
+  }
+  console.log(`current user resolved from MY_EMAIL: ${user.id}`);
+
   // A text[] round trip, because the preferences editor writes three of them
   // and array binding is the other thing that can differ between drivers.
   const [prefs] = await sql<{ cities: string[]; keywords: number; max_level: number }[]>`
     SELECT cities, array_length(keywords, 1) AS keywords, max_level
-      FROM preferences WHERE id = 1
+      FROM preferences WHERE user_id = ${user.id}
   `;
+  if (!prefs) {
+    throw new Error(
+      "no preferences row for this user. If db/schema.sql has been applied, run " +
+        "`python scripts/backfill_preferences_user.py`.",
+    );
+  }
   console.log(
     `preferences: cities=[${prefs.cities.join(", ")}]  ` +
       `keywords=${prefs.keywords}  max_level=${prefs.max_level}`,

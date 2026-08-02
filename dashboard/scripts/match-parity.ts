@@ -112,10 +112,28 @@ function python(payload: unknown): { matched: string[] } {
 }
 
 async function main() {
-  const [prefsRow] = await sql<Preferences[]>`
-    SELECT cities, keywords, exclusions, max_level FROM preferences WHERE id = 1
+  // The current user, resolved exactly as src/lib/currentUser.ts and
+  // db/users.py both do. Inlined for the same reason findRepoRoot above is:
+  // these scripts load .env.local themselves and cannot import a module that
+  // opens a pool at import time. Both implementations are then compared over
+  // the SAME user's filter, which is the only comparison worth making.
+  const email = (process.env.MY_EMAIL ?? "").trim().toLowerCase();
+  if (!email) throw new Error("MY_EMAIL is not set in .env.local");
+
+  const [user] = await sql<{ id: string }[]>`
+    SELECT id FROM public.users WHERE lower(email) = lower(${email})
   `;
-  if (!prefsRow) throw new Error("no preferences row — run python scripts/init_db.py");
+  if (!user) throw new Error("MY_EMAIL matches no row in public.users — run scripts/seed_user.py");
+
+  const [prefsRow] = await sql<Preferences[]>`
+    SELECT cities, keywords, exclusions, max_level
+      FROM preferences WHERE user_id = ${user.id}
+  `;
+  if (!prefsRow) {
+    throw new Error(
+      "no preferences row for this user — run python scripts/backfill_preferences_user.py",
+    );
+  }
 
   // Every OPEN row, unfiltered. The SQL prefilter lib/jobs.ts uses is itself
   // part of what is being checked, so it is deliberately not applied here: if

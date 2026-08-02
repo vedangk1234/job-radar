@@ -25,6 +25,28 @@ export function allowedEmail(): string {
 }
 
 /**
+ * The address the current user's database row is keyed by. Lowercased, and it
+ * THROWS when unset — which is the whole difference between this and the other
+ * reader of the same variable.
+ *
+ * lib/ats.ts also reads MY_EMAIL and falls back to unknown@example.com. That is
+ * right for what it does: the value goes in an outbound User-Agent, so an unset
+ * one makes the probe impolite and nothing more. Here the value decides WHOSE
+ * preferences row is loaded, and a fallback would resolve to no user at all —
+ * so it is read through required(), like every other value that has to be
+ * correct rather than merely present. The fallback in ats.ts stays where it is
+ * and is deliberately not reused.
+ *
+ * Not ALLOWED_EMAIL, deliberately. That variable is the sign-in gate and keeps
+ * that job; identity resolves from MY_EMAIL in BOTH runtimes, because one
+ * mechanism that can be wrong is better than two that can disagree. On this
+ * install they hold the same address. See lib/currentUser.ts.
+ */
+export function myEmail(): string {
+  return required("MY_EMAIL").toLowerCase();
+}
+
+/**
  * The transaction pooler (port 6543). Not the session pooler the crawler uses:
  * a serverless dashboard opens and drops connections constantly, which is the
  * case transaction mode exists for. The cost is no prepared statements — see

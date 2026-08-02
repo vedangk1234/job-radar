@@ -164,15 +164,43 @@ The sent-log: `canonical_id`, `sent_at`, `digest` (e.g. `2026-07-25-am`). A
 receipt per email, so a job is never emailed twice.
 
 ### `preferences` — the filter, as data rather than code
-Exactly **one row, forever**: `id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1)`, so
-"the preferences" is never an ambiguous question. Columns: `cities`, `keywords`,
-`exclusions` (all `TEXT[]`), `max_level` (`INT`, default 2), `updated_at`.
+Columns: `cities`, `keywords`, `exclusions` (all `TEXT[]`), `max_level` (`INT`,
+default 2), `updated_at`, and `user_id` (`UUID`, FK to `public.users`).
 
 It lives in the database and not in a Python constant precisely so the dashboard
 can `UPDATE` it and the very next digest obeys — no redeploy, no commit.
 `notify/match.py` carries `DEFAULT_*` constants that mirror the seed for tests
 and un-migrated databases; the database is the runtime source of truth and the
 constants are never an override.
+
+**The row has an owner, not a fixed address.** It used to be found at `id = 1` —
+`id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1)` — and every loader in both
+runtimes said so. Phase 1b replaced that with `WHERE user_id = <current user>`;
+`preferences_one_per_user_idx` (a *partial unique index*, chosen so named
+multi-profiles stay one `DROP INDEX` away) enforces one row per user. The
+`CHECK (id = 1)` is still there and still caps the table at one row overall;
+that comes down in whichever sub-phase first needs a second row.
+
+**Whose row? The MY_EMAIL bridge, and it is temporary.** Auth is Phase 2, so
+until then both runtimes resolve "the current user" the same way: look up
+`public.users WHERE lower(email) = lower(MY_EMAIL)`, once per run. That is
+`db/users.py` (`current_user_email`, `resolve_current_user_id`) on the Python
+side and `dashboard/src/lib/currentUser.ts` on the TypeScript side. It reuses
+the address the install already had rather than adding a `DEFAULT_USER_ID`,
+because two variables that must agree about who you are can disagree silently.
+Both files are marked for deletion when magic-link auth lands. Note the
+asymmetry: the TS half memoises (a Next server has no single entrypoint), the
+Python half does not (its entrypoints resolve once and thread the id down).
+
+**The nullable window.** `user_id` is nullable, because `ADD COLUMN … NOT NULL`
+would need a default the schema cannot know — the UUID is resolved from the
+environment. So applying `db/schema.sql` and running
+`scripts/backfill_preferences_user.py` is **one unit, with no crawl or digest
+between them**. In that window a user-scoped loader finds nothing, and both
+loaders tell that apart from a genuinely absent row (one extra query on the miss
+path) and **raise** rather than falling back to the seeded defaults — silently
+emailing the results of a filter nobody chose is exactly the failure the crawl
+guards exist to prevent.
 
 ---
 
@@ -795,7 +823,7 @@ placeholders.
 | `SUPABASE_CA_CERT` | `db/connection.py` | *optional* — path to the downloaded CA to verify the pooler certificate for real |
 | `RESEND_API_KEY` | `notify/digest.py` | rejected if still the `re_xxxx` placeholder |
 | `FROM_EMAIL` | `notify/digest.py` | `onboarding@resend.dev` (Resend's sandbox sender) unless a domain is verified |
-| `MY_EMAIL` | `notify/digest.py`, `fetchers/http.py`, `dashboard/src/lib/ats.ts` | digest recipient, and the contact address in the outbound User-Agent. Falls back to `unknown@example.com` in both User-Agent paths; the digest **requires** it |
+| `MY_EMAIL` | `notify/digest.py`, `fetchers/http.py`, `dashboard/src/lib/ats.ts`, **`db/users.py`**, **`dashboard/src/lib/currentUser.ts`** | digest recipient; the contact address in the outbound User-Agent; and, since Phase 1b, **the identity the current user is resolved from in both runtimes**. Falls back to `unknown@example.com` in the two User-Agent paths only. The digest requires it, and so does anything that loads preferences — including **the dashboard**, where it was previously optional. Must now be set on Vercel |
 | `GOOGLE_CLIENT_ID` | `dashboard/src/auth.ts` | |
 | `GOOGLE_CLIENT_SECRET` | `dashboard/src/auth.ts` | |
 | `AUTH_SECRET` | Auth.js | signs the session cookie; changing it logs you out everywhere |

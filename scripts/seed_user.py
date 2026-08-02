@@ -22,19 +22,14 @@ writes nothing, so it is safe on a live database with the row already in it.
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 from pathlib import Path
 
 # Allow `python scripts/seed_user.py` without installing the project as a package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from db.connection import get_crawler_conn, load_env  # noqa: E402
-
-# .env.example ships this as the MY_EMAIL placeholder. Seeding it would create a
-# plausible-looking anchor row for nobody, which every later sub-phase would then
-# attach to — the same class of failure as digest.py refusing the re_xxxx key.
-PLACEHOLDER_EMAIL = "you@example.com"
+from db.connection import get_crawler_conn  # noqa: E402
+from db.users import current_user_email  # noqa: E402
 
 # email is lowered on the way in so the row agrees with users_email_lower_idx
 # from the start. Because of that, conflicting on (email) is exactly equivalent
@@ -58,26 +53,12 @@ RETURNING id
 """
 
 
-def seed_email() -> str:
-    """MY_EMAIL from .env, lowercased, or a clear error naming what is missing."""
-    load_env()
-    email = os.getenv("MY_EMAIL", "").strip().lower()
-
-    if not email:
-        raise RuntimeError(
-            "MY_EMAIL is not set. It lives in .env (see .env.example) and is the "
-            "same address notify/digest.py sends the digest to."
-        )
-    if email == PLACEHOLDER_EMAIL:
-        raise RuntimeError(f"MY_EMAIL is still the .env.example placeholder ({PLACEHOLDER_EMAIL})")
-    if "@" not in email:
-        raise RuntimeError(f"MY_EMAIL does not look like an email address: {email!r}")
-
-    return email
-
-
 async def main() -> int:
-    email = seed_email()
+    # db.users.current_user_email is the one canonical validator, shared with
+    # the Phase-2 bridge that reads this row back. It used to live here as
+    # seed_email(); a second copy is how the writer and the reader end up
+    # disagreeing about whether MY_EMAIL is usable.
+    email = current_user_email()
 
     print("Connecting to Supabase via CRAWLER_DB_URL (session pooler)...")
     conn = await get_crawler_conn()

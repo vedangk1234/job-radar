@@ -71,6 +71,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from db.connection import get_crawler_conn  # noqa: E402
+from db.users import resolve_current_user_id  # noqa: E402
 from notify.match import title_stage_ok  # noqa: E402
 from notify.store import load_preferences  # noqa: E402
 
@@ -115,7 +116,7 @@ async def main() -> int:
 
     conn = await get_crawler_conn()
     try:
-        prefs = await load_preferences(conn)
+        prefs = await load_preferences(conn, await resolve_current_user_id(conn))
         rows = [dict(r) for r in await conn.fetch(LOAD)]
 
         # The title filter is the whole selection, not a preview of it: a row it

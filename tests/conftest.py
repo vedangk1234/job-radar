@@ -48,6 +48,14 @@ _PARAM = re.compile(r"\$(\d+)")
 # production statement, character for character.
 _CAST = re.compile(r"::(?:jsonb|json|text|int|integer|timestamptz)\b", re.IGNORECASE)
 
+# db/users.py and the dashboard both write `public.users` rather than `users`,
+# because Supabase ships its own auth.users and a bare name would resolve
+# against whatever the connection's search_path happens to be. SQLite has one
+# nameless schema and no such ambiguity, so the qualifier is stripped — the same
+# kind of translation as the casts above, and for the same reason: what runs
+# here stays the production statement in every respect that decides anything.
+_SCHEMA = re.compile(r"\bpublic\.", re.IGNORECASE)
+
 # SQLite mirror of the jobs table in db/schema.sql. Same column names, same
 # constraints that matter (PK, NOT NULLs, defaults) — the types differ only in
 # ways SQLite does not enforce anyway.
@@ -133,6 +141,9 @@ CREATE TABLE notifications (
 )
 """
 
+# user_id mirrors the real column: nullable, because that is what makes the
+# half-applied-migration state reachable in a test rather than only in
+# production. tests/test_digest.py exercises it directly.
 PREFERENCES_DDL = """
 CREATE TABLE preferences (
   id          INTEGER PRIMARY KEY CHECK (id = 1),
@@ -140,9 +151,29 @@ CREATE TABLE preferences (
   keywords    TEXT NOT NULL,
   exclusions  TEXT NOT NULL,
   max_level   INTEGER NOT NULL DEFAULT 2,
-  updated_at  TEXT
+  updated_at  TEXT,
+  user_id     TEXT REFERENCES users(id) ON DELETE CASCADE
 )
 """
+
+# The account rows are keyed by. Named `users` here and reached as
+# `public.users` by the production statements, which _SCHEMA strips — see the
+# note there. The UUID is TEXT because SQLite has no uuid type and nothing in
+# the code parses the value; it is passed through as an opaque key.
+USERS_DDL = """
+CREATE TABLE users (
+  id          TEXT PRIMARY KEY,
+  email       TEXT NOT NULL UNIQUE,
+  created_at  TEXT,
+  plan        TEXT NOT NULL DEFAULT 'free',
+  is_active   INTEGER NOT NULL DEFAULT 1
+)
+"""
+
+# The address every test resolves the current user from. A .test domain, which
+# scripts/githooks/pre-commit allows (RFC 2606/6761) — see test-guard.sh.
+TEST_EMAIL = "me@example.test"
+TEST_USER_ID = "00000000-0000-4000-8000-000000000001"
 
 
 class FakeClock:
@@ -165,7 +196,7 @@ def _translate(sql: str, args: Sequence[Any]) -> tuple[str, list[Any]]:
         order.append(int(match.group(1)) - 1)
         return "?"
 
-    return _CAST.sub("", _PARAM.sub(replace, sql)), [args[i] for i in order]
+    return _SCHEMA.sub("", _CAST.sub("", _PARAM.sub(replace, sql))), [args[i] for i in order]
 
 
 class FakeConn:
@@ -184,7 +215,14 @@ class FakeConn:
         # list becomes the JSON the mirrored DDL declares — the binding in the
         # production statement is unchanged either way.
         sqlite3.register_adapter(list, lambda v: json.dumps(v))
-        for ddl in (JOBS_DDL, COMPANIES_DDL, NOTIFICATIONS_DDL, PREFERENCES_DDL, DISCOVERED_DDL):
+        for ddl in (
+            JOBS_DDL,
+            COMPANIES_DDL,
+            NOTIFICATIONS_DDL,
+            USERS_DDL,
+            PREFERENCES_DDL,
+            DISCOVERED_DDL,
+        ):
             self._db.execute(ddl)
 
     def transaction(self) -> "FakeTransaction":
@@ -311,23 +349,44 @@ class FakeConn:
             applied_at,
         )
 
+    async def add_user(
+        self, user_id: str = TEST_USER_ID, email: str = TEST_EMAIL
+    ) -> str:
+        """Insert one public.users row and return its id."""
+        await self.execute(
+            "INSERT INTO users (id, email, created_at) VALUES ($1, $2, $3)",
+            user_id,
+            email,
+            self.clock.tick(),
+        )
+        return user_id
+
     async def set_preferences(
         self,
         cities: Sequence[str] = DEFAULT_CITIES,
         keywords: Sequence[str] = DEFAULT_KEYWORDS,
         exclusions: Sequence[str] = DEFAULT_EXCLUSIONS,
         max_level: int = DEFAULT_MAX_LEVEL,
+        user_id: str | None = TEST_USER_ID,
     ) -> None:
-        """Seed the single preferences row, TEXT[] columns encoded as JSON."""
+        """Seed the preferences row, TEXT[] columns encoded as JSON.
+
+        `user_id=None` writes the row UNOWNED, which is the half-applied
+        migration state: db/schema.sql applied, the backfill not yet run. It is
+        a parameter rather than a separate helper because that state is a real
+        thing production can be in for a minute, and load_preferences is
+        supposed to refuse rather than silently fall back to defaults in it.
+        """
         await self.execute("DELETE FROM preferences")
         await self.execute(
-            "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at) "
-            "VALUES (1, $1, $2, $3, $4, $5)",
+            "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, user_id) "
+            "VALUES (1, $1, $2, $3, $4, $5, $6)",
             json.dumps(list(cities)),
             json.dumps(list(keywords)),
             json.dumps(list(exclusions)),
             int(max_level),
             self.clock.tick(),
+            user_id,
         )
 
 
@@ -368,6 +427,22 @@ def no_description_fetches(monkeypatch) -> None:
     monkeypatch.setattr("notify.description._board_cache", {})
 
 
+@pytest.fixture(autouse=True)
+def current_user_env(monkeypatch) -> None:
+    """MY_EMAIL, for every test.
+
+    Autouse because MY_EMAIL is now the input to db.users.resolve_current_user_id
+    — the Phase-2 bridge every entrypoint calls to find out whose filter to
+    apply. Setting it here rather than per-test means the suite runs against a
+    developer's real .env without picking up their real address, and the value
+    matches the users row conftest seeds.
+
+    load_env() reads .env with override=False, so a value already in the process
+    environment wins — which is exactly what monkeypatch.setenv puts there.
+    """
+    monkeypatch.setenv("MY_EMAIL", TEST_EMAIL)
+
+
 @pytest.fixture
 def conn() -> FakeConn:
     return FakeConn()
@@ -375,8 +450,14 @@ def conn() -> FakeConn:
 
 @pytest.fixture
 async def digest_conn() -> FakeConn:
-    """A FakeConn with one company and the seeded preferences already in place."""
+    """A FakeConn with one user, one company, and the seeded preferences.
+
+    The preferences row is owned by that user from the start, so every existing
+    test goes on describing the ordinary case: a fully migrated database where
+    the filter has an owner.
+    """
     conn = FakeConn()
+    await conn.add_user()
     await conn.add_company(1, "Testco")
     await conn.set_preferences()
     return conn
