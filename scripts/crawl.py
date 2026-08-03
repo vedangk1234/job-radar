@@ -116,7 +116,13 @@ async def print_totals(conn) -> None:
     )
 
     print(f"\njobs table: {total} row(s)  ({open_rows} open, {closed_rows} closed)")
-    print(f"notified: TRUE={notified}  FALSE={unnotified}   <- FALSE is Step 4's queue")
+    # Still the boolean, deliberately. Since Phase 1d the digest decides from
+    # per-user state instead, but this is the CRAWL's report and the crawl path
+    # is user-blind by design — a per-user number here would be this script
+    # learning who the users are, which is the one thing it must never do. The
+    # boolean is also still exactly what the silent seed writes, so it remains
+    # the honest measure of what this run itself queued.
+    print(f"notified: TRUE={notified}  FALSE={unnotified}   <- the crawl-side queue flag")
     print("city labels: " + ", ".join(f"{r['city']}={r['n']}" for r in cities))
     print(
         f"description facts: {hidden_years} open row(s) demand 3+ years, "

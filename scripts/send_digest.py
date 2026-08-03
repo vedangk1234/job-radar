@@ -3,8 +3,9 @@
     python scripts/send_digest.py
     python scripts/send_digest.py --tag 30min      # label the notifications rows
 
-Reads the preferences row, reads the notified=FALSE queue, filters, and — only
-if something matched — sends exactly one email and marks exactly those jobs.
+Reads the preferences row, reads the queue — every open job this user has not
+been emailed about — filters, and, only if something matched, sends exactly one
+email and records exactly those jobs against that user.
 
 Zero matches is a success, not an error: nothing is sent and nothing is written.
 A failed send is also a no-write; the jobs stay queued for the next run.
@@ -44,7 +45,7 @@ async def main() -> int:
     finally:
         await conn.close()
 
-    print(f"candidates considered : {run.candidates}  (notified=FALSE, status=open)")
+    print(f"candidates considered : {run.candidates}  (open, not yet notified to me)")
     print(f"matched               : {len(run.matched)}")
 
     if not run.matched:
@@ -64,8 +65,9 @@ async def main() -> int:
 
     if run.emailed != len(run.matched):
         print(
-            f"\nWARNING: emailed {len(run.matched)} job(s) but only {run.emailed} row(s) "
-            f"flipped to notified=TRUE. Investigate before the next run.",
+            f"\nWARNING: emailed {len(run.matched)} job(s) but only {run.emailed} "
+            f"user_job_notifications row(s) were written. Any job in that gap will be "
+            f"emailed again on the next run. Investigate before then.",
             file=sys.stderr,
         )
         return 1

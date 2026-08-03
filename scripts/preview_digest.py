@@ -32,10 +32,16 @@ unavailable yesterday deserves the same answer here as anywhere else.
 --no-descriptions skips the enrichment entirely for a genuinely read-only,
 no-network run against whatever facts are already stored.
 
---ignore-notified drops the `notified = FALSE` clause from the candidate query.
-That is the only way to exercise the matcher against a table whose rows were all
-stored notified=TRUE by the silent seed: it answers "which of everything
-currently open WOULD my filter pick".
+--ignore-notified drops the whole queue filter from the candidate query — both
+the old global `notified = FALSE` clause and the per-user
+user_job_notifications check that replaced it as the read authority in Phase 1d.
+That is the only way to exercise the matcher against a table whose rows were
+almost all stored notified=TRUE by the silent seed: it answers "which of
+everything currently open WOULD my filter pick".
+
+Without it, this script reports MY queue — open jobs I have not been emailed
+about — which after the 1d backfill is the same set it reported before, because
+every job the boolean called notified now has a row naming me.
 """
 
 from __future__ import annotations
@@ -120,8 +126,14 @@ async def main() -> int:
 
     conn = await get_crawler_conn()
     try:
-        prefs = await load_preferences(conn, await resolve_current_user_id(conn))
-        candidates = await fetch_candidates(conn, ignore_notified=args.ignore_notified)
+        # Resolved once and used for both — the filter and the queue are two
+        # questions about the same person, and asking twice is two chances to
+        # answer differently.
+        user_id = await resolve_current_user_id(conn)
+        prefs = await load_preferences(conn, user_id)
+        candidates = await fetch_candidates(
+            conn, user_id, ignore_notified=args.ignore_notified
+        )
 
         # Stage 1 (title) decides who is worth a request; stage 2 (description)
         # answers only for those. The order is the whole reason this is cheap.
@@ -133,7 +145,7 @@ async def main() -> int:
         await conn.close()
         await close_client()
 
-    scope = "every open job" if args.ignore_notified else "notified=FALSE and open"
+    scope = "every open job" if args.ignore_notified else "open and not yet notified to me"
     print(f"preferences: {len(prefs.cities)} cities, {len(prefs.keywords)} keywords, "
           f"{len(prefs.exclusions)} exclusions")
     print(f"  cities     : {', '.join(prefs.cities)}")

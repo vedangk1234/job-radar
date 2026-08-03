@@ -42,6 +42,7 @@ from notify.description import (
     needs_description_check,
     workday_external_path,
 )
+from tests.conftest import TEST_USER_ID
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -741,7 +742,7 @@ async def test_enrichment_stores_three_facts_and_no_text(digest_conn):
 
     from notify.store import fetch_candidates
 
-    candidates = await fetch_candidates(digest_conn)
+    candidates = await fetch_candidates(digest_conn, TEST_USER_ID)
     fetch = await stub_fetcher(
         {
             "razorpay-1": RAZORPAY,
@@ -781,7 +782,7 @@ async def test_a_failed_fetch_marks_the_job_checked_and_keeps_it(digest_conn):
 
     from notify.store import fetch_candidates
 
-    candidates = await fetch_candidates(digest_conn)
+    candidates = await fetch_candidates(digest_conn, TEST_USER_ID)
     fetch = await stub_fetcher({})  # answers None for everything
     report = await enrich_candidates(digest_conn, candidates, fetcher=fetch)
 
@@ -807,7 +808,7 @@ async def test_a_successful_read_is_recorded_as_not_having_failed(digest_conn):
 
     await enrich_candidates(
         digest_conn,
-        await fetch_candidates(digest_conn),
+        await fetch_candidates(digest_conn, TEST_USER_ID),
         fetcher=await stub_fetcher({"quiet-jd": NO_EXPERIENCE_JD}),
     )
 
@@ -880,7 +881,7 @@ async def test_a_stale_failure_is_re_read_and_can_change_the_verdict(digest_conn
 
     from notify.store import fetch_candidates
 
-    candidates = await fetch_candidates(digest_conn)
+    candidates = await fetch_candidates(digest_conn, TEST_USER_ID)
     await enrich_candidates(
         digest_conn,
         candidates,
@@ -908,7 +909,7 @@ async def test_an_already_checked_job_is_never_fetched_again(digest_conn):
         return "5+ years experience"
 
     report = await enrich_candidates(
-        digest_conn, await fetch_candidates(digest_conn), fetcher=counting_fetch
+        digest_conn, await fetch_candidates(digest_conn, TEST_USER_ID), fetcher=counting_fetch
     )
 
     assert calls == []
@@ -923,7 +924,7 @@ async def test_enrichment_updates_the_rows_in_place_for_the_caller(digest_conn):
     from notify.match import Preferences, is_match
     from notify.store import fetch_candidates
 
-    candidates = await fetch_candidates(digest_conn)
+    candidates = await fetch_candidates(digest_conn, TEST_USER_ID)
     assert is_match(candidates[0], Preferences())  # before: nothing known, so kept
 
     await enrich_candidates(
@@ -945,7 +946,7 @@ async def test_enrichment_never_touches_the_notified_flag(digest_conn):
     before = await digest_conn.snapshot()
     await enrich_candidates(
         digest_conn,
-        await fetch_candidates(digest_conn, ignore_notified=True),
+        await fetch_candidates(digest_conn, TEST_USER_ID, ignore_notified=True),
         fetcher=await stub_fetcher({}),
     )
     after = await digest_conn.snapshot()

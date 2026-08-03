@@ -3,7 +3,7 @@
 Five operations, and the split between them is the whole safety story:
 
     load_preferences           read the filter
-    fetch_candidates           read the queue  (notified=FALSE AND status='open')
+    fetch_candidates           read the queue  (open, and not yet notified to ME)
     fetch_enrichment_targets   read the jobs whose description is unread
     save_description_facts     write what reading a description taught us
     record_sent                write the receipt, ONLY after Resend returned an id
@@ -15,20 +15,40 @@ description itself, which is the point — see notify/description.py. There is n
 column for one and no statement here that could fill it.
 
 fetch_enrichment_targets is read by the CRAWLER (crawler/enrich.py) rather than
-by the digest, which is why it does not filter on `notified`: the dashboard
-shows every open job that fits, emailed or not, so every open job that fits has
-to have had its description read. That difference is the whole bug fix; the
-digest's own queue is still fetch_candidates and still ends at notified=FALSE.
+by the digest, which is why it does not filter on notification state at all: the
+dashboard shows every open job that fits, emailed or not, so every open job that
+fits has to have had its description read. That difference is the whole bug fix;
+the digest's own queue is still fetch_candidates.
+
+NOTIFICATION STATE IS PER-USER SINCE PHASE 1d
+----------------------------------------------
+"Have I been told about this job" is a row in user_job_notifications, not the
+global jobs.notified boolean — see db/notifications.py and the table's comment
+block in db/schema.sql. fetch_candidates therefore takes a user_id, and
+record_sent takes one too.
+
+The boolean has NOT gone away and is still written, in the same transaction. It
+is the rollback net for the riskiest migration in Phase 1, it is the backfill's
+source of truth, and the dashboard still derives its NEW/NOTIFIED badge from it.
+1g drops it, after 1e proves the fan-out.
+
+Which means the queue predicate is a CONJUNCTION rather than a swap, and the
+first half of it is doing real work: crawler/store.mark_new stamps notified=TRUE
+across a company's whole back catalogue on its first-ever crawl, and the crawl
+path is user-blind by design, so those rows have no per-user record and reading
+the new table alone would queue every one of them. See the schema comment for the
+obligation that hands to 1e.
 
 record_sent is deliberately the last thing that happens in a digest run, after
 the network call has already succeeded. That ordering is the same idea as the
 crawler's Guard 1: when the outcome is in doubt, change nothing. A send that
-fails leaves every row at notified=FALSE, so the next run simply tries again —
-whereas flipping the flag first and then failing would lose the job silently and
+fails leaves the queue exactly as it was, so the next run simply tries again —
+whereas recording the send first and then failing would lose the job silently and
 forever, which is the one failure this whole table exists to prevent.
 
-The two writes inside record_sent run in one transaction, so it is impossible to
-end up with a job marked notified=TRUE that has no row in the sent-log.
+The three writes inside record_sent run in one transaction, so it is impossible
+to end up with a job recorded as notified that has no row in the sent-log, or
+with the per-user table and the boolean disagreeing about what went out.
 
 SQL portability note (same as crawler/store.py): these statements stay inside
 the subset Postgres and SQLite agree on — numbered placeholders, `now()`, plain
@@ -40,6 +60,8 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Sequence
+
+from db.notifications import record_notified
 
 from .match import Preferences
 
@@ -76,12 +98,49 @@ SELECT j.canonical_id, j.title, j.location, j.city, j.url,
  ORDER BY c.name, j.title
 """
 
-CANDIDATES_SQL = _CANDIDATES_TEMPLATE.format(queue_filter="\n   AND j.notified = FALSE")
+# THE QUEUE, AND WHY IT IS TWO CLAUSES RATHER THAN ONE.
+#
+# The second clause is the Phase-1d rule: this user has no row in
+# user_job_notifications for this job, so this user has not been told about it.
+# NOT EXISTS rather than a LEFT JOIN ... IS NULL because the question is
+# existence, the anti-join is what Postgres reads it as either way, and a LEFT
+# JOIN on a table with a UNIQUE (user_id, canonical_id) invites the reader to
+# wonder whether it can duplicate rows. It cannot; NOT EXISTS says so without
+# being asked.
+#
+# The FIRST clause is the old global boolean, and it is not vestigial. It is the
+# silent-seed suppressor: crawler/store.mark_new writes notified=TRUE across a
+# company's entire back catalogue on its first-ever crawl, and the crawl path
+# neither knows nor may learn who the users are (tests/test_user_companies.py
+# asserts that absence three ways). Those seeded rows therefore have no per-user
+# record at all, and a queue reading only the new table would hand every one of
+# them to the next digest — one discovery sweep once seeded 6,496 rows.
+#
+# Today, with the backfill applied, the two clauses describe exactly the same
+# set, which is what makes 1d a no-op for the existing user. 1e teaches the seed
+# to fan out; 1g then drops the boolean and this clause together. Neither may
+# happen without the other.
+CANDIDATES_SQL = _CANDIDATES_TEMPLATE.format(
+    queue_filter="""
+   AND j.notified = FALSE
+   AND NOT EXISTS (
+         SELECT 1
+           FROM user_job_notifications n
+          WHERE n.user_id = $1
+            AND n.canonical_id = j.canonical_id
+       )"""
+)
 
 # The same query minus the queue filter. Used only by scripts/preview_digest.py
 # --ignore-notified, which never writes: it answers "what WOULD my filter have
-# picked out of everything currently open", against a table whose 300 seeded
-# rows are all already notified=TRUE.
+# picked out of everything currently open", against a table whose rows are almost
+# all already notified.
+#
+# Note that this one binds NO parameter, which is why fetch_candidates branches
+# on how it calls conn.fetch rather than passing user_id either way: asyncpg
+# rejects an argument the statement has no placeholder for. Widening the read to
+# "every open job" genuinely has no user in it — that is what makes it a preview
+# of the matcher rather than a preview of someone's digest.
 CANDIDATES_IGNORING_NOTIFIED_SQL = _CANDIDATES_TEMPLATE.format(queue_filter="")
 
 # Every open job whose description we have not successfully read — the crawl's
@@ -188,16 +247,30 @@ async def load_preferences(conn, user_id) -> Preferences:
     return Preferences.from_row(None)
 
 
-async def fetch_candidates(conn, *, ignore_notified: bool = False) -> list[Mapping[str, Any]]:
+async def fetch_candidates(
+    conn, user_id: Any, *, ignore_notified: bool = False
+) -> list[Mapping[str, Any]]:
     """Rows eligible to be considered — before any filtering.
 
-    Eligible means open and unsent. Whether a job is *interesting* is decided
-    afterwards, by notify/match.py, over the rows this returns.
+    Eligible means open, and not yet notified TO THIS USER. Whether a job is
+    *interesting* is decided afterwards, by notify/match.py, over the rows this
+    returns.
 
-    `ignore_notified` is for preview only. Nothing that can write ever sets it.
+    `user_id` is required rather than defaulted, and that is deliberate: a
+    default would be a guess about whose queue this is, and the failure mode of
+    guessing wrong is silence — a digest computed for the wrong person looks
+    exactly like a quiet week. The entrypoints resolve it once and thread it
+    down (see db/users.py on why the bridge is temporary).
+
+    `ignore_notified` is for preview only. Nothing that can write ever sets it,
+    and in that mode `user_id` is genuinely unused because the widened question
+    has no user in it.
     """
-    sql = CANDIDATES_IGNORING_NOTIFIED_SQL if ignore_notified else CANDIDATES_SQL
-    return [dict(row) for row in await conn.fetch(sql)]
+    if ignore_notified:
+        rows = await conn.fetch(CANDIDATES_IGNORING_NOTIFIED_SQL)
+    else:
+        rows = await conn.fetch(CANDIDATES_SQL, user_id)
+    return [dict(row) for row in rows]
 
 
 async def fetch_enrichment_targets(
@@ -245,29 +318,52 @@ async def save_description_facts(
     return len(records)
 
 
-async def record_sent(conn, canonical_ids: Iterable[str], digest: str) -> int:
-    """Mark exactly these jobs as sent, and log one notifications row each.
+async def record_sent(conn, user_id: Any, canonical_ids: Iterable[str], digest: str) -> int:
+    """Record that this user has now been emailed about exactly these jobs.
 
-    Call this only after a send has succeeded. Returns the number of job rows
-    flipped, which the caller should compare against what it emailed.
+    Call this only after a send has succeeded. Returns the number of jobs now
+    recorded as notified to this user, which the caller compares against what it
+    actually emailed.
 
-    Both writes share one transaction: a flag without a receipt would be a job
-    we can never explain, and a receipt without a flag would re-send it tomorrow.
+    THREE WRITES, ONE TRANSACTION, AND THE THIRD IS THE ROLLBACK NET.
+
+      1. user_job_notifications  — the per-user record. THE authority: this is
+         what fetch_candidates reads, so this is what stops a re-send.
+      2. jobs.notified           — the old global boolean, still written. Phase
+         1d moved the READ to the table above but deliberately kept writing this
+         one, so reverting 1d cannot re-send anything that went out during the
+         1d window, so the backfill can be re-run afterwards against an accurate
+         source, and so the dashboard's NEW/NOTIFIED badge stays honest without
+         any TypeScript changing. 1g drops it once 1e proves the fan-out.
+      3. notifications           — the sent-log receipt, per job and per digest.
+
+    They share one transaction because every pair of them disagreeing is a
+    distinct failure: a record with no receipt is a send nobody can explain, a
+    receipt with no record re-sends the job tomorrow, and the per-user table
+    disagreeing with the boolean would make the rollback net a liability rather
+    than a net — it would either re-send on rollback or hide a job that was never
+    actually delivered.
+
+    The count returned is the per-user one, deliberately, because that is the
+    table that now decides. It counts GENUINE inserts, so re-recording a job this
+    user already knew about contributes nothing — which is what makes a caller's
+    "emailed N but recorded M" warning mean something.
     """
     ids = list(canonical_ids)
     if not ids:
         return 0
 
-    flipped = 0
     async with conn.transaction():
+        recorded = await record_notified(conn, user_id, ids)
+
         for chunk in _chunks(ids):
             sql = (
                 "UPDATE jobs SET notified = TRUE "
                 f"WHERE canonical_id IN ({_placeholders(len(chunk), 1)}) "
                 "RETURNING canonical_id"
             )
-            flipped += len(await conn.fetch(sql, *chunk))
+            await conn.fetch(sql, *chunk)
 
         await conn.executemany(INSERT_NOTIFICATION_SQL, [(cid, digest) for cid in ids])
 
-    return flipped
+    return recorded

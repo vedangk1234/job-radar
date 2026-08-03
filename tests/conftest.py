@@ -185,6 +185,36 @@ CREATE TABLE user_companies (
 )
 """
 
+# Per-user notification state — the Phase-1d replacement for the global
+# jobs.notified boolean as the thing the digest queue READS.
+#
+# UNIQUE (user_id, canonical_id) is not decoration: it is what every
+# ON CONFLICT DO NOTHING in db/notifications.py conflicts against, so without it
+# the idempotence tests would pass by inserting duplicates nobody counted.
+#
+# The job side is canonical_id TEXT, matching production, because `jobs` has no
+# id column — its primary key is the canonical_id string. Both ON DELETE CASCADE
+# clauses are mirrored verbatim because tests/test_user_notifications.py asserts
+# what they do, and the same caveat applies as for user_companies: SQLite ignores
+# every foreign key unless PRAGMA foreign_keys is ON, so those tests call
+# FakeConn.enforce_foreign_keys() or they assert nothing at all.
+# notified_at carries a DEFAULT here as it does in production, and it has to:
+# every INSERT in db/notifications.py omits the column deliberately, so a NOT
+# NULL column without one would fail on the very first row. CURRENT_TIMESTAMP
+# rather than the fake clock's now() because SQLite only accepts constant
+# expressions in a DEFAULT — a divergence that costs nothing, because nothing
+# anywhere reads this value. If anything ever branches on notified_at, this
+# mirror stops being adequate; db/schema.sql explains why nothing may.
+USER_JOB_NOTIFICATIONS_DDL = """
+CREATE TABLE user_job_notifications (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id      TEXT NOT NULL REFERENCES users(id)          ON DELETE CASCADE,
+  canonical_id TEXT NOT NULL REFERENCES jobs(canonical_id) ON DELETE CASCADE,
+  notified_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (user_id, canonical_id)
+)
+"""
+
 # The address every test resolves the current user from. A .test domain, which
 # scripts/githooks/pre-commit allows (RFC 2606/6761) — see test-guard.sh.
 TEST_EMAIL = "me@example.test"
@@ -238,6 +268,7 @@ class FakeConn:
             PREFERENCES_DDL,
             DISCOVERED_DDL,
             USER_COMPANIES_DDL,
+            USER_JOB_NOTIFICATIONS_DDL,
         ):
             self._db.execute(ddl)
 
@@ -407,6 +438,34 @@ class FakeConn:
             company_id,
             self.clock.tick(),
         )
+
+    async def notify_user(self, user_id: str, canonical_id: str) -> None:
+        """One user_job_notifications row, inserted directly.
+
+        Deliberately has no ON CONFLICT clause, for the same reason
+        track_company has none: a test about idempotence must run the production
+        statement from db/notifications.py, so that what is proven safe to repeat
+        is the thing production repeats. This helper is for arranging a state,
+        not for exercising one.
+        """
+        await self.execute(
+            "INSERT INTO user_job_notifications (user_id, canonical_id, notified_at) "
+            "VALUES ($1, $2, $3)",
+            user_id,
+            canonical_id,
+            self.clock.tick(),
+        )
+
+    async def notification_pairs(self) -> set[tuple[str, str]]:
+        """Every (user_id, canonical_id) currently in user_job_notifications.
+
+        A set of pairs rather than a count, so a CASCADE test can assert both
+        halves of "the right rows went and nothing else did" in one comparison —
+        and so a backfill test can assert WHICH jobs were covered rather than how
+        many, which is the distinction the migration's gate is built on.
+        """
+        rows = await self.fetch("SELECT user_id, canonical_id FROM user_job_notifications")
+        return {(row["user_id"], row["canonical_id"]) for row in rows}
 
     async def tracking_rows(self) -> set[tuple[str, int]]:
         """Every (user_id, company_id) pair currently in user_companies.

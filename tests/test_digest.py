@@ -146,8 +146,8 @@ async def test_candidates_query_respects_the_queue_but_preview_can_ignore_it(dig
     await digest_conn.add_job("sent", title="Backend Engineer", notified=True)
     await digest_conn.add_job("closed", title="Backend Engineer", status="closed", notified=True)
 
-    assert {j["canonical_id"] for j in await fetch_candidates(digest_conn)} == {"queued"}
-    everything = await fetch_candidates(digest_conn, ignore_notified=True)
+    assert {j["canonical_id"] for j in await fetch_candidates(digest_conn, TEST_USER_ID)} == {"queued"}
+    everything = await fetch_candidates(digest_conn, TEST_USER_ID, ignore_notified=True)
     assert {j["canonical_id"] for j in everything} == {"queued", "sent"}  # still open-only
 
 
@@ -362,8 +362,9 @@ async def test_record_sent_is_all_or_nothing(digest_conn):
 
 async def test_record_sent_on_an_empty_list_is_a_no_op(digest_conn):
     await digest_conn.add_job("a", title="Backend Engineer")
-    assert await record_sent(digest_conn, [], "2026-07-26-manual") == 0
+    assert await record_sent(digest_conn, TEST_USER_ID, [], "2026-07-26-manual") == 0
     assert await digest_conn.sent_log() == []
+    assert await digest_conn.notification_pairs() == set()
 
 
 # --- the recipient assertion ---------------------------------------------

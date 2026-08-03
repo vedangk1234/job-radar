@@ -25,6 +25,7 @@ import pytest
 
 from crawler.enrich import RETRY_AFTER, enrich_matches
 from notify.match import Preferences, is_match
+from tests.conftest import TEST_USER_ID
 
 # Noon on the day the FakeConn clock starts, so a timestamp the shim's own
 # `now()` wrote during a test is a few minutes BEFORE this rather than three
@@ -89,13 +90,13 @@ async def test_the_adobe_posting_stops_matching_once_its_description_is_read(dig
 
     from notify.store import fetch_candidates
 
-    before = (await fetch_candidates(digest_conn))[0]
+    before = (await fetch_candidates(digest_conn, TEST_USER_ID))[0]
     assert is_match(before, Preferences())
 
     fetch, _ = fetcher_for({"adobe-fullstack": ADOBE})
     await enrich_matches(digest_conn, fetcher=fetch, now=NOW)
 
-    after = (await fetch_candidates(digest_conn))[0]
+    after = (await fetch_candidates(digest_conn, TEST_USER_ID))[0]
     assert after["min_experience"] == 4
     assert not is_match(after, Preferences())
 

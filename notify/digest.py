@@ -12,9 +12,14 @@ ignore that too.
 Ordering, which is the safety property
 --------------------------------------
     title filter -> read descriptions -> match -> render -> send
-                 -> (Resend returns an id) -> flip notified, write the receipt
+                 -> (Resend returns an id) -> record the notification, write the
+                                              receipt
 
-The LIFECYCLE write happens last and only on success.
+The LIFECYCLE write happens last and only on success. Since Phase 1d "record the
+notification" means a row in user_job_notifications for THIS user — the boolean
+is written alongside it in the same transaction as a rollback net, but the
+per-user row is the thing that decides whether a job is ever considered again.
+See notify/store.record_sent.
 
 One write does happen before the send: notify/description.py stores the three
 description-derived columns as soon as it computes them. That is not a hole in
@@ -23,10 +28,10 @@ are facts about the posting, true whether or not an email goes out, and the only
 cost of a run that dies after writing them is that the next run does not have to
 re-read the same descriptions. No flag, no receipt — nothing that could make a
 job look delivered when it was not. If Resend errors, times out, or
-rejects the recipient, this module raises and touches no rows: every job stays
-notified=FALSE and the next run picks up exactly the same set. That is the
-crawler's Guard 1 philosophy applied to email — when the outcome is in doubt,
-change nothing.
+rejects the recipient, this module raises and touches no rows: no notification is
+recorded and the next run picks up exactly the same set. That is the crawler's
+Guard 1 philosophy applied to email — when the outcome is in doubt, change
+nothing.
 
 The accepted cost of that choice: if a send actually succeeded but the response
 never reached us (a timeout after delivery), the next run re-sends those jobs.
@@ -375,7 +380,7 @@ async def run_digest(
         user_id = await resolve_current_user_id(conn)
     prefs = await load_preferences(conn, user_id)
 
-    candidates = await fetch_candidates(conn)
+    candidates = await fetch_candidates(conn, user_id)
     run.candidates = len(candidates)
 
     title_stage = [job for job in candidates if title_stage_ok(job, prefs)]
@@ -403,5 +408,7 @@ async def run_digest(
     )
 
     run.tag = digest_tag(today, tag_suffix)
-    run.emailed = await record_sent(conn, [j["canonical_id"] for j in run.matched], run.tag)
+    run.emailed = await record_sent(
+        conn, user_id, [j["canonical_id"] for j in run.matched], run.tag
+    )
     return run

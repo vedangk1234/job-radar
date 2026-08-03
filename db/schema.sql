@@ -381,3 +381,121 @@ CREATE INDEX IF NOT EXISTS user_companies_company_idx ON user_companies (company
 -- them. scripts/backfill_user_companies.py is the seed — it tracks every company
 -- in the catalog for that user, so behaviour after this migration is identical
 -- to behaviour before it.
+
+-- user_job_notifications: "this person has been emailed about this job."
+--
+-- The per-user replacement for the global jobs.notified boolean. A ROW EXISTING
+-- is the entire decision — this user has been told about this job. NO ROW means
+-- not yet. There is no state in between and no column to misread.
+--
+-- WHY THE BOOLEAN COULD NOT SURVIVE MULTI-USER. jobs.notified says "somebody was
+-- emailed about this", which was an adequate paraphrase of "I was emailed about
+-- this" while the install had one user and nothing in the database naming them.
+-- The moment there are two, the first user's digest silences the job for the
+-- second, who never hears about it at all — a job silently deleted from someone's
+-- inbox is the expensive failure this project spends its guards on, and it would
+-- leave no trace anywhere. This table is that fact given an owner.
+--
+-- THE JOB SIDE IS canonical_id, NOT job_id, BECAUSE jobs HAS NO id COLUMN. The
+-- jobs primary key is canonical_id TEXT — '{ats}:{company_id}:{native_id}', or
+-- 'hash:' + a digest for boards that expose no vendor id. The `notifications`
+-- table above already spells this key exactly this way, and a second name for
+-- the same key on a sibling table is how a join gets written wrong once and
+-- reviewed as correct forever. Hence TEXT here, against the UUID on the other
+-- side: the two keys on this one table are deliberately different types, each
+-- being what the thing it references actually is, exactly as user_companies
+-- carries UUID against INT.
+--
+-- BOTH SIDES ON DELETE CASCADE, and the argument is the same one twice.
+-- user_id -> public.users: a receipt that outlives its owner records that nobody
+-- was told something, which is not data (the same argument preferences.user_id
+-- and user_companies.user_id make). canonical_id -> jobs: the same argument
+-- `notifications.canonical_id` directly above makes, plus a sharper one for this
+-- table — the 1e fan-out is an ANTI-JOIN of jobs against these rows, and an
+-- orphan is a row no join can ever return, so the table's count and the join's
+-- count would disagree for reasons nobody can see. RESTRICT on either side buys
+-- a manual multi-step delete whose only prize is keeping unreadable rows.
+--
+-- Surrogate id + UNIQUE (user_id, canonical_id) rather than a composite primary
+-- key, matching notifications, discovered_companies and user_companies. The
+-- UNIQUE is what makes "notify this user about this job" idempotent — it is what
+-- ON CONFLICT DO NOTHING conflicts against — so a double send is a no-op at the
+-- database rather than a thing the caller has to remember not to do.
+--
+-- notified_at IS RECORD-KEEPING AND NOTHING BRANCHES ON IT. It means "when this
+-- notification state was recorded", which for the 1d backfill is the migration
+-- itself: for the ~7,700 rows the silent seed marked notified we do not know
+-- when, or whether, an email ever went out, and `notifications` holds fifteen
+-- receipts against them. Back-dating from first_seen_at would put an invented
+-- send date in a column, which is the mistake source_posted_at exists to name.
+-- So the column follows notifications.sent_at — written, never read to decide —
+-- and deliberately NOT desc_checked_at, which DOES branch (the 24-hour retry
+-- gate in notify/store.ENRICHMENT_TARGETS_SQL). A future "re-notify after N
+-- days" would have to argue with this paragraph first, because the moment
+-- anything branches on this value, "when recorded" and "when sent" stop being
+-- interchangeable and the backfilled rows start lying.
+CREATE TABLE IF NOT EXISTS user_job_notifications (
+  id           SERIAL PRIMARY KEY,
+  user_id      UUID NOT NULL REFERENCES public.users(id)   ON DELETE CASCADE,
+  canonical_id TEXT NOT NULL REFERENCES jobs(canonical_id) ON DELETE CASCADE,
+  notified_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, canonical_id)
+);
+
+-- The reverse lookup, added with the table rather than discovered later — the
+-- same reasoning as user_companies_company_idx, and the same honesty about which
+-- half of it the UNIQUE already covers.
+--
+-- UNIQUE (user_id, canonical_id) leads with user_id, so it already serves the
+-- per-user question ("has THIS user been told about this job") that the digest's
+-- NOT EXISTS asks. This index serves the other direction: the planner driving
+-- that anti-join from `jobs` outward, which it will, because jobs is the large
+-- relation being scanned and these rows are the small one being probed — and the
+-- operational question "who has been told about this job", which is the one a
+-- person debugging a missing digest actually asks.
+CREATE INDEX IF NOT EXISTS user_job_notifications_job_idx
+    ON user_job_notifications (canonical_id);
+
+-- jobs.notified IS DELIBERATELY NOT DROPPED HERE. Phase 1d moves the READ
+-- authority to this table; the boolean stays, and stays WRITTEN, for three
+-- reasons — and dropping it is 1g's job, only once the 1e fan-out is proven in
+-- production.
+--
+--   1. It is the rollback net. notify/store.record_sent writes this table and
+--      the boolean in ONE transaction, so reverting 1d cannot re-send anything
+--      that went out during the 1d window. A rollback net nobody maintains is
+--      not a net.
+--   2. It is the backfill's only source of truth. scripts/backfill_user_
+--      notifications.py reads WHERE notified = TRUE; a re-run after a rollback
+--      needs it to still be accurate.
+--   3. The dashboard still reads it — lib/badges.homeBadge derives NEW vs
+--      NOTIFIED from it, and the dashboard is not user-scoped until a later
+--      sub-phase. Dual-writing is what keeps those badges honest without
+--      touching any TypeScript in 1d.
+--
+-- THE OBLIGATION 1e INHERITS, WRITTEN DOWN SO IT CANNOT BE FORGOTTEN.
+-- The 1d digest queue is a CONJUNCTION, not a straight swap:
+--
+--     AND j.notified = FALSE
+--     AND NOT EXISTS (SELECT 1 FROM user_job_notifications n
+--                      WHERE n.user_id = $1 AND n.canonical_id = j.canonical_id)
+--
+-- The second clause is the new per-user rule. The FIRST clause is still load
+-- bearing, and it is load bearing on the CRAWL path: crawler/store.mark_new
+-- writes notified = TRUE for a company's whole back catalogue on its first-ever
+-- crawl (the silent seed), and the crawl path is user-blind by design and must
+-- stay that way — tests/test_user_companies.py asserts that absence three ways.
+-- Those seeded rows therefore have NO row in this table. Reading this table
+-- alone would put an entire freshly-seeded back catalogue into the digest queue;
+-- one discovery sweep once seeded 6,496 rows in a single afternoon.
+--
+-- So the boolean remains the SILENT-SEED SUPPRESSOR until 1e teaches the seed to
+-- fan out (or replaces the seed marker outright). Until that is done, dropping
+-- either the column or the first clause re-opens exactly the flood this table
+-- was introduced to prevent. 1e does the fan-out; 1g drops the column; neither
+-- may happen before the other.
+--
+-- No seed row here, for the same reason public.users and user_companies have
+-- none: the only user is a real person resolved from MY_EMAIL at runtime and
+-- this file cannot name them. scripts/backfill_user_notifications.py is the
+-- seed, and it is the highest-risk step in Phase 1 — see its docstring.
