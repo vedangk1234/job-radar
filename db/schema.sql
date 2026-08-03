@@ -311,3 +311,73 @@ ALTER TABLE preferences ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES public.
 -- today, and a PK reshape is not a change to make speculatively.
 CREATE UNIQUE INDEX IF NOT EXISTS preferences_one_per_user_idx
     ON preferences (user_id) WHERE user_id IS NOT NULL;
+
+-- user_companies: which user watches which company. The schema behind
+-- "crawl once, fan out" — and it is only the first half of that phrase.
+--
+-- The catalog stays SHARED and is crawled EXACTLY ONCE for everybody. Two users
+-- watching Adobe is one board fetch an hour, not two, and this table is what
+-- makes that statement true rather than a coincidence of there being one user.
+-- The fan-out — deciding whose digest a new job reaches — reads this table; the
+-- crawl does not, and must not.
+--
+-- THE CRAWL PATH DOES NOT READ THIS TABLE, AND THAT IS THE POINT.
+-- scripts/crawl.py selects `FROM companies WHERE tracked = TRUE` and nothing
+-- else, exactly as it did before this table existed. A join here would make the
+-- crawl conditional on somebody wanting the results, which inverts the design:
+-- the whole reason jobs are stored loosely is that a board's history is worth
+-- having before anyone asks for it, and a company nobody currently tracks would
+-- otherwise go dark and then re-alert its entire back catalogue the day someone
+-- adds it. tests/test_user_companies.py asserts the absence three ways — the
+-- statement text, the source text of every crawl-path module, and behaviourally.
+--
+-- FK DIRECTIONS AND TYPES. user_id is UUID because public.users.id is; company_id
+-- is INT because companies.id is a plain SERIAL, exactly as jobs.company_id
+-- already declares. The two keys on this one table are deliberately different
+-- types, which is precisely the thing that invites a mistake — a UUID company_id
+-- would fail loudly here, but only because someone wrote the FK; without it, it
+-- would be a column that silently never joins.
+--
+-- BOTH SIDES ON DELETE CASCADE, and for one reason said twice. A tracking row is
+-- a statement about a pair; if either half of the pair is gone the row asserts
+-- nothing, and it cannot be read back by any query that joins to what it names.
+-- Deleting a user must take their tracking rows with them (same argument as
+-- preferences.user_id above: a filter, or a watch list, that outlives its owner
+-- decides what reaches nobody's inbox). Deleting a company from the catalog must
+-- take every user's tracking row for it (same argument as jobs.company_id): the
+-- 1e fan-out joins user_companies -> companies -> jobs, and an orphan there either
+-- trips the join or is silently dropped by it, which makes the table's row count
+-- disagree with the join's for reasons nobody can see. RESTRICT was the
+-- alternative on both sides and buys a manual two-step delete whose only prize is
+-- keeping rows nothing can read.
+--
+-- NOT NULL on both, with no nullable window — unlike preferences.user_id, which
+-- had to arrive nullable because ADD COLUMN needed a default the schema could not
+-- know. Every row here is created by an INSERT that already holds both ids.
+--
+-- Surrogate id + UNIQUE (user_id, company_id) rather than a composite primary
+-- key, matching notifications and discovered_companies. The UNIQUE is what makes
+-- "track this company" idempotent — ON CONFLICT DO NOTHING has something real to
+-- conflict against — exactly as UNIQUE (ats, token) does for "add a company".
+CREATE TABLE IF NOT EXISTS user_companies (
+  id          SERIAL PRIMARY KEY,
+  user_id     UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  company_id  INT  NOT NULL REFERENCES companies(id)    ON DELETE CASCADE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, company_id)
+);
+
+-- The reverse lookup, added with the table rather than discovered later.
+-- UNIQUE (user_id, company_id) already answers "which companies does this user
+-- watch", which is the question the dashboard and this task's backfill ask. The
+-- fan-out asks the other one — "who watches this company" — once per company
+-- carrying new jobs, every digest. Without this index that is a sequential scan
+-- per company per digest, on the one path where the row count grows with users
+-- times companies.
+CREATE INDEX IF NOT EXISTS user_companies_company_idx ON user_companies (company_id);
+
+-- No seed row here, for the same reason public.users has none: the only user is
+-- a real person resolved from MY_EMAIL at runtime, and this file cannot name
+-- them. scripts/backfill_user_companies.py is the seed — it tracks every company
+-- in the catalog for that user, so behaviour after this migration is identical
+-- to behaviour before it.

@@ -170,6 +170,21 @@ CREATE TABLE users (
 )
 """
 
+# The per-user watch list. Both ON DELETE CASCADE clauses are mirrored verbatim
+# from db/schema.sql because tests/test_user_companies.py asserts what they do —
+# but note that SQLite ignores every foreign key unless PRAGMA foreign_keys is
+# ON, and it is OFF by default. FakeConn.enforce_foreign_keys() is the opt-in;
+# see the note there for why it is not simply switched on for the whole suite.
+USER_COMPANIES_DDL = """
+CREATE TABLE user_companies (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     TEXT NOT NULL REFERENCES users(id)     ON DELETE CASCADE,
+  company_id  INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  created_at  TEXT,
+  UNIQUE (user_id, company_id)
+)
+"""
+
 # The address every test resolves the current user from. A .test domain, which
 # scripts/githooks/pre-commit allows (RFC 2606/6761) — see test-guard.sh.
 TEST_EMAIL = "me@example.test"
@@ -222,8 +237,26 @@ class FakeConn:
             USERS_DDL,
             PREFERENCES_DDL,
             DISCOVERED_DDL,
+            USER_COMPANIES_DDL,
         ):
             self._db.execute(ddl)
+
+    def enforce_foreign_keys(self) -> None:
+        """Turn on SQLite's foreign keys. Opt-in, and deliberately not autouse.
+
+        SQLite defaults `PRAGMA foreign_keys` to OFF, so a REFERENCES clause is
+        documentation until this is called — which means a test asserting that
+        deleting a user removes their tracking rows would simply fail, with the
+        rows sitting there untouched.
+
+        Not switched on for the whole suite because the existing tests predate
+        every foreign key in the mirrored schema and legitimately seed rows in
+        an order no production path uses — set_preferences(user_id=...) without
+        a users row, for one, which is how the half-applied-migration case is
+        reached. Turning it on globally would fail those for a reason that has
+        nothing to do with what they test.
+        """
+        self._db.execute("PRAGMA foreign_keys = ON")
 
     def transaction(self) -> "FakeTransaction":
         """asyncpg's `async with conn.transaction():`, backed by real BEGIN/ROLLBACK.
@@ -360,6 +393,29 @@ class FakeConn:
             self.clock.tick(),
         )
         return user_id
+
+    async def track_company(self, user_id: str, company_id: int) -> None:
+        """One user_companies row, inserted directly.
+
+        Deliberately has no ON CONFLICT clause: a test that wants the idempotent
+        behaviour runs the production statement from db/watchlist.py instead, so
+        the conflict handling under test is the one production actually uses.
+        """
+        await self.execute(
+            "INSERT INTO user_companies (user_id, company_id, created_at) VALUES ($1, $2, $3)",
+            user_id,
+            company_id,
+            self.clock.tick(),
+        )
+
+    async def tracking_rows(self) -> set[tuple[str, int]]:
+        """Every (user_id, company_id) pair currently in user_companies.
+
+        A set of pairs rather than a count, so a CASCADE test can assert both
+        halves of "the right rows went and nothing else did" in one comparison.
+        """
+        rows = await self.fetch("SELECT user_id, company_id FROM user_companies")
+        return {(row["user_id"], row["company_id"]) for row in rows}
 
     async def set_preferences(
         self,

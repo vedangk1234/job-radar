@@ -202,6 +202,46 @@ path) and **raise** rather than falling back to the seeded defaults — silently
 emailing the results of a filter nobody chose is exactly the failure the crawl
 guards exist to prevent.
 
+### `user_companies` — the watch list, per person
+Columns: `id` (`SERIAL`), `user_id` (`UUID` → `public.users`), `company_id`
+(`INT` → `companies`), `created_at`, `UNIQUE (user_id, company_id)`, plus
+`user_companies_company_idx` on `company_id` for the reverse lookup.
+
+**The catalog stays shared and is crawled exactly once for everybody.** Two
+users watching Adobe is one board fetch an hour, not two. This table is the
+schema behind "crawl once, fan out" — and only the *fan out* half reads it.
+
+**The crawl path has never heard of it, and that is asserted rather than
+promised.** `scripts/crawl.py` still selects `FROM companies WHERE tracked =
+TRUE` and nothing else. A join here would make crawling conditional on somebody
+currently wanting the results, which inverts the design: seeding is decided from
+a company's stored row count, so a board that went unwatched for a month would go
+dark and then re-alert its entire back catalogue the day someone added it.
+`tests/test_user_companies.py` checks the absence three ways — the statement text
+of `COMPANIES_SQL`, the source text of every crawl-path module, and behaviourally
+(three companies in the catalog, one watched, all three still selected).
+
+Both foreign keys are `ON DELETE CASCADE`, which is one argument said twice: a
+tracking row is a statement about a pair, and if either half is gone the row
+asserts nothing and cannot be read back by any query that joins to what it names.
+The two key types differ deliberately — `UUID` because `public.users.id` is,
+plain `INT` because `companies.id` is a `SERIAL`, exactly as `jobs.company_id`
+already declares.
+
+`companies.tracked` is a **different axis** and this table does not read it.
+`tracked = FALSE` means "excluded from crawls entirely", a property of the
+catalog; a row here means "this person wants alerts for this company", a property
+of a person. They agree today and answer different questions.
+
+`db/watchlist.py` holds the statements (so the tests exercise what production
+runs) and `scripts/backfill_user_companies.py` is the seed — the same MY_EMAIL
+bridge as the preferences backfill, tracking every catalog company for the single
+user so behaviour is unchanged. Its success gate is **coverage of a snapshot
+taken before the insert**, not a fresh re-count: the discovery sweep can add a
+company mid-run, and a gate that re-counted the catalog would fail a migration
+that did its job perfectly. A company that appears mid-run is named in the output
+and picked up by the next run.
+
 ---
 
 ## The diffing guards (why the inbox stays trustworthy)
@@ -1113,6 +1153,31 @@ Newest last. Append here as the project evolves.
   `now` forward by exactly `RETRY_AFTER` makes the cutoff the real present, which
   re-asks every failed row once and cannot touch a clean read (those are never
   re-read whatever the cutoff says).
+
+- **2026-08-03 — Phase 1c. The watch list becomes per-user.** `user_companies`
+  joins `public.users` to `companies`, both sides `ON DELETE CASCADE`, unique per
+  pair. `scripts/backfill_user_companies.py` tracks all **50** catalog companies
+  for the single user resolved from MY_EMAIL, so behaviour is unchanged: the
+  digest that reported 34 matches before the migration reports the same 34 after.
+
+  The point of the step is the half that did **not** change. Crawling is not
+  conditional on the watch list and must never become so — `COMPANIES_SQL` is
+  byte-for-byte what it was, no crawl-path file was touched, and the invariant is
+  a test rather than a note in this file. The reasoning is the silent seed: a
+  company nobody happens to watch this week would go dark, and `crawl.py` decides
+  seeding from the stored row count, so the day it was added back it would
+  re-alert its whole back catalogue. "Crawl once, fan out" means the crawl stays
+  user-blind and the *notification* narrows; the fan-out itself is 1e.
+
+  Two smaller things worth keeping. The backfill's success gate asserts coverage
+  of a catalog snapshot taken before the insert rather than re-counting the
+  catalog afterwards — the discovery sweep and `add_workday.py` can both add a
+  row mid-run, and the arithmetic gate would have failed a perfectly good
+  migration for it. And `tests/conftest.py` gained an opt-in
+  `enforce_foreign_keys()`, because SQLite ignores every `REFERENCES` clause
+  unless `PRAGMA foreign_keys` is on: without it the two CASCADE tests pass
+  vacuously by asserting nothing. Neutering the pragma fails all three FK tests,
+  which is how that was confirmed rather than assumed.
 
 **Pending**
 
