@@ -17,9 +17,11 @@ export const dynamic = "force-dynamic";
  * Ordered by name rather than by count. Home ranks; this one is a reference,
  * and a reference you look things up in should be where you left it.
  *
- * `notified` is shown here as text. It was only ever dangerous as an editable
- * field — the crawler owns it, and a dashboard that could flip it could silently
- * re-send or un-send a digest. Reading it is just a fact about the row.
+ * "notified" is shown here as text, and since Phase 1f it means "a digest has
+ * told YOU about this" — a row in user_job_notifications — rather than the old
+ * global boolean on the job. It is read and never written: this screen has no
+ * control that could add or remove such a row, and the send path is the only
+ * thing entitled to write one.
  *
  * The one badge this screen shows is SUGGESTED, on the rows that also pass the
  * filter. It is the same shared matcher Home uses, applied to a list that is not

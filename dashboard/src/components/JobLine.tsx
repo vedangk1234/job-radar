@@ -28,10 +28,11 @@ import { descriptionHint } from "@/lib/match";
  * ---------
  * One per row, and which one depends on which question the screen is asking.
  * Home shows NEW or NOTIFIED — everything there matches, so the useful fact is
- * whether the digest has already mentioned it. Jobs shows SUGGESTED on the rows
- * that match and nothing on the rest — nothing there is filtered, so the useful
- * fact is the opposite one. Both are derived at render from data the row already
- * carries; see lib/badges.ts for why neither is a column.
+ * whether a digest has already mentioned it TO ME. Jobs shows SUGGESTED on the
+ * rows that match and nothing on the rest — nothing there is filtered, so the
+ * useful fact is the opposite one. Both are derived at render from data the row
+ * already carries; see lib/badges.ts for why neither is a column, and why the
+ * first pair is per-user since Phase 1f rather than a boolean on the job.
  *
  * THE APPLIED CHECKBOX, AND WHY IT IS ONLY ON HOME
  * ------------------------------------------------
@@ -108,7 +109,12 @@ export function JobLine({
         {mode === "all" ? (
           <>
             <span className={job.status === "open" ? "tag on" : "tag off"}>{job.status}</span>
-            <span className="muted small">{job.notified ? "notified" : "not notified"}</span>
+            <span
+              className="muted small"
+              title="Whether a digest has told YOU about this job — a row in user_job_notifications, not a column on the job."
+            >
+              {job.user_notified ? "notified" : "not notified"}
+            </span>
           </>
         ) : null}
       </div>

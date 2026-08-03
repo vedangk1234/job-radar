@@ -23,7 +23,8 @@ export const dynamic = "force-dynamic";
  *
  * Read-only. There is no PATCH, POST or DELETE in this file and there should
  * never be one: the crawler owns the lifecycle of a job, and a route that could
- * edit `notified` or `status` could silently un-send or re-send a digest. The
+ * edit `status` — or the record of what has been emailed to whom — could
+ * silently un-send or re-send a digest. The
  * one column the dashboard does own has its own route — PATCH
  * /api/jobs/applied — deliberately kept out of this file so that "the route
  * that lists jobs cannot change them" stays true by inspection.

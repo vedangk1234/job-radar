@@ -14,11 +14,14 @@ export const dynamic = "force-dynamic";
  * job the digest would email; if the two ever disagree, that check fails before
  * anyone has to notice a number looked wrong.
  *
- * One thing is deliberately NOT part of the filter: `notified`. A job that was
- * already emailed still fits, so it still shows. Home is not the outbox. It is
- * however what the NEW / NOTIFIED badge on each row reports — the same flag,
- * shown rather than filtered on, so "has the digest told me about this yet" is
- * answerable at a glance without hiding anything.
+ * One thing is deliberately NOT part of the filter: whether a digest has already
+ * emailed it to you. A job that went out this morning still fits, so it still
+ * shows. Home is not the outbox. It is however what the NEW / NOTIFIED badge on
+ * each row reports — the same fact, shown rather than filtered on, so "has the
+ * digest told me about this yet" is answerable at a glance without hiding
+ * anything. Since Phase 1f that fact is per-user: a row in
+ * user_job_notifications for the account MY_EMAIL resolves to, never a boolean
+ * on the job that another person's digest could have flipped.
  *
  * Ticking "Applied" on a row is the one write either screen makes to the jobs
  * table. See lib/jobs.setApplied for why those two columns are the dashboard's
@@ -49,9 +52,9 @@ export default async function HomePage() {
       <CompanyList initial={companies} mode="matches" />
       <p className="muted small" style={{ marginTop: 14 }}>
         Each row carries one badge: <span className="badge new">new</span> for a match no digest
-        has mentioned yet, <span className="badge notified">notified</span> for one already
-        emailed. Both are computed from the row as it stands — neither is stored, so editing
-        your preferences re-decides every badge on the next load. Ticking{" "}
+        has mentioned to you yet, <span className="badge notified">notified</span> for one
+        already emailed to you. Both are computed from the row as it stands — neither is
+        stored, so editing your preferences re-decides every badge on the next load. Ticking{" "}
         <strong>Applied</strong> dims the job, strikes the title through and sinks it to the
         bottom of its company; the link still works, and the crawler never clears the tick.
       </p>

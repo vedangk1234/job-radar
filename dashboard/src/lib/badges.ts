@@ -14,10 +14,31 @@
  * It is also why there is no migration here and no backfill: adding a badge
  * changed no data, only what the screen says about data it already had.
  *
- *   NEW        a match nobody has emailed yet   (match && !notified)
- *   NOTIFIED   a match already in a digest      (match && notified)
- *   SUGGESTED  on the RAW list: this one fits   (match, on a screen that does
- *                                                not filter by matching)
+ *   NEW        a match I have not been told about  (match && !user_notified)
+ *   NOTIFIED   a match a digest has told me about  (match && user_notified)
+ *   SUGGESTED  on the RAW list: this one fits      (match, on a screen that does
+ *                                                   not filter by matching)
+ *
+ * "TOLD ME", NOT "TOLD SOMEBODY" — THE PHASE 1f CHANGE
+ * ----------------------------------------------------
+ * Until 1f the first two read `jobs.notified`, a single boolean on the job. It
+ * means "somebody was emailed about this", which is a faithful paraphrase of
+ * "I was emailed about this" for exactly as long as there is one account. With
+ * two, the first person's digest would turn the second person's NEW into
+ * NOTIFIED — a badge asserting an email that person never got, which is the
+ * flattening `user_job_notifications` was created in 1d to end and which the
+ * digest queue stopped doing in 1e. The screen was the last reader left.
+ *
+ * So `user_notified` now comes from lib/jobs.notifiedToUser: does a row exist in
+ * user_job_notifications for THIS user and this job. Same table, same predicate
+ * and same meaning as notify/store.CANDIDATES_SQL's NOT EXISTS — the digest asks
+ * it to decide what to send, this asks it to decide what to say.
+ *
+ * For the one real account the two readings cover the identical set of jobs (the
+ * 1d backfill wrote a row for every notified = TRUE job; record_sent has written
+ * both ever since), so this changed no badge on any screen. That is not an
+ * assumption: `npm run badge-check` compares the two, job by job, against the
+ * live database and fails on any difference.
  *
  * WHY HOME AND JOBS SHOW DIFFERENT BADGES
  * ---------------------------------------
@@ -31,11 +52,16 @@
  *
  * A NOTE ON WHAT YOU WILL ACTUALLY SEE TODAY
  * ------------------------------------------
- * Every stored match is currently notified = TRUE, because the whole table was
- * silently seeded (see "the silent seed" in CLAUDE.md) and no digest cron exists
- * yet. So Home reads NOTIFIED everywhere until the cron starts leaving fresh
- * jobs at notified = FALSE. NEW is not speculative — it is what the crawler
- * already writes for a genuinely new posting; there simply is not one yet.
+ * Most matches read NOTIFIED, because most of the table is back catalogue: a
+ * company's first-ever crawl stores its whole board silently (see "the silent
+ * seed" in CLAUDE.md), and the 1d backfill recorded every job the old boolean
+ * covered as already-notified for the one existing account.
+ *
+ * NEW is not speculative and has not been since the hourly cron started. A
+ * genuinely new posting arrives with no row in user_job_notifications for
+ * anybody, so it reads NEW on Home until that hour's digest sends and records
+ * one. A job that somebody else's digest sent stays NEW here, which is the whole
+ * point of the change.
  */
 
 export type HomeBadge = "NEW" | "NOTIFIED";
@@ -45,28 +71,35 @@ export type Badge = HomeBadge | JobsBadge;
 /** What the badge says, and the tooltip that explains why it says it. */
 export type BadgeInfo = { label: Badge; title: string };
 
-type Judged = { notified?: boolean | null; matches?: boolean | null };
+/**
+ * The two derived facts a badge is read from — neither of them a column.
+ *
+ * Structural rather than importing JobView, so this module stays free of the
+ * database import graph and can be called from a check script as easily as from
+ * a client component.
+ */
+type Judged = { user_notified?: boolean | null; matches?: boolean | null };
 
 /**
  * The badge for a row on Home, where every row is already a match.
  *
  * `matches` is still consulted rather than assumed. The screen guarantees it
- * today, but a function that reads "NEW = a match that is not notified" and
- * checks only half of that is a function that will one day label a non-match
+ * today, but a function that reads "NEW = a match I have not been told about"
+ * and checks only half of that is a function that will one day label a non-match
  * NEW on a screen nobody has written yet.
  */
 export function homeBadge(job: Judged): BadgeInfo | null {
   if (job.matches === false) return null;
-  return job.notified
+  return job.user_notified
     ? {
         label: "NOTIFIED",
-        title: "This job fits your filter and has already gone out in a digest email.",
+        title: "This job fits your filter and has already gone out to you in a digest email.",
       }
     : {
         label: "NEW",
         title:
-          "This job fits your filter and has not been emailed yet — it is sitting in the " +
-          "digest queue (notified = false).",
+          "This job fits your filter and has not been emailed to you yet — it is sitting in " +
+          "your digest queue.",
       };
 }
 

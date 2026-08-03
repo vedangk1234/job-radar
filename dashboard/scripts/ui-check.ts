@@ -131,16 +131,43 @@ async function main() {
   check(/title="Applied on [^"]+\. Untick to undo\."/.test(ticked), "the tooltip names the applied date");
 
   // --- HOME: the badges ---------------------------------------------------
+  //
+  // Since Phase 1f the input is `user_notified` — derived per user from
+  // user_job_notifications by lib/jobs.notifiedToUser, rather than read off the
+  // old global jobs.notified column. The badge LABELS and CSS classes are
+  // deliberately unchanged, which is what makes "Home looks identical for me"
+  // checkable here: if the markup below still holds and badge-check says the two
+  // readings cover the same jobs, the screen cannot have moved.
   console.log("\nHome — NEW / NOTIFIED");
-  const notified = render({ ...home[0], notified: true }, "matches");
-  check(notified.includes('class="badge notified"'), "a match already emailed reads NOTIFIED");
+  const notified = render({ ...home[0], user_notified: true }, "matches");
+  check(notified.includes('class="badge notified"'), "a match already emailed to me reads NOTIFIED");
   check(notified.includes(">NOTIFIED<"), "the word NOTIFIED is in the markup");
   check(!notified.includes(">NEW<"), "and NEW is not");
 
-  const fresh = render({ ...home[0], notified: false }, "matches");
-  check(fresh.includes('class="badge new"'), "a match not yet emailed reads NEW");
+  const fresh = render({ ...home[0], user_notified: false }, "matches");
+  check(fresh.includes('class="badge new"'), "a match not yet emailed to me reads NEW");
   check(fresh.includes(">NEW<"), "the word NEW is in the markup");
   check(!fresh.includes(">NOTIFIED<"), "and NOTIFIED is not");
+
+  // The same row with NOTHING overridden — the badge the running app actually
+  // puts on screen for the signed-in user, from the flag the live API sent.
+  // The two checks above prove the component can render either badge; this one
+  // proves the live per-user data reaches it, which is the half a synthetic
+  // prop can never test. It is also the check that would catch the API quietly
+  // dropping the field: `undefined` is falsy, so every row would read NEW.
+  console.log("\nHome — the badge on a LIVE row, as the API sent it");
+  const liveRow = home[0];
+  check(
+    typeof liveRow.user_notified === "boolean",
+    "the live API sends user_notified as a boolean",
+    `got ${typeof liveRow.user_notified}`,
+  );
+  const live = render(liveRow, "matches");
+  const expected = liveRow.user_notified ? "NOTIFIED" : "NEW";
+  check(
+    live.includes(`>${expected}<`),
+    `the live row reads ${expected}, which is what user_job_notifications says for me — "${liveRow.title}"`,
+  );
 
   // --- JOBS: SUGGESTED, and its absence -----------------------------------
   console.log("\nJobs — SUGGESTED, and the rows that get nothing");
@@ -158,6 +185,10 @@ async function main() {
     const html = render(nonMatching, "all");
     check(!html.includes("badge"), `a non-matching row has NO badge — "${nonMatching.title}"`);
     check(html.includes("notified"), "but keeps the notified text and the status tag");
+    check(
+      typeof nonMatching.user_notified === "boolean",
+      "and the raw list carries user_notified too, so that text is per-user as well",
+    );
   }
 
   // --- the ordering rule --------------------------------------------------

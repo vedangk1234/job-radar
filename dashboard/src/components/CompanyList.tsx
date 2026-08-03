@@ -171,10 +171,16 @@ function CompanyRow({
       const saved = data.job as JobView;
       setJobs((current) =>
         (current ?? []).map((j) =>
-          // `matches` is not a column, so the server's row does not carry it;
-          // keep the one this list was rendered with rather than dropping the
-          // badge on the row that was just ticked.
-          j.canonical_id === saved.canonical_id ? { ...saved, matches: j.matches } : j,
+          // Neither `matches` nor `user_notified` is a column, so the row the
+          // PATCH returns does not carry either: that statement writes two
+          // columns and reads back two columns, which is what keeps it provably
+          // unable to touch anything else. Both are kept from the row this list
+          // was rendered with, rather than dropping the badge off the row that
+          // was just ticked. Ticking "applied" says nothing about whether the
+          // filter still likes the job or whether a digest has mentioned it.
+          j.canonical_id === saved.canonical_id
+            ? { ...saved, matches: j.matches, user_notified: j.user_notified }
+            : j,
         ),
       );
     } catch (err) {

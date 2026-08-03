@@ -11,6 +11,7 @@
     "db:check": "tsx scripts/db-check.ts",
     "parity": "tsx scripts/parity-check.ts",
     "match-parity": "tsx scripts/match-parity.ts",
+    "badge-check": "tsx scripts/badge-check.ts",
     "mint-session": "tsx scripts/mint-session.ts",
     "ui-check": "tsx --tsconfig tsconfig.scripts.json scripts/ui-check.ts",
     "config-roundtrip": "tsx scripts/config-roundtrip.ts"

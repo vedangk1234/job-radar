@@ -71,7 +71,7 @@ type Row = {
   is_pm_role: boolean;
   desc_checked: boolean;
   desc_fetch_failed: boolean;
-  notified: boolean;
+  user_notified: boolean;
 };
 
 /*
@@ -138,10 +138,24 @@ async function main() {
   // Every OPEN row, unfiltered. The SQL prefilter lib/jobs.ts uses is itself
   // part of what is being checked, so it is deliberately not applied here: if
   // it dropped a row the matcher would have kept, this is where that shows up.
+  //
+  // `user_notified` is carried for the one summary line below and is no part of
+  // the comparison — the matcher has never read it, in either language. It used
+  // to be the `j.notified` column; since Phase 1f "has this been emailed" is a
+  // row in user_job_notifications for the user resolved above, so it is asked of
+  // that user here too. The predicate is the same one lib/jobs.notifiedToUser
+  // states for the app; this script builds its own pool for the reasons above
+  // and so cannot embed that fragment. Nothing decides on it here, and
+  // `npm run badge-check` is what runs the production predicate itself.
   const jobs = await sql<Row[]>`
     SELECT j.canonical_id, c.name AS company, j.title, j.city,
            j.min_experience, j.is_pm_role, j.desc_checked, j.desc_fetch_failed,
-           j.notified
+           EXISTS (
+             SELECT 1
+               FROM user_job_notifications n
+              WHERE n.user_id = ${user.id}
+                AND n.canonical_id = j.canonical_id
+           ) AS user_notified
       FROM jobs j
       JOIN companies c ON c.id = j.company_id
      WHERE j.status = 'open'
@@ -183,9 +197,9 @@ async function main() {
     console.log(`  ${String(n).padStart(3)}  ${company}`);
   }
 
-  const notified = jobs.filter((j) => fromTs.has(j.canonical_id) && j.notified).length;
+  const emailed = jobs.filter((j) => fromTs.has(j.canonical_id) && j.user_notified).length;
   console.log(`\nTOTAL "For you" across all companies : ${fromTs.size}`);
-  console.log(`  of those, already emailed          : ${notified}  (still shown; Home is not the outbox)`);
+  console.log(`  of those, already emailed to you   : ${emailed}  (still shown; Home is not the outbox)`);
   console.log(
     `  of those, desc_checked = false     : ${unchecked}  (shown with a "desc not checked" hint)`,
   );
