@@ -1,50 +1,40 @@
 /**
- * Prove the NEW / NOTIFIED badge is per-user, and that making it per-user changed
- * nothing on my screen.
+ * Prove the NEW / NOTIFIED badge is per-user, against the live database.
  *
  *     npm run badge-check
  *
- * WHAT PHASE 1f DID, AND WHY IT NEEDS A CHECK OF ITS OWN
- * ------------------------------------------------------
- * The badge used to read `jobs.notified`, one boolean on the job meaning
- * "somebody was emailed about this". Phase 1d gave that fact an owner —
- * user_job_notifications, one row per (user, job) — and 1e moved the digest queue
- * onto it. The dashboard's badge was the last reader of the boolean left, and 1f
- * is what moved it. lib/jobs.notifiedToUser is the new definition, and it is the
- * same predicate the digest asks in notify/store.CANDIDATES_SQL, read from the
- * other side: the queue asks NOT EXISTS to decide what to send, the badge asks
- * EXISTS to decide what to say.
+ * WHAT THE BADGE READS, AND WHAT IT USED TO
+ * ------------------------------------------
+ * It used to read `jobs.notified`, one boolean on the job meaning "somebody was
+ * emailed about this". Phase 1d gave that fact an owner — user_job_notifications,
+ * one row per (user, job) — 1e moved the digest queue onto it, and 1f moved this
+ * badge, which was the boolean's last reader. lib/jobs.notifiedToUser is the
+ * definition now, and it is the same predicate the digest asks in
+ * notify/store.CANDIDATES_SQL read from the other side: the queue asks NOT EXISTS
+ * to decide what to send, the badge asks EXISTS to decide what to say.
  *
- * That is a change of MEANING, from "somebody was told" to "I was told", and for
- * the single real account the two are the same set of jobs. "Are" rather than
- * "should be" is the thing worth checking, so §1 checks it job by job.
+ * That was a change of MEANING, from "somebody was told" to "I was told". For a
+ * single account the two are the same set of jobs, which is why 1f could not be
+ * proved by looking at one screen — the interesting half only exists once there
+ * is a second person.
  *
  * THE THREE SECTIONS
  * ------------------
- *   §1  For me, the two readings agree — every open job, and the badge each one
- *       produces. This is the migration proof: if it is green, Home is byte
- *       identical to what it showed before 1f.
+ *   §1  The column is gone. `jobs` has no `notified`, and nothing in dashboard/
+ *       names it.
  *   §2  The badge is genuinely per-user, proved in BOTH directions with a second
  *       account, inside a transaction that always rolls back.
  *   §3  The "for you" counts come from MY preferences row and nobody else's.
  *
- * §1 IS THE ONE FILE IN dashboard/ THAT STILL READS jobs.notified, DELIBERATELY.
- * It is the before/after comparison, so it has to name both sides. Phase 1g drops
- * that column, at which point this section stops being possible and stops being
- * needed — 1g's diff should delete it, and until then the check failing with
- * `column "notified" does not exist` is the reminder. Everything a page render
- * touches is free of the column already, which is the precondition 1g depends on;
- * tests/test_dashboard_notified.py asserts that textually and names this file as
- * the single enumerated exemption.
- *
- * §1 IS ALSO SELF-CONTAINED, WHICH IT DID NOT USED TO BE. It runs its own query
- * and derives its own match set, so §2 and §3 borrow nothing from it. That is
- * deliberate preparation rather than tidiness: §1 is a block 1g deletes whole, and
- * a section that fed the two sections below it could not be deleted without
- * silently taking their inputs with it — the two per-user proofs would vanish in
- * the same diff that removes the column they exist to justify removing. Everything
- * §2 and §3 need comes from loadOpenRows(), which names only the per-user
- * predicate and never the boolean.
+ * §1 REPLACED THE MIGRATION PROOF, WHICH HAS EXPIRED. Through 1f this section
+ * read both the retiring boolean and the per-user table for every open job and
+ * failed if they disagreed about one — the evidence that Home was byte identical
+ * across the change. Phase 1g dropped the column, so that comparison is not
+ * possible and is not needed; what replaced it is the assertion that the drop
+ * actually happened and did not silently get skipped on some environment. Both
+ * halves are asked, because they can fail apart: the schema can still carry the
+ * column while no code reads it (a database the migration never reached), and the
+ * code can name a column the schema no longer has (a revert of 1g's diff).
  *
  * WHY §2 WRITES TO THE LIVE DATABASE, AND WHY THAT IS SAFE
  * --------------------------------------------------------
@@ -129,8 +119,9 @@ class Rollback extends Error {}
  * actually shows. `user_notified` comes from the production predicate itself
  * rather than from a restatement of it.
  *
- * NAMES NO COLUMN THAT PHASE 1g REMOVES. This is what every section below §1
- * runs on, which is what makes §1 a block that can be deleted on its own.
+ * NAMES NO COLUMN PHASE 1g REMOVED. This is what every section runs on; it was
+ * split out ahead of the drop so that deleting the old §1 could not silently take
+ * the inputs of the sections below it.
  */
 type OpenRow = {
   canonical_id: string;
@@ -143,9 +134,6 @@ type OpenRow = {
   desc_fetch_failed: boolean;
   user_notified: boolean;
 };
-
-/** §1's extra column: the retiring boolean, alongside what replaced it. */
-type MigrationRow = OpenRow & { boolean_says: boolean };
 
 async function loadOpenRows(lib: Lib, userId: string): Promise<OpenRow[]> {
   const { sql, notifiedToUser } = lib;
@@ -175,102 +163,56 @@ async function main() {
 
   const prefs = await lib.loadPreferences();
 
-  // The rows every section from §2 onwards works from. Read once, before §1, so
-  // that deleting §1 leaves them exactly where they are.
+  // The rows every section works from.
   const rows = await loadOpenRows(lib, userId);
   const matched = rows.filter((row) => isMatch(row, prefs));
 
   // -------------------------------------------------------------------------
-  // §1  The migration proof: for me, the two readings are the same set.
-  //     PHASE 1g DELETES THIS SECTION WHOLE. Nothing below reads anything it
-  //     defines — see the header note.
+  // §1  The column is gone — from the schema, and from this app's source.
   // -------------------------------------------------------------------------
-  console.log("\n§1  the old boolean and the per-user table, compared for me");
+  console.log("\n§1  the retired notification column is gone");
 
-  // Both readings on every open row: the column being retired, and the
-  // production fragment that replaced it.
-  const migrationRows = await sql<MigrationRow[]>`
-    SELECT j.canonical_id,
-           c.name AS company,
-           j.title,
-           j.city,
-           j.min_experience,
-           j.is_pm_role,
-           j.desc_checked,
-           j.desc_fetch_failed,
-           j.notified AS boolean_says,
-           ${notifiedToUser(userId)}
-      FROM jobs j
-      JOIN companies c ON c.id = j.company_id
-     WHERE j.status = 'open'
-     ORDER BY c.name, j.title
+  // Asked of information_schema rather than by SELECTing the column and catching
+  // the error, because a query that throws cannot tell "the column is absent"
+  // from "the database is unreachable" — and this check's whole job at this point
+  // is to distinguish states that look alike from the outside.
+  const [{ still_there: stillThere }] = await sql<{ still_there: number }[]>`
+    SELECT count(*)::int AS still_there
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name   = 'jobs'
+       AND column_name  = 'notified'
   `;
-
-  const booleanTrue = migrationRows.filter((r) => r.boolean_says).length;
-  const mineTrue = migrationRows.filter((r) => r.user_notified).length;
-  console.log(
-    `  open jobs ${migrationRows.length}  ·  jobs.notified = TRUE ${booleanTrue}  ·  ` +
-      `a row in user_job_notifications for me ${mineTrue}`,
-  );
-
-  const disagreements = migrationRows.filter((r) => r.boolean_says !== r.user_notified);
-  for (const row of disagreements.slice(0, 10)) {
-    console.log(
-      `  DIFF  ${row.company} — ${row.title}\n` +
-        `        boolean says ${row.boolean_says ? "notified" : "not notified"}, ` +
-        `the table says ${row.user_notified ? "notified" : "not notified"}`,
-    );
-  }
+  // The label spells the column apart from its table on purpose: the dotted form
+  // is exactly what tests/test_dashboard_notified.py bans across this directory,
+  // and a check script that trips the ban in its own success message would be a
+  // silly way to fail a suite.
   check(
-    disagreements.length === 0,
-    "every open job reads the same either way (symmetric difference is 0)",
-    `${disagreements.length} row(s) disagree`,
+    stillThere === 0,
+    "the jobs table has no `notified` column",
+    `information_schema still reports ${stillThere} — db/schema.sql has not been applied here`,
   );
 
-  // The whole table, not just the open rows the screens can show. A disagreement
-  // on a closed job is invisible on every screen and is still the same fault:
-  // the boolean and the per-user table remembering different histories.
-  const [wide] = await sql<{ boolean_but_no_row: number; row_but_no_boolean: number }[]>`
-    SELECT
-      (SELECT count(*) FROM jobs j
-        WHERE j.notified = TRUE
-          AND NOT EXISTS (SELECT 1 FROM user_job_notifications n
-                           WHERE n.user_id = ${userId} AND n.canonical_id = j.canonical_id)
-      )::int AS boolean_but_no_row,
-      (SELECT count(*) FROM jobs j
-        WHERE j.notified = FALSE
-          AND EXISTS (SELECT 1 FROM user_job_notifications n
-                       WHERE n.user_id = ${userId} AND n.canonical_id = j.canonical_id)
-      )::int AS row_but_no_boolean
-  `;
-  check(
-    wide.boolean_but_no_row === 0 && wide.row_but_no_boolean === 0,
-    "and across every stored job, open or closed, in both directions",
-    `notified with no row: ${wide.boolean_but_no_row}, row with no boolean: ${wide.row_but_no_boolean}`,
-  );
-
-  // The badge itself, from the shipped function, fed each reading in turn. This
-  // is the assertion that actually says "Home looks identical": not that the two
-  // columns agree, but that the thing rendered from them is the same word.
-  const migrationMatched = migrationRows.filter((row) => isMatch(row, prefs));
-  const before = { NEW: 0, NOTIFIED: 0 };
-  const after = { NEW: 0, NOTIFIED: 0 };
-  let badgeDiff = 0;
-  for (const row of migrationMatched) {
-    const was = homeBadge({ matches: true, user_notified: row.boolean_says })?.label;
-    const now = homeBadge({ matches: true, user_notified: row.user_notified })?.label;
-    if (was) before[was as "NEW" | "NOTIFIED"] += 1;
-    if (now) after[now as "NEW" | "NOTIFIED"] += 1;
-    if (was !== now) {
-      badgeDiff += 1;
-      if (badgeDiff <= 10) console.log(`  BADGE  ${row.company} — ${row.title}: ${was} -> ${now}`);
-    }
-  }
   console.log(
-    `  matches ${migrationMatched.length}  ·  from the boolean: ${before.NOTIFIED} NOTIFIED / ` +
-      `${before.NEW} NEW  ·  from the table: ${after.NOTIFIED} NOTIFIED / ${after.NEW} NEW`,
+    `  open jobs ${rows.length}  ·  a row in user_job_notifications for me ` +
+      `${rows.filter((r) => r.user_notified).length}  ·  matches ${matched.length}`,
   );
-  check(badgeDiff === 0, "every match on Home renders the same badge either way", `${badgeDiff} changed`);
+
+  // The badge, from the shipped function, over the rows Home actually shows. Not
+  // a comparison any more — there is nothing left to compare it against — but
+  // still the number a person recognises, and the one that would move first if
+  // the per-user predicate broke.
+  const badges = { NEW: 0, NOTIFIED: 0 };
+  for (const row of matched) {
+    const label = homeBadge({ matches: true, user_notified: row.user_notified })?.label;
+    if (label) badges[label as "NEW" | "NOTIFIED"] += 1;
+  }
+  console.log(`  Home renders: ${badges.NOTIFIED} NOTIFIED / ${badges.NEW} NEW`);
+  check(
+    badges.NOTIFIED + badges.NEW === matched.length,
+    "every match on Home gets exactly one of NEW or NOTIFIED",
+    `${matched.length} matches produced ${badges.NOTIFIED + badges.NEW} badges`,
+  );
 
   // -------------------------------------------------------------------------
   // §2  Per-user, in both directions, inside a transaction that always rolls back.
@@ -422,7 +364,7 @@ async function main() {
   console.log(
     failures
       ? `\nFAILED — ${failures} assertion(s) did not hold.`
-      : `\nOK — the badge is per-user, and it says exactly what it said before Phase 1f for me.`,
+      : `\nOK — the column is gone, the badge is per-user in both directions, and "for you" is mine.`,
   );
   if (failures) process.exitCode = 1;
 }

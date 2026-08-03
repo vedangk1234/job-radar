@@ -45,13 +45,7 @@ from pathlib import Path
 
 import pytest
 
-from db.notifications import (
-    backfill_from_notified,
-    count_jobs_flagged_notified,
-    count_notified_for_user,
-    count_uncovered,
-    record_notified,
-)
+from db.notifications import count_notified_for_user, record_notified
 from db.watchlist import track_companies
 from notify.digest import run_digest
 from notify.store import fetch_candidates, record_sent
@@ -102,12 +96,11 @@ class ExplodingSender:
 async def seed_history(conn, count: int, *, matching: bool = True) -> list[str]:
     """`count` open jobs stored by a silent seed. The shape the live table is in.
 
-    ~7,700 rows carrying the old boolean, almost all of them back catalogue
-    rather than anything that was ever emailed — and since Phase 1e that fact
-    lives in jobs.seeded, which is what the queue reads. Both flags are written
-    because crawler/store.mark_new writes both from one `seeding` argument, and a
-    helper that arranged half the state would be arranging something production
-    cannot produce.
+    ~7,700 rows in the live table are in exactly this state: stored by a
+    company's first-ever crawl and never emailed to anybody. Until Phase 1g this
+    helper set the old global boolean too, because crawler/store.mark_new wrote
+    both from one `seeding` argument; the boolean is gone and `seeded` is the
+    whole of what a silent seed means.
 
     `matching` controls whether they pass the filter, because only a matching job
     can reach a digest — a re-spam test seeded with jobs the filter drops would
@@ -117,7 +110,7 @@ async def seed_history(conn, count: int, *, matching: bool = True) -> list[str]:
     ids = []
     for n in range(count):
         cid = f"hist-{n}"
-        await conn.add_job(cid, title=title, notified=True, seeded=True)
+        await conn.add_job(cid, title=title, seeded=True)
         ids.append(cid)
     return ids
 
@@ -291,116 +284,27 @@ async def test_deleting_a_job_takes_every_users_notification_row(digest_conn):
 # --- the migration -------------------------------------------------------
 
 
-async def test_the_backfill_covers_exactly_the_notified_jobs(digest_conn):
-    """Membership, not arithmetic: the right jobs, and only those.
+async def test_history_recorded_against_me_makes_a_digest_send_zero(digest_conn):
+    """THE test. With my history recorded, my next digest emails NOTHING.
 
-    The unnotified job is the one that matters. A backfill that recorded every
-    job rather than every NOTIFIED job would silently withhold the queue — the
-    failure with no trace, and the opposite of the one everybody watches for.
-    """
-    await seed_history(digest_conn, 3)
-    await digest_conn.add_job("fresh", title="Backend Engineer", notified=False)
-
-    recorded = await backfill_from_notified(digest_conn, TEST_USER_ID)
-
-    assert sorted(recorded) == ["hist-0", "hist-1", "hist-2"]
-    assert await digest_conn.notification_pairs() == {
-        (TEST_USER_ID, "hist-0"),
-        (TEST_USER_ID, "hist-1"),
-        (TEST_USER_ID, "hist-2"),
-    }
-    assert await count_uncovered(digest_conn, TEST_USER_ID) == 0
-
-
-async def test_the_backfill_is_idempotent(digest_conn):
-    """Run it twice. The second run writes nothing and breaks nothing.
-
-    This is what makes a half-failed migration recoverable by re-running rather
-    than by reasoning about how far it got — which matters because the gate is
-    deliberately strict about mid-run arrivals and re-running is the remedy.
-    """
-    await seed_history(digest_conn, 3)
-
-    first = await backfill_from_notified(digest_conn, TEST_USER_ID)
-    before = await digest_conn.notification_pairs()
-    second = await backfill_from_notified(digest_conn, TEST_USER_ID)
-
-    assert len(first) == 3
-    assert second == [], "a second run must insert nothing at all"
-    assert await digest_conn.notification_pairs() == before
-    assert await count_notified_for_user(digest_conn, TEST_USER_ID) == 3
-
-
-async def test_the_gate_refuses_when_a_notified_job_is_uncovered(digest_conn):
-    """Delete one row and the gate must fail. Every uncovered job is a re-send.
-
-    The count equality alone would also catch this one — the point of asserting
-    both here is the NEXT test, where it would not.
-    """
-    await seed_history(digest_conn, 3)
-    await backfill_from_notified(digest_conn, TEST_USER_ID)
-
-    await digest_conn.execute(
-        "DELETE FROM user_job_notifications WHERE canonical_id = $1", "hist-1"
-    )
-
-    assert await count_uncovered(digest_conn, TEST_USER_ID) == 1
-    assert await count_notified_for_user(digest_conn, TEST_USER_ID) == 2
-    assert await count_jobs_flagged_notified(digest_conn) == 3
-
-
-async def test_the_gate_is_not_fooled_by_counts_that_happen_to_match(digest_conn):
-    """Why the gate is an anti-join and not just arithmetic.
-
-    Right count, wrong membership: one historical job is uncovered and one row
-    names a job that was never notified. `mine == flagged` passes — and the
-    uncovered job is still in the queue, waiting to be re-sent. This is the exact
-    shape of a migration that looks green and re-spams anyway.
-    """
-    await seed_history(digest_conn, 3)
-    await digest_conn.add_job("fresh", title="Backend Engineer", notified=False)
-
-    await digest_conn.notify_user(TEST_USER_ID, "hist-0")
-    await digest_conn.notify_user(TEST_USER_ID, "hist-2")
-    await digest_conn.notify_user(TEST_USER_ID, "fresh")
-
-    assert await count_notified_for_user(digest_conn, TEST_USER_ID) == 3
-    assert await count_jobs_flagged_notified(digest_conn) == 3
-    assert await count_uncovered(digest_conn, TEST_USER_ID) == 1, (
-        "the counts match and hist-1 is still uncovered — arithmetic alone "
-        "would have passed this migration"
-    )
-
-
-async def test_the_gate_ignores_rows_belonging_to_another_user(digest_conn):
-    """Scoped to one user, so a second account cannot make my migration look done."""
-    await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
-    await seed_history(digest_conn, 2)
-
-    await digest_conn.notify_user(OTHER_USER_ID, "hist-0")
-    await digest_conn.notify_user(OTHER_USER_ID, "hist-1")
-
-    assert await count_notified_for_user(digest_conn, TEST_USER_ID) == 0
-    assert await count_uncovered(digest_conn, TEST_USER_ID) == 2
-
-
-# --- the behaviour that is the whole point --------------------------------
-
-
-async def test_after_the_backfill_a_digest_sends_zero(digest_conn):
-    """THE test. With the backfill applied, my next digest emails NOTHING.
-
-    Twenty historical matches, all flagged notified = TRUE exactly as the live
-    table has them, all of them jobs the filter genuinely wants. Before 1d they
-    were suppressed by the boolean; after the backfill they are suppressed by a
-    row naming me. The sender raises if it is reached, so passing means no email
+    Twenty matches the filter genuinely wants, none of them back catalogue — so
+    `seeded` cannot be what holds them, and the ONLY thing keeping them out of
+    this digest is a row per (me, job). That is the whole of Phase 1d stated as
+    behaviour, and the sender raises if it is reached, so passing means no email
     was even attempted.
+
+    It was called test_after_the_backfill_a_digest_sends_zero until 1g, and it
+    arranged its history by running the 1d backfill over rows carrying the old
+    global boolean. The backfill has been deleted along with the column it read;
+    what it produced is arranged directly here instead. The property is unchanged
+    and is not about a migration — it is about what a queue does with a person's
+    history, forever.
 
     Failing this test in the real world costs one email containing every job I
     have ever been shown.
     """
-    await seed_history(digest_conn, 20)
-    await backfill_from_notified(digest_conn, TEST_USER_ID)
+    ids = await unseeded_history(digest_conn, 20)
+    await record_notified(digest_conn, TEST_USER_ID, ids)
 
     sender = ExplodingSender()
     run = await run_digest(digest_conn, user_id=TEST_USER_ID, sender=sender)
@@ -462,31 +366,17 @@ async def test_the_silent_seed_is_suppressed_by_the_seeded_flag(digest_conn):
         assert queued == [], "a silent seed is silent for every user, not just the first"
 
 
-async def test_the_seed_clause_is_what_holds_them_and_not_the_old_boolean(digest_conn):
-    """Which clause is doing the work — asked so 1g cannot answer it wrongly.
-
-    Same five back-catalogue rows, with the old global boolean cleared and only
-    jobs.seeded left standing. They stay out of the queue. This is 1g's dropping
-    of jobs.notified rehearsed in a test: if removing the column changed what a
-    digest contains, it would fail here rather than in an inbox.
-    """
-    await seed_history(digest_conn, 5)
-    await digest_conn.execute("UPDATE jobs SET notified = 0")
-
-    queued = [j["canonical_id"] for j in await fetch_candidates(digest_conn, TEST_USER_ID)]
-    assert queued == [], "seeded is the clause that suppresses; the boolean is vestigial"
-
-
 async def test_a_genuinely_new_job_still_reaches_the_queue(digest_conn):
-    """The other direction: 1d must not silence anything either.
+    """The other direction: suppression must not silence anything either.
 
-    A backfill that over-recorded would pass every gate above and quietly empty
-    the digest forever, which is the failure that leaves no trace. So: history
-    backfilled, one fresh job, and the fresh one still comes through.
+    Recording too much would pass every "nothing was re-sent" assertion in this
+    file and quietly empty the digest forever, which is the failure that leaves
+    no trace. So: five jobs recorded as my history, one fresh job that is not,
+    and the fresh one still comes through.
     """
-    await seed_history(digest_conn, 5)
-    await backfill_from_notified(digest_conn, TEST_USER_ID)
-    await digest_conn.add_job("brand-new", title="Backend Engineer", notified=False)
+    ids = await unseeded_history(digest_conn, 5)
+    await record_notified(digest_conn, TEST_USER_ID, ids)
+    await digest_conn.add_job("brand-new", title="Backend Engineer")
 
     queued = [j["canonical_id"] for j in await fetch_candidates(digest_conn, TEST_USER_ID)]
     assert queued == ["brand-new"]
@@ -682,7 +572,7 @@ async def test_a_silent_day_sends_nothing_and_writes_nothing(digest_conn):
     the workflow's preflight secret check exists to compensate for, and it has to
     survive the queue being rewritten.
     """
-    await digest_conn.add_job("nope", title="Senior Sales Director", notified=False)
+    await digest_conn.add_job("nope", title="Senior Sales Director")
 
     sender = ExplodingSender()
     run = await run_digest(digest_conn, user_id=TEST_USER_ID, sender=sender)

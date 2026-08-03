@@ -60,6 +60,11 @@ _SCHEMA = re.compile(r"\bpublic\.", re.IGNORECASE)
 # SQLite mirror of the jobs table in db/schema.sql. Same column names, same
 # constraints that matter (PK, NOT NULLs, defaults) — the types differ only in
 # ways SQLite does not enforce anyway.
+#
+# NO `notified` COLUMN, since Phase 1g dropped it from the real table. The mirror
+# has to track the live schema in both directions: a column here that production
+# does not have would let a test arrange a state the database cannot hold, and
+# pass while asserting something untrue of anything.
 JOBS_DDL = """
 CREATE TABLE jobs (
   canonical_id     TEXT PRIMARY KEY,
@@ -73,7 +78,6 @@ CREATE TABLE jobs (
   last_seen_at     TEXT NOT NULL,
   miss_count       INTEGER NOT NULL DEFAULT 0,
   status           TEXT NOT NULL DEFAULT 'open',
-  notified         INTEGER NOT NULL DEFAULT 0,
   seeded           INTEGER NOT NULL DEFAULT 0,
   min_experience    INTEGER,
   is_pm_role        INTEGER NOT NULL DEFAULT 0,
@@ -392,7 +396,6 @@ class FakeConn:
         city: str | None = None,
         url: str | None = None,
         status: str = "open",
-        notified: bool = False,
         seeded: bool = False,
         min_experience: int | None = None,
         is_pm_role: bool = False,
@@ -414,20 +417,24 @@ class FakeConn:
         reason: a crawled row can only ever start there, because the crawler has
         no statement that writes the column at all.
 
-        `seeded` and `notified` are separate parameters because since Phase 1e
-        they are separate facts. seeded=True is a row the silent seed stored —
-        back catalogue, excluded from every user's queue. notified=True alone is
-        now only the old global boolean, which nothing reads to decide anything;
-        a test that means "this was emailed to me" wants add_sent_job below.
+`seeded=True` is a row the silent seed stored — back catalogue, excluded
+        from every user's queue, and a fact about the CRAWL rather than about any
+        person. It is not "this was emailed": for that, and for every test that
+        means it, use add_sent_job below.
+
+        There was a `notified` parameter beside it until Phase 1g, when the
+        column it wrote went. The pair existed because one boolean had been
+        carrying both facts; keeping them as two parameters through 1e and 1f is
+        what made it obvious that only one of them was ever a crawl's business.
         """
         stamp = self.clock.tick()
         await self.execute(
             "INSERT INTO jobs (canonical_id, company_id, title, location, city, url, "
-            "first_seen_at, last_seen_at, status, notified, seeded, "
+            "first_seen_at, last_seen_at, status, seeded, "
             "min_experience, is_pm_role, desc_checked, desc_fetch_failed, desc_checked_at, "
             "applied, applied_at) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12, $13, $14, $15, "
-            "$16, $17)",
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12, $13, $14, "
+            "$15, $16)",
             canonical_id,
             company_id,
             title,
@@ -436,7 +443,6 @@ class FakeConn:
             url or f"https://example.test/jobs/{canonical_id}",
             stamp,
             status,
-            1 if notified else 0,
             1 if seeded else 0,
             min_experience,
             1 if is_pm_role else 0,

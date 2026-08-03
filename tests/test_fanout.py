@@ -171,13 +171,14 @@ async def test_a_seeded_back_catalogue_reaches_nobody(two_users):
 
     Both users watch this company and both filters want these jobs. Nothing is
     sent, because seeded rows are back catalogue for everybody — the property
-    that used to belong to the global boolean and now belongs to jobs.seeded.
+    that used to belong to the global boolean and, since 1e, belongs to
+    jobs.seeded alone.
     """
     await two_users.track_company(USER_B_ID, 1)
     await same_filter_as_a(two_users)
     for n in range(30):
         await two_users.add_job(f"seed-{n}", title="Backend Engineer",
-                                company_id=1, notified=True, seeded=True)
+                                company_id=1, seeded=True)
 
     sender = RecordingSender()
     fan_out = await run_fan_out(two_users, today=TODAY, sender=sender)

@@ -115,9 +115,10 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ;
 --
 -- READ BY THE QUEUE, in the place notified = FALSE used to sit. See
 -- notify/store.CANDIDATES_SQL: a seeded row is never emailed to anyone, ever,
--- which is precisely what "silent seed" has always meant. What that buys is that
--- 1g's drop of `notified` becomes a genuine no-op instead of a behaviour change
--- with an inbox-shaped failure mode.
+-- which is precisely what "silent seed" has always meant. What that bought is
+-- that 1g's drop of `notified` was a genuine no-op rather than a behaviour
+-- change with an inbox-shaped failure mode — the queue had already been reading
+-- this column for a phase by the time the old one went.
 --
 -- NOT NULL DEFAULT FALSE, so the ALTER backfills every existing row to "not
 -- seeded" — which is the SAFE direction and deliberately not the accurate one.
@@ -129,6 +130,59 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ;
 -- already covered for every user who tracks its company, so a mistake in the
 -- reconstruction cannot remove anything from anybody's digest.
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS seeded BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- jobs.notified — DROPPED HERE, PHASE 1g.
+--
+-- THE FIRST DROP COLUMN IN THIS FILE, AND IT FOLLOWS AN EXISTING SHAPE. The
+-- `DROP CONSTRAINT IF EXISTS preferences_id_check` near the bottom of the
+-- preferences block is the precedent: the CREATE TABLE above keeps the column in
+-- its list, describing the table as it was built, and the removal is stated once,
+-- here, where there is room to say why. A fresh database therefore creates the
+-- column and drops it a few statements later — which costs nothing, keeps this
+-- file re-runnable in one pass, and leaves the reason for the removal in exactly
+-- one place instead of split between an absence and a note.
+--
+-- IF EXISTS, so re-running this file after the drop is a no-op like every other
+-- statement here.
+--
+-- WHY THE COLUMN IS DEAD. It carried two different facts under one name:
+--
+--     "this row is back catalogue"   a property of the CRAWL. Now jobs.seeded,
+--                                    written by crawler/store.mark_new from the
+--                                    seeding flag, read by the digest queue.
+--     "somebody was emailed this"    a property of a PERSON. Now a row in
+--                                    user_job_notifications, one per (user, job).
+--
+-- Conflating them is why one person's digest silenced a job for everybody else:
+-- a boolean on a shared row cannot answer a question about an individual. 1d gave
+-- the person half an owner, 1e moved the crawl half into `seeded` and switched
+-- the queue onto both, 1f moved the dashboard's NEW/NOTIFIED badge onto the
+-- per-user table, and by then nothing read this column at all.
+--
+-- WHY IT SURVIVED THREE SUB-PHASES AFTER ITS LAST READER. It was the rollback
+-- net: record_sent kept writing it in the same transaction as the per-user row,
+-- so reverting 1d could not have re-sent anything that went out during the 1d
+-- window, and scripts/backfill_user_notifications.py had an accurate source to
+-- re-run against. That net is what made each step reversible one at a time.
+--
+-- WHY IT DID NOT SURVIVE 1g. A net for a rollback nobody can still perform is
+-- not a net. Once 1e was proven in production the earlier phases stopped being
+-- revertible in any case, and a column written by one statement and read by none
+-- is worse than absent: the next person to find it reasonably assumes something
+-- depends on it, and the first edit made on that assumption is a silent one.
+--
+-- WHAT HAD TO BE TRUE FIRST, and all three were, before this ran:
+--   * no page render, query or badge read it — tests/test_dashboard_notified.py
+--     asserts that textually over every file in dashboard/, with no exemptions;
+--   * the code that stops using it was DEPLOYED, not merely written. The cron and
+--     the dashboard share this database, so old code plus a dropped column is an
+--     outage, not a safe no-op. Expand, then contract;
+--   * every job the boolean called notified was already recorded per-user, and
+--     every silently-seeded row already carried jobs.seeded. The two backfills
+--     that established that read this column, so they ran before this line
+--     existed and were deleted alongside it — see the git history for 1d and 1e
+--     if a future migration ever needs to see how they were gated.
+ALTER TABLE jobs DROP COLUMN IF EXISTS notified;
 
 -- One-time re-open of the rows the OLD enrichment marked checked without ever
 -- reading anything. Before crawler/enrich.py existed, enrichment ran only in
@@ -471,7 +525,7 @@ CREATE INDEX IF NOT EXISTS user_companies_company_idx ON user_companies (company
 -- is the entire decision — this user has been told about this job. NO ROW means
 -- not yet. There is no state in between and no column to misread.
 --
--- WHY THE BOOLEAN COULD NOT SURVIVE MULTI-USER. jobs.notified says "somebody was
+-- WHY THE BOOLEAN COULD NOT SURVIVE MULTI-USER. jobs.notified said "somebody was
 -- emailed about this", which was an adequate paraphrase of "I was emailed about
 -- this" while the install had one user and nothing in the database naming them.
 -- The moment there are two, the first user's digest silences the job for the
@@ -539,22 +593,26 @@ CREATE TABLE IF NOT EXISTS user_job_notifications (
 CREATE INDEX IF NOT EXISTS user_job_notifications_job_idx
     ON user_job_notifications (canonical_id);
 
--- jobs.notified IS DELIBERATELY NOT DROPPED HERE. Phase 1d moves the READ
--- authority to this table; the boolean stays, and stays WRITTEN, for three
--- reasons — and dropping it is 1g's job, only once the 1e fan-out is proven in
--- production.
+-- HOW jobs.notified WAS RETIRED, over four sub-phases rather than one.
 --
---   1. It is the rollback net. notify/store.record_sent writes this table and
---      the boolean in ONE transaction, so reverting 1d cannot re-send anything
---      that went out during the 1d window. A rollback net nobody maintains is
---      not a net.
---   2. It is the backfill's only source of truth. scripts/backfill_user_
---      notifications.py reads WHERE notified = TRUE; a re-run after a rollback
---      needs it to still be accurate.
---   3. The dashboard still reads it — lib/badges.homeBadge derives NEW vs
---      NOTIFIED from it, and the dashboard is not user-scoped until a later
---      sub-phase. Dual-writing is what keeps those badges honest without
---      touching any TypeScript in 1d.
+-- Phase 1d moved the READ authority to this table and left the boolean in place,
+-- still WRITTEN, for three reasons. All three have since expired, which is what
+-- made the drop above safe:
+--
+--   1. It was the rollback net. notify/store.record_sent wrote this table and
+--      the boolean in ONE transaction, so reverting 1d could not re-send
+--      anything that went out during the 1d window. A rollback net nobody
+--      maintains is not a net — so it was maintained until it was removed.
+--   2. It was the backfill's only source of truth. The 1d backfill read
+--      WHERE notified = TRUE, and a re-run after a rollback needed it accurate.
+--   3. The dashboard still read it — lib/badges.homeBadge derived NEW vs
+--      NOTIFIED from it, and the dashboard was not user-scoped until 1f. Dual
+--      writing is what kept those badges honest without touching any TypeScript
+--      in 1d.
+--
+-- 1e replaced the seed meaning (below), 1f moved the badge onto this table, and
+-- 1g removed the write and then the column — in that order, each step leaving
+-- the one before it revertible until the next had been proven in production.
 --
 -- THE OBLIGATION 1d HANDED TO 1e, AND HOW 1e DISCHARGED IT.
 -- The 1d digest queue was a CONJUNCTION, not a straight swap:
@@ -592,11 +650,10 @@ CREATE INDEX IF NOT EXISTS user_job_notifications_job_idx
 -- will never be emailed about this job", which is what every row here has always
 -- meant; notified_at stays record-keeping and nothing branches on it.
 --
--- jobs.notified is now genuinely vestigial as a READ: nothing reads it to decide
--- anything except the dashboard's NEW/NOTIFIED badge (1f). It is still WRITTEN,
--- by record_sent and by mark_new, for the three reasons below, and 1g drops it —
--- a drop that is now a no-op rather than a behaviour change, which was the whole
--- point of doing 1e first.
+-- This table, jobs.seeded and the watch list are now the whole of the decision.
+-- jobs.notified is gone; see the block above the DROP in the jobs section for
+-- what it meant, why it outlived its last reader by three sub-phases, and what
+-- had to be true before it could go.
 --
 -- No seed row here, for the same reason public.users and user_companies have
 -- none: the only user is a real person resolved from MY_EMAIL at runtime and
