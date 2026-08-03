@@ -517,8 +517,9 @@ def select_matches(
 ) -> list[Mapping[str, Any]]:
     """The emailable subset, in the order given. Candidacy is the caller's problem.
 
-    notified=FALSE and status='open' are enforced by the SELECT in notify/store.py,
-    not here, because those are facts about the row's lifecycle rather than about
-    whether the job is interesting.
+    Candidacy — open, watched by this person, not back catalogue, not already
+    sent to them — is enforced by the SELECT in notify/store.py, not here,
+    because those are facts about the row's lifecycle and about who is asking,
+    rather than about whether the job is interesting.
     """
     return [job for job in jobs if is_match(job, prefs)]

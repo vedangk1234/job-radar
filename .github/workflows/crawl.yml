@@ -5,7 +5,7 @@ name: crawl
 # database — this workflow orchestrates them and adds nothing to them.
 #
 #   scripts/crawl.py        fetch every tracked board, diff, store, enrich
-#   scripts/send_digest.py  email whatever is notified=FALSE + open + matching
+#   scripts/send_digest.py  email each user their open, watched, unsent matches
 #
 # Nothing is emailed unless something matched: send_digest treats zero matches
 # as a success and returns before it builds a message. So a quiet hour is a
@@ -29,7 +29,7 @@ on:
 # cancel-in-progress is deliberately FALSE. Cancelling a running crawl would
 # kill it at an arbitrary statement, and the run that survives would be the
 # NEWER one, which is the wrong choice: the older run may already have jobs
-# queued at notified=FALSE with an email half-sent. Queuing instead means a
+# queued for a digest with an email half-sent. Queuing instead means a
 # slow run delays the next one by a few minutes and nothing is ever torn in
 # half. If the hour is missed entirely, the next cron picks the work up.
 concurrency:

@@ -21,6 +21,11 @@ The whole file runs the production path with one substitution — the function t
 talks to Resend — so what it proves about ordering and writes is true of the real
 thing. Two users, two filters, two watch lists, and a fake sender per user so
 "who got what" is answered by what was actually handed to the network.
+
+The rig itself — `two_users`, `RecordingSender`, `same_filter_as_a` and the
+second account's id — lives in tests/conftest.py, because tests/test_leakage.py
+asks a different set of questions of the same arrangement. Two definitions of
+"two users" is how one file's isolation holds while the other's leaks.
 """
 
 from __future__ import annotations
@@ -31,82 +36,27 @@ import pytest
 
 from db.notifications import count_notified_for_user
 from db.watchlist import track_companies
-from notify.digest import DigestError, run_digest, run_fan_out
+from notify.digest import run_digest, run_fan_out
 from notify.store import fetch_candidates
-from tests.conftest import TEST_EMAIL, TEST_USER_ID
+from tests.conftest import (
+    TEST_EMAIL,
+    TEST_USER_ID,
+    USER_B_EMAIL,
+    USER_B_ID,
+    RecordingSender,
+    same_filter_as_a,
+)
 
 TODAY = date(2026, 8, 3)
 
-USER_B_ID = "00000000-0000-4000-8000-00000000000b"
-USER_B_EMAIL = "second@example.test"
-
-
-class RecordingSender:
-    """Every send that was attempted, in order, with its recipient and body."""
-
-    def __init__(self, fail_for: str | None = None) -> None:
-        self.fail_for = fail_for
-        self.calls: list[dict] = []
-
-    async def __call__(self, subject, html_body, text_body, *, api_key, from_email, to_email):
-        self.calls.append({"subject": subject, "to": to_email, "text": text_body})
-        if self.fail_for and to_email == self.fail_for:
-            raise DigestError(f"pretend Resend refused {to_email}")
-        return f"msg_{len(self.calls)}"
-
-    def to(self, email: str) -> list[dict]:
-        return [call for call in self.calls if call["to"] == email]
-
 
 @pytest.fixture(autouse=True)
-def email_env(monkeypatch):
-    """A complete, obviously-fake .env so email_config() never reads the real one.
+def email_env(verified_sender_env):
+    """Every test in this module gets the fan-out's fake, verified-domain .env.
 
-    FROM_EMAIL is a VERIFIED-looking domain here rather than Resend's sandbox
-    sender, and that is the difference between testing a fan-out and testing one
-    account. With the sandbox sender, Resend delivers only to the address owning
-    the API key, so every user but MY_EMAIL is refused before the network call —
-    which is the live install's actual state and is asserted directly in
-    test_the_sandbox_sender_still_refuses_everyone_but_my_email, with the sandbox
-    FROM put back for that one test.
+    A one-line wrapper so the shared fixture can stay opt-in — see
+    conftest.verified_sender_env for why it is not simply autouse there.
     """
-    monkeypatch.setenv("RESEND_API_KEY", "re_test_key")
-    monkeypatch.setenv("FROM_EMAIL", "digest@job-radar.test")
-    monkeypatch.setenv("MY_EMAIL", TEST_EMAIL)
-
-
-async def same_filter_as_a(conn) -> None:
-    """Give B the filter A has, replacing the disjoint one the fixture set.
-
-    For the tests where the two users must differ in exactly ONE way — the watch
-    list, or nothing at all. Leaving them with different filters there would let
-    a leak hide behind "well, B's filter did not want it anyway".
-    """
-    await conn.execute("DELETE FROM preferences WHERE user_id = $1", USER_B_ID)
-    await conn.add_preferences_for(USER_B_ID, cities=["blr"], keywords=["backend"])
-
-
-@pytest.fixture
-async def two_users(digest_conn):
-    """Two people, two companies, two filters, two disjoint watch lists.
-
-    A watches Testco (id 1) for backend roles in Bengaluru; B watches Otherco
-    (id 2) for machine-learning roles in Pune. Nothing about the two overlaps, so
-    any leak between them is unambiguous rather than a matter of interpretation.
-
-    The tracking rows go in directly rather than through track_companies, because
-    that function suppresses the company's stored history — correct in production
-    and fatal to a fixture, which adds its jobs afterwards.
-    """
-    await digest_conn.add_company(2, "Otherco")
-    await digest_conn.add_user(USER_B_ID, USER_B_EMAIL)
-    await digest_conn.track_company(USER_B_ID, 2)
-
-    await digest_conn.set_preferences(cities=["blr"], keywords=["backend"])
-    await digest_conn.add_preferences_for(
-        USER_B_ID, cities=["pune"], keywords=["machine learning"]
-    )
-    return digest_conn
 
 
 # --- isolation ------------------------------------------------------------

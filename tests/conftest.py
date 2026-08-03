@@ -31,6 +31,7 @@ from typing import Any, Iterable, Sequence
 import pytest
 
 from fetchers.normalize import city_label, make_job
+from notify.digest import DigestError
 from notify.match import (
     DEFAULT_CITIES,
     DEFAULT_EXCLUSIONS,
@@ -234,6 +235,14 @@ CREATE TABLE user_job_notifications (
 # scripts/githooks/pre-commit allows (RFC 2606/6761) — see test-guard.sh.
 TEST_EMAIL = "me@example.test"
 TEST_USER_ID = "00000000-0000-4000-8000-000000000001"
+
+# THE SECOND ACCOUNT. Two files need it now — tests/test_fanout.py, which proves
+# the fan-out sends each person their own digest, and tests/test_leakage.py,
+# which proves nothing crosses between them — so the rig lives here rather than
+# in whichever of them happened to be written first. A second user defined twice
+# with two ids would let one file's "isolation" hold while the other's leaked.
+USER_B_ID = "00000000-0000-4000-8000-00000000000b"
+USER_B_EMAIL = "second@example.test"
 
 
 class FakeClock:
@@ -446,14 +455,16 @@ class FakeConn:
         Before Phase 1e a test spelled that `add_job(..., notified=True)`, and
         while there was one user and one global boolean it was true enough. It is
         not any more: "emailed" is a row in user_job_notifications naming a
-        person, and the boolean is a dual-written rollback net that no query
-        reads to decide anything. A test still setting only the flag would be
-        arranging a state production cannot produce — and would pass or fail for
-        reasons unrelated to what it meant to check.
+        person, and nothing else. Through 1e and 1f this helper wrote the boolean
+        too, because notify/store.record_sent did; 1g removed that write from
+        record_sent, so writing it here would be arranging a state production can
+        no longer produce.
 
-        So this writes both, exactly as notify/store.record_sent does.
+        The job row itself is therefore ordinary — not seeded, nothing special
+        about it — and the notification row is the entire difference between a job
+        this user has been told about and one they have not.
         """
-        await self.add_job(canonical_id, notified=True, **kwargs)
+        await self.add_job(canonical_id, **kwargs)
         await self.notify_user(user_id, canonical_id)
 
     async def add_user(
@@ -662,6 +673,97 @@ async def digest_conn() -> FakeConn:
     await conn.track_company(TEST_USER_ID, 1)
     await conn.set_preferences()
     return conn
+
+
+# --- the two-user rig -----------------------------------------------------
+#
+# Shared by tests/test_fanout.py and tests/test_leakage.py. The two files ask
+# different questions of the same arrangement: the fan-out file asks whether each
+# person's digest is computed and sent correctly, the leakage file asks whether
+# anything of A's ever appears in B's answer. Neither is the other, and they must
+# not be allowed to disagree about what "two users" means.
+
+
+class RecordingSender:
+    """Every send that was attempted, in order, with its recipient and body.
+
+    The injection point run_digest and run_fan_out take in place of
+    notify.digest.send_via_resend, so "who got what" is answered by what was
+    actually handed to the network rather than by a count kept alongside it.
+
+    `fail_for` makes exactly one recipient's send raise, which is how the
+    containment tests arrange one broken account among working ones.
+    """
+
+    def __init__(self, fail_for: str | None = None) -> None:
+        self.fail_for = fail_for
+        self.calls: list[dict] = []
+
+    async def __call__(self, subject, html_body, text_body, *, api_key, from_email, to_email):
+        self.calls.append({"subject": subject, "to": to_email, "text": text_body})
+        if self.fail_for and to_email == self.fail_for:
+            raise DigestError(f"pretend Resend refused {to_email}")
+        return f"msg_{len(self.calls)}"
+
+    def to(self, email: str) -> list[dict]:
+        return [call for call in self.calls if call["to"] == email]
+
+
+@pytest.fixture
+def verified_sender_env(monkeypatch) -> None:
+    """A complete, obviously-fake .env so email_config() never reads the real one.
+
+    NOT autouse, deliberately. The modules that want it declare a one-line autouse
+    fixture taking this one, because tests/test_digest.py sets a DIFFERENT
+    FROM_EMAIL on purpose and a conftest-wide autouse would be a second value for
+    the same variable arriving from two directions.
+
+    FROM_EMAIL is a VERIFIED-looking domain here rather than Resend's sandbox
+    sender, and that is the difference between testing a fan-out and testing one
+    account. With the sandbox sender, Resend delivers only to the address owning
+    the API key, so every user but MY_EMAIL is refused before the network call —
+    which is the live install's actual state and is asserted directly in
+    tests/test_fanout.test_the_sandbox_sender_still_refuses_everyone_but_my_email,
+    with the sandbox FROM put back for that one test.
+    """
+    monkeypatch.setenv("RESEND_API_KEY", "re_test_key")
+    monkeypatch.setenv("FROM_EMAIL", "digest@job-radar.test")
+    monkeypatch.setenv("MY_EMAIL", TEST_EMAIL)
+
+
+@pytest.fixture
+async def two_users(digest_conn) -> FakeConn:
+    """Two people, two companies, two filters, two disjoint watch lists.
+
+    A watches Testco (id 1) for backend roles in Bengaluru; B watches Otherco
+    (id 2) for machine-learning roles in Pune. Nothing about the two overlaps, so
+    any leak between them is unambiguous rather than a matter of interpretation.
+
+    The tracking rows go in directly rather than through track_companies, because
+    that function suppresses the company's stored history — correct in production
+    and fatal to a fixture, which adds its jobs afterwards. The one test that is
+    ABOUT that suppression calls the real function on top of this.
+    """
+    await digest_conn.add_company(2, "Otherco")
+    await digest_conn.add_user(USER_B_ID, USER_B_EMAIL)
+    await digest_conn.track_company(USER_B_ID, 2)
+
+    await digest_conn.set_preferences(cities=["blr"], keywords=["backend"])
+    await digest_conn.add_preferences_for(
+        USER_B_ID, cities=["pune"], keywords=["machine learning"]
+    )
+    return digest_conn
+
+
+async def same_filter_as_a(conn) -> None:
+    """Give B the filter A has, replacing the disjoint one the fixture set.
+
+    For the tests where the two users must differ in exactly ONE way — the watch
+    list, or nothing at all. Leaving them with different filters there would let
+    a leak hide behind "well, B's filter did not want it anyway".
+    """
+    await conn.execute("DELETE FROM preferences WHERE user_id = $1", USER_B_ID)
+    await conn.add_preferences_for(USER_B_ID, cities=["blr"], keywords=["backend"])
 
 
 # --- job builders ---------------------------------------------------------

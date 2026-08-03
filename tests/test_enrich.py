@@ -1,7 +1,7 @@
 """The crawl's enrichment pass: the hole it closes, and the ones it must not open.
 
 The hole, stated once: a job that has never been emailed was never enriched,
-because enrichment ran over the digest's notified=FALSE queue. The dashboard
+because enrichment ran over the digest's own send queue. The dashboard
 does not read that queue — it shows everything open that fits — so a freshly
 crawled job appeared there with nothing known about its experience requirement,
 and "nothing known" means KEEP everywhere in this project. A real Adobe posting
@@ -12,7 +12,7 @@ Every test below is about one of three things:
     it reads the descriptions of the jobs that would be SHOWN, not the ones
         that would be SENT                                    (the fix)
     it reads only the jobs worth a request                    (the cost)
-    it cannot disturb applied/notified/closed state           (the risk)
+    it cannot disturb applied/seeded/closed state             (the risk)
 
 No network anywhere: the fetcher is injected, exactly as in test_description.py.
 """
@@ -55,16 +55,16 @@ def fetcher_for(texts: dict[str, str | None]):
 async def test_a_matching_job_nobody_has_emailed_still_gets_its_description_read(digest_conn):
     """THE BUG, as a test.
 
-    `notified` is TRUE here, which is what a silently-seeded job looks like and
-    what every row on this table was. The old enrichment ran over the
-    notified=FALSE queue and would have skipped it entirely; Home would still
-    have shown it, because Home is not the outbox.
+    `seeded` is TRUE here, which is what a silently-seeded job looks like and
+    what every row on this table was. The old enrichment ran over the digest's
+    own queue and would have skipped it entirely; Home would still have shown it,
+    because Home is not the outbox.
     """
     await digest_conn.add_job(
         "adobe-fullstack",
         title="Computer Scientist - Fullstack",
         location="Bangalore, India",
-        notified=True,
+        seeded=True,
     )
 
     fetch, asked = fetcher_for({"adobe-fullstack": ADOBE})
@@ -229,22 +229,22 @@ async def lifecycle(conn) -> dict[str, tuple]:
     """The columns a crawl owns. Enrichment may not move any of them."""
     rows = await conn.snapshot()
     return {
-        cid: (row["notified"], row["status"], row["miss_count"], row["first_seen_at"])
+        cid: (row["seeded"], row["status"], row["miss_count"], row["first_seen_at"])
         for cid, row in rows.items()
     }
 
 
 async def test_enrichment_disturbs_no_lifecycle_column(digest_conn):
-    """applied/notified/closed state, before and after, column by column.
+    """applied/seeded/closed state, before and after, column by column.
 
     This runs in the middle of a crawl now, which is the one place a stray
-    UPDATE would be most expensive: re-opening a closed job or clearing a
-    notified flag would re-alert a board, and re-alerting a board is the failure
-    the whole diffing engine exists to prevent.
+    UPDATE would be most expensive: re-opening a closed job or clearing the
+    `seeded` marker would re-alert a board, and re-alerting a board is the
+    failure the whole diffing engine exists to prevent.
     """
     await digest_conn.add_job("fresh", title="Backend Engineer", location="Bengaluru, India")
     await digest_conn.add_job(
-        "sent", title="Platform Engineer", location="Bengaluru, India", notified=True
+        "sent", title="Platform Engineer", location="Bengaluru, India", seeded=True
     )
     await digest_conn.add_job(
         "shut", title="Frontend Engineer", location="Bengaluru, India", status="closed"

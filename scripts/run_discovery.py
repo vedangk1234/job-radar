@@ -13,7 +13,7 @@ happens before tracking rather than after.
 
 The jobs table is not touched, here or anywhere downstream of here. A company
 this script tracks has zero stored rows, so the next scripts/crawl.py detects a
-first-ever crawl and seeds its whole back catalogue with notified = TRUE. That
+first-ever crawl and seeds its whole back catalogue with seeded = TRUE. That
 is the same silent seed every other company got, and it is the reason a sweep
 that tracks forty new boards does not produce forty boards' worth of email.
 

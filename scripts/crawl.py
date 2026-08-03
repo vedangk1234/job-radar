@@ -3,9 +3,9 @@
     python scripts/crawl.py
 
 Stores and diffs, then enriches. Sends nothing. Brand-new jobs are left with
-notified=FALSE, which is the queue Step 4 will read; on a company's first-ever
-crawl they are stored notified=TRUE instead, so a hundred-job back catalogue is
-recorded silently rather than emailed.
+seeded=FALSE, which is what makes them eligible for a digest queue; on a
+company's first-ever crawl they are stored seeded=TRUE instead, so a hundred-job
+back catalogue is recorded silently rather than emailed — to anybody.
 
 The enrichment pass runs once, AFTER every company has been reconciled, rather
 than once per company. Two reasons, and both are about being polite: a job that
@@ -97,9 +97,8 @@ def print_enrichment(pass_: EnrichmentPass) -> None:
 async def print_totals(conn) -> None:
     """Whole-table state after the run: size, queue depth, city spread."""
     total = await conn.fetchval("SELECT count(*) FROM jobs")
-    notified = await conn.fetchval("SELECT count(*) FROM jobs WHERE notified")
-    unnotified = await conn.fetchval("SELECT count(*) FROM jobs WHERE NOT notified")
     seeded = await conn.fetchval("SELECT count(*) FROM jobs WHERE seeded")
+    unseeded = await conn.fetchval("SELECT count(*) FROM jobs WHERE NOT seeded")
     open_rows = await conn.fetchval("SELECT count(*) FROM jobs WHERE status = 'open'")
     closed_rows = await conn.fetchval("SELECT count(*) FROM jobs WHERE status = 'closed'")
     cities = await conn.fetch(
@@ -117,17 +116,19 @@ async def print_totals(conn) -> None:
     )
 
     print(f"\njobs table: {total} row(s)  ({open_rows} open, {closed_rows} closed)")
-    # Both flags, and neither is a per-user number — deliberately. Since Phase 1d
-    # the digest decides from per-user state, but this is the CRAWL's report and
-    # the crawl path is user-blind by design; a per-user count here would be this
-    # script learning who the users are, which is the one thing it must never do.
+    # NOT a per-user number, deliberately. Since Phase 1d the digest decides from
+    # per-user state, but this is the CRAWL's report and the crawl path is
+    # user-blind by design; a per-user count here would be this script learning
+    # who the users are, which is the one thing it must never do.
     #
-    # `seeded` is what this run itself wrote and what the 1e queue reads: back
-    # catalogue, excluded from every user's digest. `notified` is the old global
-    # boolean, still dual-written and dropped in 1g. They differ by the jobs that
-    # were genuinely emailed to somebody.
+    # `seeded` is what this run itself wrote and what the queue reads: back
+    # catalogue, excluded from every user's digest. There was a second line here
+    # until Phase 1g, counting the old global jobs.notified — which was never a
+    # per-user number either, and by 1e was not a crawl fact at all. The column is
+    # gone, and the half of its meaning that was about a PERSON now lives in the
+    # notify path, where this script cannot see it and must not.
     print(f"seeded  : {seeded}   <- back catalogue; never enters anyone's digest")
-    print(f"notified: TRUE={notified}  FALSE={unnotified}   <- the old global flag (1g drops it)")
+    print(f"eligible: {unseeded}   <- may enter a queue, subject to who watches and who knows")
     print("city labels: " + ", ".join(f"{r['city']}={r['n']}" for r in cities))
     print(
         f"description facts: {hidden_years} open row(s) demand 3+ years, "
@@ -157,7 +158,7 @@ async def main() -> int:
         would_alert = sum(r.truly_new for r in results if not r.seeding and not r.guard_tripped)
         tripped = [r for r in results if r.guard_tripped]
 
-        print(f"\nseeded this run: {len(seeded)} company/ies (their jobs stored notified=TRUE)")
+        print(f"\nseeded this run: {len(seeded)} company/ies (their jobs stored seeded=TRUE)")
         print(f"would-be alerts queued this run: {would_alert} job(s)")
         if tripped:
             print("guards tripped (no writes for these): " + ", ".join(f"{r.company} [{r.guard}]" for r in tripped))

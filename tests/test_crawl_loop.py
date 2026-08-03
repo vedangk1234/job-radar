@@ -6,7 +6,7 @@ diff_snapshots, upsert_seen, mark_new, bump_missing, close_stale, and all three
 guards — is the production code path.
 
 The recurring assertion is not "the right rows exist" but "no row acquired
-notified=FALSE that should not have". That flag is the queue Step 4 reads, so a
+seeded=FALSE that should not have". That flag is what the digest queue reads, so a
 row that lands there wrongly is a false alert, which is the failure mode this
 whole step exists to prevent.
 """
@@ -28,8 +28,14 @@ async def run(conn, boards, seeding=False, ats="greenhouse"):
 
 
 async def queued(conn) -> set[str]:
-    """Ids sitting in Step 4's queue: brand-new and not yet notified."""
-    rows = await conn.fetch("SELECT canonical_id FROM jobs WHERE notified = 0")
+    """Ids a digest could reach: stored by an ordinary crawl, not back catalogue.
+
+    `seeded = 0` is the crawl-path half of the queue and the only half this file
+    can ask about — whether a given PERSON gets one of these depends on their
+    watch list and on what they have already been told, and the crawl knows
+    neither. Until Phase 1g this read `notified = 0`, which conflated the two.
+    """
+    rows = await conn.fetch("SELECT canonical_id FROM jobs WHERE seeded = 0")
     return {r["canonical_id"] for r in rows}
 
 
@@ -43,12 +49,10 @@ async def test_seed_run_stores_every_job_as_back_catalogue(conn):
     board looks new because we have never seen the board — so the seed run marks
     them and the queue comes out empty.
 
-    BOTH FLAGS, since Phase 1e. `seeded` is the one that means what this test is
-    about — "this row is back catalogue", a fact about this crawl, user-blind and
-    permanent, and since 1e the clause the digest queue actually reads.
-    `notified` is the old global boolean, still dual-written until 1g drops it.
-    Asserting both is what makes 1g's drop provably a no-op rather than an
-    argument.
+    `seeded` is what says so: "this row is back catalogue", a fact about this
+    crawl — user-blind, permanent, and the clause the digest queue reads. It was
+    written alongside the old global `notified` boolean from 1e until 1g, which
+    is what let 1g drop that column without changing what any digest contains.
     """
     board = load_board()
     result = await run(conn, [board], seeding=True)
@@ -58,7 +62,6 @@ async def test_seed_run_stores_every_job_as_back_catalogue(conn):
     assert result.truly_new == 11
     assert len(rows) == 11
     assert all(r["seeded"] == 1 for r in rows.values())
-    assert all(r["notified"] == 1 for r in rows.values())
     assert all(r["status"] == "open" and r["miss_count"] == 0 for r in rows.values())
     assert await queued(conn) == set()  # zero would-be notifications
 
@@ -94,7 +97,7 @@ async def test_identical_second_snapshot_changes_nothing(conn):
     assert result.reappeared == 11
     assert result.missing == 0
     assert result.closed == 0
-    assert await queued(conn) == set()  # no notified=FALSE row was created
+    assert await queued(conn) == set()  # no queue-eligible row was created
     assert set(after) == set(before)
     # last_seen_at moved; first_seen_at did not.
     assert all(after[k]["first_seen_at"] == before[k]["first_seen_at"] for k in before)
@@ -117,7 +120,7 @@ async def test_one_added_job_is_the_only_thing_queued(conn):
     assert result.truly_new == 1
     assert result.reappeared == 11
     assert await queued(conn) == {new_id}
-    assert rows[new_id]["notified"] == 0
+    assert rows[new_id]["seeded"] == 0
     # Not back catalogue: this is the one row a digest is allowed to reach. A
     # non-seeding crawl writing seeded=TRUE would hide every genuinely new job
     # from every user, permanently and silently — the exact inverse of the flood
@@ -304,7 +307,7 @@ async def test_unknown_ats_is_a_fetch_error_not_a_crash(conn):
 
 
 async def test_closed_job_that_comes_back_is_reopened_not_re_notified(conn):
-    """Reopen: status back to open, miss_count zeroed, notified left alone.
+    """Reopen: status back to open, miss_count zeroed, `seeded` left alone.
 
     This is the payoff of keeping closed rows around. The id is in
     known_closed, so diff_snapshots calls it `reappeared`, and reappeared never
@@ -327,11 +330,9 @@ async def test_closed_job_that_comes_back_is_reopened_not_re_notified(conn):
     assert result.reappeared == 11
     assert reopened["status"] == "open"
     assert reopened["miss_count"] == 0
-    assert reopened["notified"] == 1  # still counts as already told
-    # And still back catalogue. An upsert clearing `seeded` would hand a whole
-    # seeded board to every user the first time it flapped — the same failure the
-    # `notified` assertion above has always guarded, now on the column that
-    # actually decides.
+    # Still back catalogue. An upsert clearing `seeded` would hand a whole seeded
+    # board to every user the first time one of its jobs flapped, which is the
+    # failure this assertion has guarded in one column or another since Step 3.
     assert reopened["seeded"] == 1
     assert reopened["first_seen_at"] == closed_row["first_seen_at"]  # not restamped
     assert await queued(conn) == set()
@@ -340,7 +341,7 @@ async def test_closed_job_that_comes_back_is_reopened_not_re_notified(conn):
 async def test_job_reopens_without_losing_its_queue_position(conn):
     """A job that was new-but-unsent, then flapped, is still queued exactly once.
 
-    notified=FALSE must survive an upsert, or Step 4 would lose the job.
+    seeded=FALSE must survive an upsert, or the job leaves every queue silently.
     """
     board = load_board()
     added = job("NEW-1")

@@ -8,7 +8,8 @@ ordering and writes is true of the real thing.
 
 Two properties matter more than the rest:
 
-  * a job is emailed exactly once, ever. Already-notified rows never re-enter
+  * a job is emailed exactly once per person, ever. Rows already recorded
+    against that person never re-enter
     the queue, and a successful send flips precisely the jobs it included.
   * a failed send writes nothing. Not a flag, not a receipt. The queue is
     identical afterwards, so the next run retries the same set — the same
@@ -30,6 +31,7 @@ from notify.digest import (
     run_digest,
     subject_line,
 )
+from db.notifications import record_notified
 from db.users import resolve_current_user_id
 from notify.match import Preferences
 from notify.store import fetch_candidates, load_preferences, record_sent
@@ -70,14 +72,21 @@ def email_env(monkeypatch):
 
 
 async def queue_ids(conn) -> set[str]:
-    rows = await conn.fetch("SELECT canonical_id FROM jobs WHERE notified = 0")
-    return {r["canonical_id"] for r in rows}
+    """What this user's next digest would consider — the real queue.
+
+    Until Phase 1g this was `SELECT ... WHERE notified = 0`, which was the queue
+    while the queue was one global boolean. It is now three clauses across three
+    tables, so asking the production query is the only way to ask the real
+    question; a restatement here would be a second definition of the queue that
+    could agree with the first for a while.
+    """
+    return {job["canonical_id"] for job in await fetch_candidates(conn, TEST_USER_ID)}
 
 
 # The columns that describe where a job is in its LIFECYCLE, as opposed to what
 # the job is. These are the ones a failed send must leave exactly as it found
 # them; see test_a_failed_send_changes_absolutely_nothing.
-LIFECYCLE_COLUMNS = ("notified", "status", "first_seen_at", "last_seen_at", "miss_count")
+LIFECYCLE_COLUMNS = ("seeded", "status", "first_seen_at", "last_seen_at", "miss_count")
 
 
 async def lifecycle(conn) -> dict[str, dict]:
@@ -269,12 +278,15 @@ async def test_successful_send_flips_exactly_the_emailed_jobs(digest_conn):
 
     run = await run_digest(digest_conn, today=TODAY, tag_suffix="manual", sender=FakeResend())
 
-    rows = await digest_conn.snapshot()
     assert run.emailed == 2
-    assert rows["a"]["notified"] == 1
-    assert rows["b"]["notified"] == 1
-    assert rows["skipped"]["notified"] == 0        # not sent, so still queued
-    assert await queue_ids(digest_conn) == {"skipped"}
+    # The per-user table is what records a send, so it is what gets asserted.
+    # Before Phase 1g this read the jobs.notified boolean, which said only that
+    # SOMEBODY had been told.
+    assert await digest_conn.notification_pairs() == {
+        (TEST_USER_ID, "a"),
+        (TEST_USER_ID, "b"),
+    }
+    assert await queue_ids(digest_conn) == {"skipped"}   # not sent, so still queued
 
 
 async def test_successful_send_writes_one_notifications_row_per_job(digest_conn):
@@ -325,8 +337,8 @@ async def test_a_failed_send_changes_absolutely_nothing(digest_conn, failure):
     "Nothing" is the lifecycle, not literally every column. The run does mark
     desc_checked on the way past, because reading a description happens before
     the send and what it learned is true whether or not an email went out. That
-    write cannot make a job look delivered: no notified flag, no notifications
-    row, nothing that would stop the next run retrying this exact set.
+    write cannot make a job look delivered: no notification row, no receipt,
+    nothing that would stop the next run retrying this exact set.
     """
     await digest_conn.add_job("a", title="Backend Engineer")
     await digest_conn.add_job("b", title="Platform Engineer")
@@ -357,13 +369,10 @@ async def test_record_sent_is_all_or_nothing(digest_conn):
 
     with pytest.raises(Exception):
         async with digest_conn.transaction():
-            await digest_conn.fetch(
-                "UPDATE jobs SET notified = TRUE WHERE canonical_id = $1 RETURNING canonical_id",
-                "a",
-            )
+            await record_notified(digest_conn, TEST_USER_ID, ["a"])
             raise RuntimeError("insert blew up")
 
-    assert (await digest_conn.snapshot())["a"]["notified"] == 0
+    assert await digest_conn.notification_pairs() == set()
     assert await digest_conn.sent_log() == []
 
 

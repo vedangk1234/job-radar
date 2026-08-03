@@ -6,7 +6,7 @@
 Why this is part of a crawl at all
 ----------------------------------
 It was not, and that was the bug. Enrichment used to live only in the digest
-path, which reads the notified=FALSE queue — so a description was read the first
+path, which reads one person's send queue — so a description was read the first
 time a job was considered for an EMAIL. The dashboard's Home screen is a
 different question: it shows everything currently open that fits, already
 emailed or not. A job the crawler discovered an hour ago was therefore on Home

@@ -1,4 +1,4 @@
-"""Step 4: turn the jobs table's notified=FALSE queue into one email.
+"""Step 4: turn one person's queue of unsent open matches into one email.
 
 Reads. Sends. Records what it sent. Never crawls, never diffs, never writes a
 job row except to stamp it as told.

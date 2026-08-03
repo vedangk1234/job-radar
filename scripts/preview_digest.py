@@ -1,4 +1,4 @@
-"""See the digest without sending it. Never sends, never marks anything notified.
+"""See the digest without sending it. Never sends, never records anything as sent.
 
     python scripts/preview_digest.py --dry-run
     python scripts/preview_digest.py --dry-run --ignore-notified
@@ -9,9 +9,9 @@ Prints the matched jobs grouped by company and writes the rendered email to
 digest_preview.html so it can be opened in a browser.
 
 This script cannot send and cannot mark a job as sent. It does not import
-record_sent, it never calls run_digest, and it holds no code that could set
-notified=TRUE — the safety is structural rather than a flag that could be left
-off by accident. --dry-run is accepted (and is the only mode) so that the
+record_sent, it never calls run_digest, and it holds no statement that could
+write a notification row or a receipt — the safety is structural rather than a
+flag that could be left off by accident. --dry-run is accepted (and is the only mode) so that the
 documented command reads honestly.
 
 It is NOT, however, read-only any more, and pretending otherwise would be the
@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ignore-notified",
         action="store_true",
-        help="consider every open job, not just the notified=FALSE queue (preview only)",
+        help="consider every open job, not just my own queue (preview only)",
     )
     parser.add_argument(
         "--explain",
@@ -212,7 +212,7 @@ async def main() -> int:
 
 def print_footer(descriptions_read: int) -> None:
     """State exactly what this run did and did not write. No rounding up."""
-    print("\nDRY RUN — nothing sent, no notifications row, notified flags untouched.")
+    print("\nDRY RUN — nothing sent, no receipt written, no notification recorded.")
     if descriptions_read:
         print(
             f"          {descriptions_read} row(s) had min_experience, is_pm_role and "

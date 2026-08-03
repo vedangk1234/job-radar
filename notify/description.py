@@ -31,7 +31,7 @@ It runs in the CRAWL now (crawler/enrich.py), and it used to run only in the
 digest path. The move closes a real hole rather than tidying anything.
 
 The old arrangement enriched a job the first time a DIGEST considered it, which
-meant the first time it was in the notified=FALSE queue. The dashboard's Home
+meant the first time it reached somebody's send queue. The dashboard's Home
 screen is not that queue — it shows everything open that fits, emailed or not —
 so a job the crawler had just discovered appeared on Home with desc_checked =
 FALSE, no experience known, and therefore kept. A real Adobe posting
@@ -812,7 +812,7 @@ async def enrich_candidates(
     marked desc_fetch_failed too, so `retry_before` can bring it back tomorrow.
 
     What this writes is deliberately five columns and no more: it must not be
-    able to disturb `notified`, `status`, `miss_count` or `first_seen_at`. See
+    able to disturb `seeded`, `status`, `miss_count` or `first_seen_at`. See
     SAVE_DESCRIPTION_FACTS_SQL, which has no clause that could.
 
     Sequential rather than gathered, on purpose. The set is a handful by the

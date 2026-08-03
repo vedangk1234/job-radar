@@ -37,6 +37,15 @@
  * tests/test_dashboard_notified.py asserts that textually and names this file as
  * the single enumerated exemption.
  *
+ * §1 IS ALSO SELF-CONTAINED, WHICH IT DID NOT USED TO BE. It runs its own query
+ * and derives its own match set, so §2 and §3 borrow nothing from it. That is
+ * deliberate preparation rather than tidiness: §1 is a block 1g deletes whole, and
+ * a section that fed the two sections below it could not be deleted without
+ * silently taking their inputs with it — the two per-user proofs would vanish in
+ * the same diff that removes the column they exist to justify removing. Everything
+ * §2 and §3 need comes from loadOpenRows(), which names only the per-user
+ * predicate and never the boolean.
+ *
  * WHY §2 WRITES TO THE LIVE DATABASE, AND WHY THAT IS SAFE
  * --------------------------------------------------------
  * "A job notified to B reads NEW for me" cannot be proved by a user who owns no
@@ -112,6 +121,17 @@ function check(ok: boolean, label: string, detail = "") {
 /** Thrown to end §2's transaction. Never escapes main(). */
 class Rollback extends Error {}
 
+/**
+ * Every open job, with the one per-user fact a badge is made of.
+ *
+ * The columns are exactly what lib/match.isMatch reads, plus the company name for
+ * the printout — so the comparison can be made where it matters, on the rows Home
+ * actually shows. `user_notified` comes from the production predicate itself
+ * rather than from a restatement of it.
+ *
+ * NAMES NO COLUMN THAT PHASE 1g REMOVES. This is what every section below §1
+ * runs on, which is what makes §1 a block that can be deleted on its own.
+ */
 type OpenRow = {
   canonical_id: string;
   company: string;
@@ -121,9 +141,30 @@ type OpenRow = {
   is_pm_role: boolean;
   desc_checked: boolean;
   desc_fetch_failed: boolean;
-  boolean_says: boolean;
   user_notified: boolean;
 };
+
+/** §1's extra column: the retiring boolean, alongside what replaced it. */
+type MigrationRow = OpenRow & { boolean_says: boolean };
+
+async function loadOpenRows(lib: Lib, userId: string): Promise<OpenRow[]> {
+  const { sql, notifiedToUser } = lib;
+  return sql<OpenRow[]>`
+    SELECT j.canonical_id,
+           c.name AS company,
+           j.title,
+           j.city,
+           j.min_experience,
+           j.is_pm_role,
+           j.desc_checked,
+           j.desc_fetch_failed,
+           ${notifiedToUser(userId)}
+      FROM jobs j
+      JOIN companies c ON c.id = j.company_id
+     WHERE j.status = 'open'
+     ORDER BY c.name, j.title
+  `;
+}
 
 async function main() {
   const lib = await loadLib();
@@ -134,16 +175,21 @@ async function main() {
 
   const prefs = await lib.loadPreferences();
 
+  // The rows every section from §2 onwards works from. Read once, before §1, so
+  // that deleting §1 leaves them exactly where they are.
+  const rows = await loadOpenRows(lib, userId);
+  const matched = rows.filter((row) => isMatch(row, prefs));
+
   // -------------------------------------------------------------------------
   // §1  The migration proof: for me, the two readings are the same set.
+  //     PHASE 1g DELETES THIS SECTION WHOLE. Nothing below reads anything it
+  //     defines — see the header note.
   // -------------------------------------------------------------------------
   console.log("\n§1  the old boolean and the per-user table, compared for me");
 
   // Both readings on every open row: the column being retired, and the
-  // production fragment that replaced it. Everything else here is what
-  // lib/match.isMatch needs, so the comparison can be made where it matters —
-  // on the rows Home actually shows.
-  const rows = await sql<OpenRow[]>`
+  // production fragment that replaced it.
+  const migrationRows = await sql<MigrationRow[]>`
     SELECT j.canonical_id,
            c.name AS company,
            j.title,
@@ -160,14 +206,14 @@ async function main() {
      ORDER BY c.name, j.title
   `;
 
-  const booleanTrue = rows.filter((r) => r.boolean_says).length;
-  const mineTrue = rows.filter((r) => r.user_notified).length;
+  const booleanTrue = migrationRows.filter((r) => r.boolean_says).length;
+  const mineTrue = migrationRows.filter((r) => r.user_notified).length;
   console.log(
-    `  open jobs ${rows.length}  ·  jobs.notified = TRUE ${booleanTrue}  ·  ` +
+    `  open jobs ${migrationRows.length}  ·  jobs.notified = TRUE ${booleanTrue}  ·  ` +
       `a row in user_job_notifications for me ${mineTrue}`,
   );
 
-  const disagreements = rows.filter((r) => r.boolean_says !== r.user_notified);
+  const disagreements = migrationRows.filter((r) => r.boolean_says !== r.user_notified);
   for (const row of disagreements.slice(0, 10)) {
     console.log(
       `  DIFF  ${row.company} — ${row.title}\n` +
@@ -206,11 +252,11 @@ async function main() {
   // The badge itself, from the shipped function, fed each reading in turn. This
   // is the assertion that actually says "Home looks identical": not that the two
   // columns agree, but that the thing rendered from them is the same word.
-  const matched = rows.filter((row) => isMatch(row, prefs));
+  const migrationMatched = migrationRows.filter((row) => isMatch(row, prefs));
   const before = { NEW: 0, NOTIFIED: 0 };
   const after = { NEW: 0, NOTIFIED: 0 };
   let badgeDiff = 0;
-  for (const row of matched) {
+  for (const row of migrationMatched) {
     const was = homeBadge({ matches: true, user_notified: row.boolean_says })?.label;
     const now = homeBadge({ matches: true, user_notified: row.user_notified })?.label;
     if (was) before[was as "NEW" | "NOTIFIED"] += 1;
@@ -221,7 +267,7 @@ async function main() {
     }
   }
   console.log(
-    `  matches ${matched.length}  ·  from the boolean: ${before.NOTIFIED} NOTIFIED / ` +
+    `  matches ${migrationMatched.length}  ·  from the boolean: ${before.NOTIFIED} NOTIFIED / ` +
       `${before.NEW} NEW  ·  from the table: ${after.NOTIFIED} NOTIFIED / ${after.NEW} NEW`,
   );
   check(badgeDiff === 0, "every match on Home renders the same badge either way", `${badgeDiff} changed`);

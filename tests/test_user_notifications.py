@@ -169,19 +169,23 @@ async def test_record_sent_twice_does_not_duplicate_or_re_queue(digest_conn):
     assert [j["canonical_id"] for j in await fetch_candidates(digest_conn, TEST_USER_ID)] == []
 
 
-async def test_record_sent_also_writes_the_boolean_rollback_net(digest_conn):
-    """1d dual-writes on purpose: the new table decides, the boolean is the net.
+async def test_record_sent_writes_the_record_and_the_receipt_and_nothing_else(digest_conn):
+    """Two writes, one transaction — what replaced the 1d dual-write.
 
-    If this ever fails, reverting 1d would re-send everything that went out
-    during the 1d window, and scripts/backfill_user_notifications.py would have
-    an inaccurate source to re-run against. The column is not dead weight until
-    1g drops it — see db/schema.sql.
+    Through 1d, 1e and 1f this function also flipped the global jobs.notified
+    boolean, as a rollback net: reverting 1d could then not re-send anything that
+    had gone out during the 1d window. Phase 1g removed that write and then the
+    column, because by 1e nothing read it and by 1f nothing rendered from it — a
+    net for a rollback nobody can still perform is not a net, it is a column the
+    next person assumes something depends on.
+
+    So what a send leaves behind is exactly two rows: the per-user record that
+    stops a re-send, and the receipt that explains it.
     """
     await digest_conn.add_job("a", title="Backend Engineer")
 
     await record_sent(digest_conn, TEST_USER_ID, ["a"], "2026-08-03-am")
 
-    assert (await digest_conn.snapshot())["a"]["notified"] == 1
     assert await digest_conn.notification_pairs() == {(TEST_USER_ID, "a")}
     assert [row["canonical_id"] for row in await digest_conn.sent_log()] == ["a"]
 
@@ -207,8 +211,10 @@ async def test_notification_state_is_read_per_user(digest_conn):
     tracks the same company and was never emailed anything, sees the job — which
     is the entire point of the table and the failure 1d was built to prevent.
 
-    What did NOT change: record_sent still dual-writes the boolean as a rollback
-    net, and 1g drops it. Nothing below reads it.
+    What did change again in 1g: record_sent stopped dual-writing the boolean,
+    and the column is gone. The two assertions below that used to be phrased in
+    terms of it are phrased in terms of the state itself, which is what they were
+    always about — a row naming a person, or the absence of one.
     """
     await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
     await digest_conn.track_company(OTHER_USER_ID, 1)
@@ -218,16 +224,10 @@ async def test_notification_state_is_read_per_user(digest_conn):
 
     # The state knows the difference, which the boolean never could.
     assert await digest_conn.notification_pairs() == {(TEST_USER_ID, "a")}
-    assert await count_uncovered(digest_conn, TEST_USER_ID) == 0
-    assert await count_uncovered(digest_conn, OTHER_USER_ID) == 1
 
-    # And so does the queue now. One send, two independent answers.
+    # And so does the queue. One send, two independent answers.
     assert [j["canonical_id"] for j in await fetch_candidates(digest_conn, TEST_USER_ID)] == []
     assert [j["canonical_id"] for j in await fetch_candidates(digest_conn, OTHER_USER_ID)] == ["a"]
-
-    # The boolean is still written and still says nothing about whose inbox it
-    # went to — which is why nothing reads it to decide any of the above.
-    assert (await digest_conn.snapshot())["a"]["notified"] == 1
 
 
 async def test_a_send_to_one_user_does_not_silence_a_job_for_another(digest_conn):

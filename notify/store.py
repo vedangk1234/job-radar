@@ -29,17 +29,14 @@ questions, spelled out above CANDIDATES_SQL. Every read in this module that
 decides anything now takes a user_id, and the fan-out in notify/digest.py calls
 them once per user.
 
-The global jobs.notified boolean is no longer read here at all. It was doing two
-jobs at once: "this is back catalogue" (a fact about a crawl) and "somebody was
+The global jobs.notified boolean is gone, as of Phase 1g. It was doing two jobs
+at once: "this is back catalogue" (a fact about a crawl) and "somebody was
 emailed this" (a fact about a person). 1d moved the person half into
 user_job_notifications; 1e moved the crawl half into jobs.seeded, which
 crawler/store.mark_new writes from the same seeding flag — so the crawl path
-stays user-blind and the queue stops flattening two users into one.
-
-The boolean is still WRITTEN by record_sent, in the same transaction: it is the
-rollback net, it is the 1d backfill's source of truth, and the dashboard still
-derives its NEW/NOTIFIED badge from it. 1g drops it, and after 1e that drop is a
-no-op rather than a behaviour change.
+stays user-blind and the queue stops flattening two users into one. 1d through 1f
+kept writing the boolean as a rollback net; 1g removed the last write and then
+the column, once the fan-out had been proven in production.
 
 record_sent is deliberately the last thing that happens in a digest run, after
 the network call has already succeeded. That ordering is the same idea as the
@@ -48,9 +45,8 @@ fails leaves the queue exactly as it was, so the next run simply tries again —
 whereas recording the send first and then failing would lose the job silently and
 forever, which is the one failure this whole table exists to prevent.
 
-The three writes inside record_sent run in one transaction, so it is impossible
-to end up with a job recorded as notified that has no row in the sent-log, or
-with the per-user table and the boolean disagreeing about what went out.
+The two writes inside record_sent run in one transaction, so it is impossible to
+end up with a job recorded as notified that has no row in the sent-log.
 
 SQL portability note (same as crawler/store.py): these statements stay inside
 the subset Postgres and SQLite agree on — numbered placeholders, `now()`, plain
@@ -61,16 +57,17 @@ rather than a mock of them.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping
 
 from db.notifications import record_notified
 
 from .match import Preferences
 
-# Same reasoning as crawler/store.py: SQLite caps host parameters at 999 and
-# Postgres at 65535, so chunk well below both.
-CHUNK = 400
-
+# No CHUNK constant here any more. This module held one until Phase 1g, for the
+# IN-list in record_sent's boolean flip; the two statements that remain bind
+# either one parameter or a list of records through executemany, and the chunking
+# that a digest's worth of ids genuinely needs lives with the statement that
+# needs it — db/notifications.record_notified.
 PREFERENCES_SQL = (
     "SELECT cities, keywords, exclusions, max_level FROM preferences WHERE user_id = $1"
 )
@@ -188,7 +185,7 @@ CANDIDATES_IGNORING_NOTIFIED_SQL = _CANDIDATES_TEMPLATE.format(queue_filter="")
 # posting nobody can apply to.
 ENRICHMENT_TARGETS_SQL = """
 SELECT j.canonical_id, j.title, j.location, j.city, j.url,
-       j.first_seen_at, j.company_id, j.notified,
+       j.first_seen_at, j.company_id,
        j.min_experience, j.is_pm_role, j.desc_checked,
        j.desc_fetch_failed, j.desc_checked_at,
        c.name AS company, c.ats, c.token, c.config
@@ -208,10 +205,10 @@ VALUES ($1, now(), $2)
 
 # Two facts and three pieces of bookkeeping. Note what is NOT here: any column
 # that could hold the description those facts were derived from — and, just as
-# deliberately, any column about the job's LIFECYCLE. There is no notified here,
+# deliberately, any column about the job's LIFECYCLE. There is no seeded here,
 # no status, no miss_count, no first_seen_at. That is what makes it safe to run
 # this in the middle of a crawl: enrichment cannot re-open a closed job, cannot
-# un-send a sent one, and cannot make a job look newly seen.
+# hand a back catalogue to a digest, and cannot make a job look newly seen.
 #
 # desc_checked = TRUE is set unconditionally, including when min_experience came
 # back NULL because the fetch failed. "We looked and learned nothing" is a fact
@@ -227,16 +224,6 @@ UPDATE jobs
        desc_checked_at   = now()
  WHERE canonical_id = $1
 """
-
-
-def _chunks(items: Sequence[str]) -> Iterable[Sequence[str]]:
-    for start in range(0, len(items), CHUNK):
-        yield items[start : start + CHUNK]
-
-
-def _placeholders(count: int, first: int) -> str:
-    """`$2, $3, $4` — an IN-list numbered from `first`."""
-    return ", ".join(f"${n}" for n in range(first, first + count))
 
 
 async def load_preferences(conn, user_id) -> Preferences:
@@ -320,7 +307,8 @@ async def fetch_enrichment_targets(
     lives: this returns the unchecked half of the board, and only a few dozen of
     those are worth a request.
 
-    Deliberately not filtered on `notified`. See the module docstring.
+    Deliberately not filtered on notification state of any kind. See the module
+    docstring: this is the CRAWL's queue, not a digest's.
     """
     rows = await conn.fetch(ENRICHMENT_TARGETS_SQL, retry_before)
     return [dict(row) for row in rows]
@@ -338,7 +326,7 @@ async def save_description_facts(
 
     This is also the one write the digest performs BEFORE a send, which is a
     deliberate exception to this module's usual ordering. It is safe because it
-    touches nothing about the job's lifecycle: no notified flag, no receipt. A
+    touches nothing about the job's lifecycle: no notification row, no receipt. A
     send that fails afterwards leaves these rows enriched and still queued,
     which is exactly what should happen — the facts are true regardless of
     whether an email went out, and re-reading the descriptions to rediscover
@@ -361,27 +349,29 @@ async def record_sent(conn, user_id: Any, canonical_ids: Iterable[str], digest: 
     recorded as notified to this user, which the caller compares against what it
     actually emailed.
 
-    THREE WRITES, ONE TRANSACTION, AND THE THIRD IS THE ROLLBACK NET.
+    TWO WRITES, ONE TRANSACTION.
 
       1. user_job_notifications  — the per-user record. THE authority: this is
          what fetch_candidates reads, so this is what stops a re-send.
-      2. jobs.notified           — the old global boolean, still written. Phase
-         1d moved the READ to the table above but deliberately kept writing this
-         one, so reverting 1d cannot re-send anything that went out during the
-         1d window, so the backfill can be re-run afterwards against an accurate
-         source, and so the dashboard's NEW/NOTIFIED badge stays honest without
-         any TypeScript changing. 1g drops it once 1e proves the fan-out.
-      3. notifications           — the sent-log receipt, per job and per digest.
+      2. notifications           — the sent-log receipt, per job and per digest.
 
-    They share one transaction because every pair of them disagreeing is a
-    distinct failure: a record with no receipt is a send nobody can explain, a
-    receipt with no record re-sends the job tomorrow, and the per-user table
-    disagreeing with the boolean would make the rollback net a liability rather
-    than a net — it would either re-send on rollback or hide a job that was never
-    actually delivered.
+    They share one transaction because either of them without the other is a
+    distinct failure: a record with no receipt is a send nobody can explain, and
+    a receipt with no record re-sends the job tomorrow.
+
+    THERE WAS A THIRD WRITE UNTIL PHASE 1g: jobs.notified, the old global
+    boolean. 1d moved the read authority to the table above and deliberately kept
+    writing the boolean as a rollback net — so reverting 1d could not re-send
+    anything that went out during the 1d window, so the backfill could be re-run
+    against an accurate source, and so the dashboard's badge stayed honest with no
+    TypeScript changing. 1e made the queue read jobs.seeded instead, 1f moved the
+    badge onto this table, and by 1g nothing read the boolean at all. It was
+    dropped rather than left: a column written by one statement and read by none
+    is a rollback net for a rollback nobody can still perform, and the next person
+    to find it would reasonably assume something depends on it.
 
     The count returned is the per-user one, deliberately, because that is the
-    table that now decides. It counts GENUINE inserts, so re-recording a job this
+    table that decides. It counts GENUINE inserts, so re-recording a job this
     user already knew about contributes nothing — which is what makes a caller's
     "emailed N but recorded M" warning mean something.
     """
@@ -391,15 +381,6 @@ async def record_sent(conn, user_id: Any, canonical_ids: Iterable[str], digest: 
 
     async with conn.transaction():
         recorded = await record_notified(conn, user_id, ids)
-
-        for chunk in _chunks(ids):
-            sql = (
-                "UPDATE jobs SET notified = TRUE "
-                f"WHERE canonical_id IN ({_placeholders(len(chunk), 1)}) "
-                "RETURNING canonical_id"
-            )
-            await conn.fetch(sql, *chunk)
-
         await conn.executemany(INSERT_NOTIFICATION_SQL, [(cid, digest) for cid in ids])
 
     return recorded

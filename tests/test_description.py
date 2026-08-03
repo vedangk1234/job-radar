@@ -936,10 +936,10 @@ async def test_enrichment_updates_the_rows_in_place_for_the_caller(digest_conn):
     assert not is_match(candidates[0], Preferences())  # after: dropped, twice over
 
 
-async def test_enrichment_never_touches_the_notified_flag(digest_conn):
+async def test_enrichment_never_touches_the_notification_state(digest_conn):
     """It is not a lifecycle write. Nothing here can make a job look sent."""
     await digest_conn.add_job("a", title="Backend Engineer")
-    await digest_conn.add_job("b", title="Platform Engineer", notified=True)
+    await digest_conn.add_sent_job("b", title="Platform Engineer")
 
     from notify.store import fetch_candidates
 
@@ -951,5 +951,6 @@ async def test_enrichment_never_touches_the_notified_flag(digest_conn):
     )
     after = await digest_conn.snapshot()
 
-    assert [after[k]["notified"] for k in after] == [before[k]["notified"] for k in before]
+    assert [after[k]["seeded"] for k in after] == [before[k]["seeded"] for k in before]
+    assert await digest_conn.notification_pairs() == {(TEST_USER_ID, "b")}
     assert await digest_conn.sent_log() == []

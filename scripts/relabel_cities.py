@@ -18,7 +18,7 @@ fixes future crawls and leaves 135 LSEG rows sitting in `other`.
 WHAT IT TOUCHES, AND WHAT IT REFUSES TO
 ---------------------------------------
 Only `city`, and only on rows whose recomputed label actually differs. Every
-lifecycle column — notified, status, first_seen_at, last_seen_at, miss_count,
+lifecycle column — seeded, status, first_seen_at, last_seen_at, miss_count,
 and the five description-derived ones — is absent from the UPDATE, so this
 cannot re-alert a job, reopen a closed one, or move a timestamp. `city` is
 stored and used to decide nothing at crawl time; it is read later by the digest
@@ -70,7 +70,7 @@ CHUNK = 200
 # "The UPDATE only names `city`" is an argument. This is evidence: every column
 # of the jobs table EXCEPT city, hashed per row, before the pass and again
 # after. If the two digests match, nothing but the label moved — no timestamp
-# nudged by a trigger, no `notified` cleared, no row inserted or deleted. If a
+# nudged by a trigger, no `seeded` cleared, no row inserted or deleted. If a
 # future edit to this script reaches a second column by accident, the run says
 # so instead of the next digest saying so by re-emailing 135 jobs.
 #
@@ -83,7 +83,7 @@ SELECT canonical_id,
          concat_ws('|',
            company_id::text, title, location, url,
            source_posted_at::text, first_seen_at::text, last_seen_at::text,
-           miss_count::text, status, notified::text,
+           miss_count::text, status, seeded::text,
            min_experience::text, is_pm_role::text, desc_checked::text,
            desc_fetch_failed::text, desc_checked_at::text
          )
@@ -96,7 +96,7 @@ SELECT canonical_id,
 # of the table deliberately absent from both this list and the digest above.
 LIFECYCLE_COLUMNS = (
     "company_id", "title", "location", "url", "source_posted_at",
-    "first_seen_at", "last_seen_at", "miss_count", "status", "notified",
+    "first_seen_at", "last_seen_at", "miss_count", "status", "seeded",
     "min_experience", "is_pm_role", "desc_checked", "desc_fetch_failed",
     "desc_checked_at",
 )

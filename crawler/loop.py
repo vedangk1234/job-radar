@@ -25,8 +25,9 @@ Guards 1 and 2 return before any write, so "changed nothing" is structural
 rather than something the writes have to be careful about.
 
 No email is sent from this module and no notification matching happens here.
-Brand-new jobs are left with notified=FALSE; that flag is the queue Step 4
-reads.
+Brand-new jobs are left with seeded=FALSE, which is what makes them eligible for
+a digest queue; whose queue, and whether they have already been told, are
+questions the notify path asks and this module has never been able to.
 """
 
 from __future__ import annotations
@@ -212,9 +213,9 @@ async def crawl(
 
     `seeding` is decided by the caller from the company's row count (see
     scripts/crawl.py) and only changes one thing: whether brand-new jobs are
-    stored already-notified. On a first-ever crawl a board's entire back
-    catalogue looks new, so a seed run marks it notified=TRUE and nothing is
-    ever emailed for it. Real alerting starts on crawl #2.
+    stored as back catalogue. On a first-ever crawl a board's entire back
+    catalogue looks new, so a seed run marks it seeded=TRUE and nothing is ever
+    emailed for it, to anybody. Real alerting starts on crawl #2.
 
     `fetchers` is an injection point for tests; production uses the module
     dict. Nothing else about the code path differs under test.
@@ -262,14 +263,15 @@ async def crawl(
     # reopens returned jobs; running it after bump_missing would be harmless
     # but running close_stale before it would close a job that just came back.
     await upsert_seen(conn, company.id, fetched)
-    await mark_new(conn, d.truly_new, notified=seeding)
+    await mark_new(conn, d.truly_new, seeded=seeding)
     await bump_missing(conn, company.id, d.missing)
 
     # --- GUARD 3: close only after MISS_LIMIT consecutive misses ------------
     result.closed = len(await close_stale(conn, company.id))
 
-    # `reappeared` is deliberately not re-notified: we have seen those ids
-    # before, so a job that flapped out and back is not news. `truly_new` on a
-    # non-seeding run keeps notified=FALSE, which is exactly how Step 4 finds
-    # it. Nothing is emailed from here.
+    # `reappeared` is deliberately not passed to mark_new: we have seen those
+    # ids before, so a job that flapped out and back is not news, and re-stamping
+    # first_seen_at would make it look like news. `truly_new` on a non-seeding
+    # run keeps seeded=FALSE, which is what puts it in a queue at all. Nothing is
+    # emailed from here.
     return result

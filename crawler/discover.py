@@ -29,7 +29,7 @@ WHAT THIS MODULE MAY WRITE
 --------------------------
 `companies` and `discovered_companies`. Never `jobs`. A newly-tracked company is
 picked up by the next scheduled scripts/crawl.py, which sees zero stored rows
-for it, and therefore seeds its whole back catalogue with notified = TRUE — the
+for it, and therefore seeds its whole back catalogue with seeded = TRUE — the
 same silent seed every other company got. Writing job rows here would break that
 detection and turn a discovery run into an inbox full of a stranger's back
 catalogue.
