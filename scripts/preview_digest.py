@@ -32,16 +32,22 @@ unavailable yesterday deserves the same answer here as anywhere else.
 --no-descriptions skips the enrichment entirely for a genuinely read-only,
 no-network run against whatever facts are already stored.
 
---ignore-notified drops the whole queue filter from the candidate query — both
-the old global `notified = FALSE` clause and the per-user
-user_job_notifications check that replaced it as the read authority in Phase 1d.
-That is the only way to exercise the matcher against a table whose rows were
-almost all stored notified=TRUE by the silent seed: it answers "which of
-everything currently open WOULD my filter pick".
+This previews ONE user's digest — the account MY_EMAIL names. Since Phase 1e
+there is a digest per user; scripts/preview_fanout.py is the one that shows
+everybody's, and the comparison between them is what proves the fan-out isolates.
 
-Without it, this script reports MY queue — open jobs I have not been emailed
-about — which after the 1d backfill is the same set it reported before, because
-every job the boolean called notified now has a row naming me.
+--ignore-notified drops the whole queue filter from the candidate query: the
+watch-list clause, the `seeded = FALSE` clause and the per-user
+user_job_notifications check alike. That is the only way to exercise the matcher
+against a table whose rows were almost all stored by the silent seed — it answers
+"which of everything currently open WOULD my filter pick", which is also the
+question `npm run match-parity` asks, so the two totals stay comparable.
+
+Without it, this script reports MY queue — open jobs, in companies I watch, not
+back catalogue, that I have not been emailed about. After the 1d and 1e
+migrations that is the same set it reported before either of them: I track all
+fifty companies, and every job the old boolean called notified now either has a
+row naming me or is marked seeded.
 """
 
 from __future__ import annotations
@@ -145,7 +151,11 @@ async def main() -> int:
         await conn.close()
         await close_client()
 
-    scope = "every open job" if args.ignore_notified else "open and not yet notified to me"
+    scope = (
+        "every open job"
+        if args.ignore_notified
+        else "open, watched by me, not seeded, not yet sent to me"
+    )
     print(f"preferences: {len(prefs.cities)} cities, {len(prefs.keywords)} keywords, "
           f"{len(prefs.exclusions)} exclusions")
     print(f"  cities     : {', '.join(prefs.cities)}")

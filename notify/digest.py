@@ -1,8 +1,16 @@
-"""Render the matched jobs into one email, and send it through Resend.
+"""Render the matched jobs into one email per person, and send through Resend.
 
-One email, never several. A digest that arrives as eleven separate messages is
-the same failure as an inbox full of noise — you stop opening it — so the run
-either produces a single grouped message or produces nothing at all.
+One email per user, never several. A digest that arrives as eleven separate
+messages is the same failure as an inbox full of noise — you stop opening it — so
+each user's run either produces a single grouped message or produces nothing at
+all.
+
+ONE EMAIL PER USER IS PHASE 1e — the fan-out. `run_digest` is one person's
+digest and `run_fan_out` is the loop over everybody, and the split is the whole
+design: every statement underneath is bound to a single user_id, so isolation
+between two users' digests is a property of the SQL rather than of this loop
+being careful. The crawl above it is untouched and stays user-blind; only the
+notification narrows. See run_fan_out.
 
 And *nothing at all* is a real outcome here, not an error. Zero matches sends
 zero emails. An empty digest that shows up every morning saying "no new jobs"
@@ -56,7 +64,7 @@ from typing import Any, Iterable, Mapping
 import httpx
 
 from db.connection import load_env
-from db.users import resolve_current_user_id
+from db.users import digest_users, email_for_user, resolve_current_user_id
 
 from .description import enrich_candidates
 from .match import Preferences, select_matches, title_stage_ok
@@ -250,20 +258,37 @@ def assert_self_send(from_email: str, to_email: str, my_email: str) -> None:
 
     Checking it here means the error names the actual constraint, and means a
     mistyped recipient never gets as far as a network call.
+
+    CONDITIONAL ON THE SENDER SINCE PHASE 1e, and this is a narrowing rather than
+    a loosening. The rule was written as "the digest may only go to MY_EMAIL",
+    which was an accurate paraphrase while there was one digest and one person —
+    but the reason it is true has always been the sandbox sender, and its own
+    error message said so ("to send anywhere else, verify a domain in Resend and
+    change FROM_EMAIL"). A fan-out makes the difference matter: with the rule
+    stated as an absolute, every second user's digest is refused forever and
+    verifying a domain changes nothing.
+
+    So the guard now fires exactly when the constraint exists. FROM_EMAIL is
+    still the sandbox sender on this install, so today's behaviour is unchanged
+    to the character: only the MY_EMAIL account can be delivered to, and anyone
+    else fails loudly before the network call and before any write. What changes
+    is that verifying a domain is now sufficient to make the fan-out real.
     """
     if to_email.lower() == my_email.lower():
         return
 
-    detail = (
-        f"\n{SANDBOX_FROM} is Resend's sandbox sender: it can only deliver to the "
-        f"address that owns the API key. To send anywhere else, verify a domain in "
-        f"Resend and change FROM_EMAIL."
-        if from_email.lower() == SANDBOX_FROM
-        else ""
-    )
+    if from_email.lower() != SANDBOX_FROM:
+        # A verified domain: Resend will deliver to anyone, so refusing here
+        # would be this function inventing a restriction rather than reporting
+        # one. Every recipient still comes from a public.users row — see
+        # db/users.email_for_user, which raises rather than guessing.
+        return
+
     raise DigestError(
-        f"refusing to send to {to_email!r}: the digest may only go to MY_EMAIL "
-        f"({my_email!r}).{detail}"
+        f"refusing to send to {to_email!r}: FROM_EMAIL is {SANDBOX_FROM}, Resend's "
+        f"sandbox sender, which can only deliver to the address that owns the API "
+        f"key ({my_email!r}). Verify a domain in Resend and change FROM_EMAIL to "
+        f"send to anybody else — until then this account cannot receive a digest."
     )
 
 
@@ -328,9 +353,12 @@ def digest_tag(today: date | None = None, suffix: str = "manual") -> str:
 
 
 class DigestRun:
-    """What one digest run considered, matched, and sent."""
+    """What one digest run considered, matched, and sent — for ONE user."""
 
     def __init__(self) -> None:
+        self.user_id: Any = None
+        self.to: str | None = None
+        self.error: str | None = None
         self.candidates: int = 0
         self.title_stage: int = 0
         self.enriched: list[dict[str, Any]] = []
@@ -357,14 +385,22 @@ async def run_digest(
 ) -> DigestRun:
     """Load, filter on titles, read descriptions, match, send, record.
 
-    `user_id` is whose filter to apply. It defaults to None and is resolved from
-    MY_EMAIL exactly once here, at the top of the run, rather than inside
-    load_preferences — this is the entrypoint, so this is where "once per run"
-    is a structural fact instead of a convention. Tests inject it. See
-    db/users.py: the whole mechanism is a Phase-2 bridge.
+    ONE USER'S DIGEST. run_fan_out below calls this once per active account; a
+    caller with a user in hand can call it directly, and scripts/preview_digest.py
+    still does for the one user MY_EMAIL names.
 
-    `to` defaults to MY_EMAIL and is checked against it either way — the
-    recipient is not a knob, it is an assertion (see assert_self_send).
+    `user_id` is whose filter, whose watch list, whose queue and whose inbox.
+    It defaults to None and is then resolved from MY_EMAIL exactly once here, at
+    the top of the run, rather than inside load_preferences — this is an
+    entrypoint, so this is where "once per run" is a structural fact instead of a
+    convention. See db/users.py: that bridge is Phase-2 scaffolding, but the
+    fan-out passes an explicit id and never touches it.
+
+    `to` defaults to THIS USER's own address, read from their row, and is checked
+    against MY_EMAIL either way — the recipient is not a knob, it is an assertion
+    (see assert_self_send). Until a domain is verified in Resend, that assertion
+    means only the MY_EMAIL account can actually be delivered to; a second real
+    user's send is refused loudly, before any network call and before any write.
 
     `sender` is the injection point for tests; production uses send_via_resend.
     `describer` is the same for the description fetch. Everything before and
@@ -378,6 +414,7 @@ async def run_digest(
     run = DigestRun()
     if user_id is None:
         user_id = await resolve_current_user_id(conn)
+    run.user_id = user_id
     prefs = await load_preferences(conn, user_id)
 
     candidates = await fetch_candidates(conn, user_id)
@@ -394,7 +431,12 @@ async def run_digest(
 
     run.subject = subject_line(run.matched, today)
     api_key, from_email, my_email = email_config()
-    to_email = (to or my_email).strip()
+    # The recipient is THIS USER's address, read from their own row — not
+    # MY_EMAIL. Since 1e there is one digest per user, and defaulting the
+    # recipient to the environment would quietly post somebody else's matches to
+    # my inbox. `to` stays an override for tests only.
+    to_email = (to or await email_for_user(conn, user_id)).strip()
+    run.to = to_email
     assert_self_send(from_email, to_email, my_email)
 
     # Raises on any failure, before a single row is touched.
@@ -412,3 +454,88 @@ async def run_digest(
         conn, user_id, [j["canonical_id"] for j in run.matched], run.tag
     )
     return run
+
+
+class FanOutRun:
+    """What one fan-out considered, per user. The crawl-once half is elsewhere."""
+
+    def __init__(self) -> None:
+        self.runs: list[tuple[Any, str, DigestRun]] = []  # (user_id, email, run)
+
+    @property
+    def sent(self) -> int:
+        return sum(1 for _, _, run in self.runs if run.sent)
+
+    @property
+    def emailed(self) -> int:
+        return sum(run.emailed for _, _, run in self.runs)
+
+    @property
+    def failures(self) -> list[tuple[Any, str, DigestRun]]:
+        return [entry for entry in self.runs if entry[2].error is not None]
+
+
+async def run_fan_out(
+    conn,
+    *,
+    today: date | None = None,
+    tag_suffix: str = "manual",
+    sender=send_via_resend,
+    describer=None,
+) -> FanOutRun:
+    """One digest per user, each containing only that user's matches.
+
+    THE OTHER HALF OF "CRAWL ONCE, FAN OUT", and the half that took until Phase
+    1e because it is the one with an inbox on the end of it. The crawl is
+    untouched and stays untouched: it fetches every tracked board for everybody,
+    knows nothing about users, and could not narrow itself to somebody's watch
+    list without making a board's history conditional on a person currently
+    wanting it. All the narrowing happens here.
+
+    Per user, in turn: their preferences, their tracked companies, their queue,
+    their filter, their email, their receipts. Nothing about one user's run reads
+    or writes another's — the isolation is in the SQL (every statement is bound to
+    one user_id) rather than in the care taken by this loop.
+
+    SEQUENTIAL, NOT GATHERED. The crawler holds a single asyncpg connection,
+    which cannot serve concurrent queries; the same fact that makes scripts/
+    crawl.py crawl companies one at a time. It also means a job whose description
+    is read for the first user is already desc_checked for the second, so the
+    network cost of N users is not N times the cost of one.
+
+    ONE USER'S FAILURE IS NOT EVERYONE'S. A DigestError — a refused recipient, a
+    Resend outage — is recorded against that user and the loop continues, because
+    the alternative is one broken account silencing every other. Nothing is
+    written for the user who failed: run_digest raises before any row is touched,
+    which is the crawler's Guard 1 applied to email. The caller reports them and
+    exits non-zero; a failure that only appears in a log is a failure nobody sees.
+
+    A user with zero matches gets no email and no receipt, exactly as the single
+    user always has — including never reaching email_config(), so a quiet hour
+    still cannot fail on a missing secret. That is what the workflow's preflight
+    secret check exists to compensate for, and it survives the fan-out unchanged.
+    """
+    fan_out = FanOutRun()
+
+    for user_id, email in await digest_users(conn):
+        run = DigestRun()
+        run.user_id, run.to = user_id, email
+        try:
+            run = await run_digest(
+                conn,
+                user_id=user_id,
+                to=email,
+                today=today,
+                tag_suffix=tag_suffix,
+                sender=sender,
+                describer=describer,
+            )
+        except DigestError as exc:
+            # Deliberately narrow: DigestError means "the send could not be
+            # attempted or was refused, and nothing was written". Anything else —
+            # a broken preferences migration, a lost connection — is not
+            # per-user and must not be swallowed into a report line.
+            run.error = str(exc)
+        fan_out.runs.append((user_id, email, run))
+
+    return fan_out

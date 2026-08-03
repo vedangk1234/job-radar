@@ -99,6 +99,7 @@ async def print_totals(conn) -> None:
     total = await conn.fetchval("SELECT count(*) FROM jobs")
     notified = await conn.fetchval("SELECT count(*) FROM jobs WHERE notified")
     unnotified = await conn.fetchval("SELECT count(*) FROM jobs WHERE NOT notified")
+    seeded = await conn.fetchval("SELECT count(*) FROM jobs WHERE seeded")
     open_rows = await conn.fetchval("SELECT count(*) FROM jobs WHERE status = 'open'")
     closed_rows = await conn.fetchval("SELECT count(*) FROM jobs WHERE status = 'closed'")
     cities = await conn.fetch(
@@ -116,13 +117,17 @@ async def print_totals(conn) -> None:
     )
 
     print(f"\njobs table: {total} row(s)  ({open_rows} open, {closed_rows} closed)")
-    # Still the boolean, deliberately. Since Phase 1d the digest decides from
-    # per-user state instead, but this is the CRAWL's report and the crawl path
-    # is user-blind by design — a per-user number here would be this script
-    # learning who the users are, which is the one thing it must never do. The
-    # boolean is also still exactly what the silent seed writes, so it remains
-    # the honest measure of what this run itself queued.
-    print(f"notified: TRUE={notified}  FALSE={unnotified}   <- the crawl-side queue flag")
+    # Both flags, and neither is a per-user number — deliberately. Since Phase 1d
+    # the digest decides from per-user state, but this is the CRAWL's report and
+    # the crawl path is user-blind by design; a per-user count here would be this
+    # script learning who the users are, which is the one thing it must never do.
+    #
+    # `seeded` is what this run itself wrote and what the 1e queue reads: back
+    # catalogue, excluded from every user's digest. `notified` is the old global
+    # boolean, still dual-written and dropped in 1g. They differ by the jobs that
+    # were genuinely emailed to somebody.
+    print(f"seeded  : {seeded}   <- back catalogue; never enters anyone's digest")
+    print(f"notified: TRUE={notified}  FALSE={unnotified}   <- the old global flag (1g drops it)")
     print("city labels: " + ", ".join(f"{r['city']}={r['n']}" for r in cities))
     print(
         f"description facts: {hidden_years} open row(s) demand 3+ years, "

@@ -119,11 +119,18 @@ jobs:
         # unreachable vendor is not a broken crawler.
         run: python scripts/crawl.py
 
-      - name: Send the digest
-        # Emails only jobs that are notified=FALSE, open, and match the
-        # preferences row, then flips exactly those to notified=TRUE. Zero
-        # matches sends nothing and writes nothing.
+      - name: Send the digests
+        # One digest PER USER since Phase 1e — the fan-out. For each active
+        # account: the open jobs in companies THEY watch, not stored by a silent
+        # seed, that THEY have not been emailed about, filtered by THEIR
+        # preferences row. Zero matches for a user sends nothing and writes
+        # nothing for them.
         #
-        # A failed send is also a no-write, so the jobs stay queued and the
-        # next hourly run retries them. Nothing is lost by a red run here.
+        # The crawl step above is deliberately not per-user and never will be:
+        # it fetched every tracked board once, for everybody. All the narrowing
+        # happens here.
+        #
+        # A failed send is a no-write, so those jobs stay queued and the next
+        # hourly run retries them — and one user's failure does not stop
+        # anybody else's digest, though it does turn this step red.
         run: python scripts/send_digest.py --tag cron

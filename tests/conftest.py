@@ -73,6 +73,7 @@ CREATE TABLE jobs (
   miss_count       INTEGER NOT NULL DEFAULT 0,
   status           TEXT NOT NULL DEFAULT 'open',
   notified         INTEGER NOT NULL DEFAULT 0,
+  seeded           INTEGER NOT NULL DEFAULT 0,
   min_experience    INTEGER,
   is_pm_role        INTEGER NOT NULL DEFAULT 0,
   desc_checked      INTEGER NOT NULL DEFAULT 0,
@@ -144,9 +145,15 @@ CREATE TABLE notifications (
 # user_id mirrors the real column: nullable, because that is what makes the
 # half-applied-migration state reachable in a test rather than only in
 # production. tests/test_digest.py exercises it directly.
+#
+# NO CHECK (id = 1) any more, mirroring the DROP CONSTRAINT in db/schema.sql.
+# Phase 1e took the one-row cap off the table because a fan-out needs a second
+# FILTER, not just a second user — two users sharing one filter would not test
+# isolation at all. One row per USER is still the rule and is still enforced by
+# preferences_one_per_user_idx, mirrored below.
 PREFERENCES_DDL = """
 CREATE TABLE preferences (
-  id          INTEGER PRIMARY KEY CHECK (id = 1),
+  id          INTEGER PRIMARY KEY,
   cities      TEXT NOT NULL,
   keywords    TEXT NOT NULL,
   exclusions  TEXT NOT NULL,
@@ -154,6 +161,14 @@ CREATE TABLE preferences (
   updated_at  TEXT,
   user_id     TEXT REFERENCES users(id) ON DELETE CASCADE
 )
+"""
+
+# The partial unique index from db/schema.sql, mirrored because 1e is the first
+# sub-phase in which more than one row can exist at all — so it is the first in
+# which "one filter per person" is a rule something could actually break.
+PREFERENCES_ONE_PER_USER_DDL = """
+CREATE UNIQUE INDEX preferences_one_per_user_idx
+    ON preferences (user_id) WHERE user_id IS NOT NULL
 """
 
 # The account rows are keyed by. Named `users` here and reached as
@@ -269,6 +284,7 @@ class FakeConn:
             DISCOVERED_DDL,
             USER_COMPANIES_DDL,
             USER_JOB_NOTIFICATIONS_DDL,
+            PREFERENCES_ONE_PER_USER_DDL,
         ):
             self._db.execute(ddl)
 
@@ -368,6 +384,7 @@ class FakeConn:
         url: str | None = None,
         status: str = "open",
         notified: bool = False,
+        seeded: bool = False,
         min_experience: int | None = None,
         is_pm_role: bool = False,
         desc_checked: bool = False,
@@ -387,14 +404,21 @@ class FakeConn:
         ordinary case. `applied` defaults the same way, and for the stronger
         reason: a crawled row can only ever start there, because the crawler has
         no statement that writes the column at all.
+
+        `seeded` and `notified` are separate parameters because since Phase 1e
+        they are separate facts. seeded=True is a row the silent seed stored —
+        back catalogue, excluded from every user's queue. notified=True alone is
+        now only the old global boolean, which nothing reads to decide anything;
+        a test that means "this was emailed to me" wants add_sent_job below.
         """
         stamp = self.clock.tick()
         await self.execute(
             "INSERT INTO jobs (canonical_id, company_id, title, location, city, url, "
-            "first_seen_at, last_seen_at, status, notified, "
+            "first_seen_at, last_seen_at, status, notified, seeded, "
             "min_experience, is_pm_role, desc_checked, desc_fetch_failed, desc_checked_at, "
             "applied, applied_at) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12, $13, $14, $15, "
+            "$16, $17)",
             canonical_id,
             company_id,
             title,
@@ -404,6 +428,7 @@ class FakeConn:
             stamp,
             status,
             1 if notified else 0,
+            1 if seeded else 0,
             min_experience,
             1 if is_pm_role else 0,
             1 if desc_checked else 0,
@@ -412,6 +437,24 @@ class FakeConn:
             1 if applied else 0,
             applied_at,
         )
+
+    async def add_sent_job(
+        self, canonical_id: str, *, user_id: str = TEST_USER_ID, **kwargs
+    ) -> None:
+        """A job that HAS been emailed to this user — the whole state, not half.
+
+        Before Phase 1e a test spelled that `add_job(..., notified=True)`, and
+        while there was one user and one global boolean it was true enough. It is
+        not any more: "emailed" is a row in user_job_notifications naming a
+        person, and the boolean is a dual-written rollback net that no query
+        reads to decide anything. A test still setting only the flag would be
+        arranging a state production cannot produce — and would pass or fail for
+        reasons unrelated to what it meant to check.
+
+        So this writes both, exactly as notify/store.record_sent does.
+        """
+        await self.add_job(canonical_id, notified=True, **kwargs)
+        await self.notify_user(user_id, canonical_id)
 
     async def add_user(
         self, user_id: str = TEST_USER_ID, email: str = TEST_EMAIL
@@ -491,11 +534,46 @@ class FakeConn:
         a parameter rather than a separate helper because that state is a real
         thing production can be in for a minute, and load_preferences is
         supposed to refuse rather than silently fall back to defaults in it.
+
+        Still clears the table first, so a test that calls it twice replaces the
+        filter rather than colliding with itself. A SECOND user's filter goes
+        through add_preferences_for, which does not clear — see there.
         """
         await self.execute("DELETE FROM preferences")
         await self.execute(
             "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, user_id) "
             "VALUES (1, $1, $2, $3, $4, $5, $6)",
+            json.dumps(list(cities)),
+            json.dumps(list(keywords)),
+            json.dumps(list(exclusions)),
+            int(max_level),
+            self.clock.tick(),
+            user_id,
+        )
+
+
+    async def add_preferences_for(
+        self,
+        user_id: str,
+        cities: Sequence[str] = DEFAULT_CITIES,
+        keywords: Sequence[str] = DEFAULT_KEYWORDS,
+        exclusions: Sequence[str] = DEFAULT_EXCLUSIONS,
+        max_level: int = DEFAULT_MAX_LEVEL,
+    ) -> None:
+        """A SECOND user's filter. Adds a row; deletes nothing.
+
+        Only possible at all since Phase 1e dropped CHECK (id = 1) — which is why
+        it is a separate helper rather than a flag on set_preferences: the two do
+        genuinely different things now, one replacing the install's filter and one
+        giving another person their own. preferences_one_per_user_idx still
+        refuses a second row for the SAME user, and a test that hits that is
+        testing the rule rather than tripping over the fixture.
+        """
+        next_id = int(await self.fetchval("SELECT COALESCE(max(id), 0) + 1 FROM preferences"))
+        await self.execute(
+            "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, user_id) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            next_id,
             json.dumps(list(cities)),
             json.dumps(list(keywords)),
             json.dumps(list(exclusions)),
@@ -565,15 +643,23 @@ def conn() -> FakeConn:
 
 @pytest.fixture
 async def digest_conn() -> FakeConn:
-    """A FakeConn with one user, one company, and the seeded preferences.
+    """One user, one company they watch, and the seeded preferences.
 
-    The preferences row is owned by that user from the start, so every existing
-    test goes on describing the ordinary case: a fully migrated database where
-    the filter has an owner.
+    The ordinary case, as of Phase 1e: a fully migrated database where the filter
+    has an owner AND the user's watch list contains the company their jobs belong
+    to. The tracking row is not decoration — since 1e the digest queue requires
+    it, so without it every test in this suite would read an empty queue and pass
+    or fail for a reason none of them is about.
+
+    Tracked with a direct INSERT rather than through db.watchlist.track_companies
+    on purpose: that function also suppresses the company's stored history, which
+    is exactly right in production and would silence every job a test adds
+    afterwards. Tests about tracking-time suppression call the real function.
     """
     conn = FakeConn()
     await conn.add_user()
     await conn.add_company(1, "Testco")
+    await conn.track_company(TEST_USER_ID, 1)
     await conn.set_preferences()
     return conn
 

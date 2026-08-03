@@ -1,28 +1,42 @@
-"""Per-user notification state, and the migration that must not re-spam an inbox.
+"""Per-user notification state, its migration, and the history it must withhold.
 
-Phase 1d moves "has this person been told about this job" out of the global
-jobs.notified boolean and into user_job_notifications. The dangerous half is not
-the table, it is the BACKFILL: until every historically-notified job has a row
-naming the existing user, the digest's queue considers all of them fresh. Getting
-that wrong means one email containing a person's entire job history — roughly
-7,700 rows, most of them stored by the silent seed and never meant for an inbox.
+Phase 1d moved "has this person been told about this job" out of the global
+jobs.notified boolean and into user_job_notifications. The dangerous half was not
+the table, it was the BACKFILL: until every historically-notified job had a row
+naming the existing user, the digest's queue considered all of them fresh, and
+getting that wrong meant one email containing a person's entire job history —
+roughly 7,700 rows, most of them stored by the silent seed and never meant for an
+inbox.
 
-So the tests below are weighted accordingly. Four of them are about the table
-behaving (uniqueness, per-user reads, cascade), and four are about the migration
-being provably correct before it is trusted:
+Phase 1e then made the queue genuinely per-user, and this file carries both the
+tests that were written to fail when that happened and the answers they were
+waiting for. Two of them said so in their own docstrings; read those before
+changing anything here, because the shape of the argument matters more than the
+assertions:
 
-    the backfill is idempotent                    (re-runnable after a failure)
-    the backfill covers exactly the right set      (membership, not arithmetic)
-    the gate refuses when something is uncovered   (it cannot pass wrongly)
-    a digest after the backfill sends ZERO         (the behaviour that matters)
+    test_notification_state_is_read_per_user
+        was: both users see an empty queue, because the boolean flattens them
+        now: one send, two independent answers
 
-The last one is the whole sub-phase in a single assertion, and it is written with
-a sender that raises if it is called, so "sent nothing" is proven by the absence
-of a network call rather than by a count that could be zero for other reasons.
+    test_the_silent_seed_is_suppressed_by_the_seeded_flag
+        was: the boolean is what holds a back catalogue back
+        now: jobs.seeded is, and the boolean is vestigial (asserted separately,
+             which is 1g rehearsed)
 
-No network anywhere. The SQL is the production SQL from db/notifications.py and
-notify/store.py, run against the SQLite shim — a mock would happily agree that a
-backfill covered everything without the real INSERT ever having said so.
+The rest divide into the table behaving (uniqueness, cascades), the 1d migration
+being provably correct (idempotent, exact membership, a gate that cannot pass
+wrongly, and a digest that sends ZERO afterwards), and the two ways history
+reaches a new inbox — a silent seed, and a user who starts tracking a company
+that already has stored jobs.
+
+The zero-send test is the whole of 1d in one assertion and is written with a
+sender that raises if it is called, so "sent nothing" is proven by the absence of
+a network call rather than by a count that could be zero for other reasons.
+
+No network anywhere. The SQL is the production SQL from db/notifications.py,
+db/watchlist.py and notify/store.py, run against the SQLite shim — a mock would
+happily agree that a backfill covered everything without the real INSERT ever
+having said so.
 """
 
 from __future__ import annotations
@@ -38,12 +52,9 @@ from db.notifications import (
     count_uncovered,
     record_notified,
 )
+from db.watchlist import track_companies
 from notify.digest import run_digest
-from notify.store import (
-    CANDIDATES_IGNORING_NOTIFIED_SQL,
-    fetch_candidates,
-    record_sent,
-)
+from notify.store import fetch_candidates, record_sent
 from tests.conftest import TEST_USER_ID
 
 OTHER_USER_ID = "00000000-0000-4000-8000-000000000002"
@@ -88,38 +99,41 @@ class ExplodingSender:
         )
 
 
-async def queued_by_per_user_clause(conn, user_id) -> list[str]:
-    """The queue as 1e will read it: the per-user clause WITHOUT the boolean.
-
-    Built by adding the NOT EXISTS to the ignore-notified statement rather than
-    by writing a fresh query, so what is exercised is production's own SELECT
-    list and join with exactly one predicate swapped. Two tests need it: one to
-    show the state is genuinely per-user underneath the conjunction, and one to
-    show what happens when the backfill has not run.
-    """
-    per_user_only = CANDIDATES_IGNORING_NOTIFIED_SQL.replace(
-        "WHERE j.status = 'open'",
-        "WHERE j.status = 'open'\n"
-        "   AND NOT EXISTS (SELECT 1 FROM user_job_notifications n\n"
-        "                    WHERE n.user_id = $1 AND n.canonical_id = j.canonical_id)",
-    )
-    return [row["canonical_id"] for row in await conn.fetch(per_user_only, user_id)]
-
-
 async def seed_history(conn, count: int, *, matching: bool = True) -> list[str]:
-    """`count` open jobs already flagged notified = TRUE. The pre-1d table.
+    """`count` open jobs stored by a silent seed. The shape the live table is in.
 
-    This is the shape the live database is actually in: ~7,700 rows carrying the
-    boolean, almost all of them from the silent seed rather than from a real
-    email. `matching` controls whether they pass the filter, because only a
-    matching job can reach a digest — a re-spam test seeded with jobs the filter
-    drops would pass without proving anything.
+    ~7,700 rows carrying the old boolean, almost all of them back catalogue
+    rather than anything that was ever emailed — and since Phase 1e that fact
+    lives in jobs.seeded, which is what the queue reads. Both flags are written
+    because crawler/store.mark_new writes both from one `seeding` argument, and a
+    helper that arranged half the state would be arranging something production
+    cannot produce.
+
+    `matching` controls whether they pass the filter, because only a matching job
+    can reach a digest — a re-spam test seeded with jobs the filter drops would
+    pass without proving anything.
     """
     title = "Backend Engineer" if matching else "Senior Sales Director"
     ids = []
     for n in range(count):
         cid = f"hist-{n}"
-        await conn.add_job(cid, title=title, notified=True)
+        await conn.add_job(cid, title=title, notified=True, seeded=True)
+        ids.append(cid)
+    return ids
+
+
+async def unseeded_history(conn, count: int) -> list[str]:
+    """`count` ordinary open jobs: not seeded, never emailed, sitting in a queue.
+
+    The OTHER kind of history, and the one jobs.seeded says nothing about — a
+    company that has been crawled normally for weeks accumulates these. They are
+    what a user starting to track that company would receive in one email if
+    db/watchlist.track_companies did not record them first.
+    """
+    ids = []
+    for n in range(count):
+        cid = f"old-{n}"
+        await conn.add_job(cid, title="Backend Engineer")
         ids.append(cid)
     return ids
 
@@ -172,25 +186,32 @@ async def test_record_sent_also_writes_the_boolean_rollback_net(digest_conn):
     assert [row["canonical_id"] for row in await digest_conn.sent_log()] == ["a"]
 
 
-async def test_notification_state_is_recorded_per_user(digest_conn):
-    """The state itself is per-user. What READS it is still globally gated in 1d.
+async def test_notification_state_is_read_per_user(digest_conn):
+    """THE 1d TRIPWIRE, NOW SHOWING THE 1e ANSWER. Read the history first.
 
-    This is the one place the dual-write's cost is visible, and it is worth being
-    precise about rather than discovering in 1e.
+    This test used to assert the opposite of what it asserts now, on purpose, and
+    the change is the whole of Phase 1e.
 
-    record_sent writes two things: the per-user row (the authority) and the old
-    global boolean (the rollback net). The 1d queue is the conjunction of both,
-    so a job I have been emailed about is suppressed for EVERYBODY until the
-    boolean clause comes out. That is not a bug in 1d — 1d is single-user by
-    design, and the second user has no watch-list fan-out to reach them anyway
-    (that is 1e). But it does mean "per-user reads" is only half true today, and
-    the half that IS true is the half this table exists to make possible.
+    In 1d the state was already per-user but the QUEUE was not: the predicate was
+    `notified = FALSE AND NOT EXISTS(my row)`, a conjunction, so a job emailed to
+    me flipped the global boolean and vanished from everybody's queue. 1d was
+    single-user by design and the second user had no fan-out to reach them
+    anyway, so that flattening cost nothing — but it meant "per-user reads" was
+    only half true, and this test ended with a line asserting BOTH users saw an
+    empty queue, written specifically so that removing the boolean clause would
+    fail here and make someone read the reasoning.
 
-    So: the recorded STATE distinguishes the two users correctly, and the 1e
-    predicate over that state gives the right answer for each. Only the retained
-    boolean flattens them, and removing it is exactly what 1e/1g do.
+    That line has now been removed, deliberately, by the change it was watching
+    for. The boolean clause is gone from notify/store.CANDIDATES_SQL; the queue
+    asks the watch list, jobs.seeded, and this table. So the second user, who
+    tracks the same company and was never emailed anything, sees the job — which
+    is the entire point of the table and the failure 1d was built to prevent.
+
+    What did NOT change: record_sent still dual-writes the boolean as a rollback
+    net, and 1g drops it. Nothing below reads it.
     """
     await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
+    await digest_conn.track_company(OTHER_USER_ID, 1)
     await digest_conn.add_job("a", title="Backend Engineer")
 
     await record_sent(digest_conn, TEST_USER_ID, ["a"], "2026-08-03-am")
@@ -200,15 +221,38 @@ async def test_notification_state_is_recorded_per_user(digest_conn):
     assert await count_uncovered(digest_conn, TEST_USER_ID) == 0
     assert await count_uncovered(digest_conn, OTHER_USER_ID) == 1
 
-    # And the per-user predicate alone — what 1e will read — answers per user.
-    assert await queued_by_per_user_clause(digest_conn, TEST_USER_ID) == []
-    assert await queued_by_per_user_clause(digest_conn, OTHER_USER_ID) == ["a"]
-
-    # Today's ACTUAL queue is still the conjunction, so both are empty. Asserted
-    # rather than left implicit, so that when 1e removes the boolean clause this
-    # line fails and forces someone to read the paragraph above.
+    # And so does the queue now. One send, two independent answers.
     assert [j["canonical_id"] for j in await fetch_candidates(digest_conn, TEST_USER_ID)] == []
-    assert [j["canonical_id"] for j in await fetch_candidates(digest_conn, OTHER_USER_ID)] == []
+    assert [j["canonical_id"] for j in await fetch_candidates(digest_conn, OTHER_USER_ID)] == ["a"]
+
+    # The boolean is still written and still says nothing about whose inbox it
+    # went to — which is why nothing reads it to decide any of the above.
+    assert (await digest_conn.snapshot())["a"]["notified"] == 1
+
+
+async def test_a_send_to_one_user_does_not_silence_a_job_for_another(digest_conn):
+    """The multi-user failure the whole table exists to prevent, stated directly.
+
+    Two users watching the same company, one shared job. Under the 1d conjunction
+    the first digest would have taken it away from the second user permanently
+    and left no trace anywhere — the expensive failure, silent, with the evidence
+    destroyed by the fix. Here each is told exactly once, independently, and the
+    order does not matter.
+    """
+    await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
+    await digest_conn.track_company(OTHER_USER_ID, 1)
+    await digest_conn.add_job("shared", title="Backend Engineer")
+
+    assert await record_sent(digest_conn, TEST_USER_ID, ["shared"], "2026-08-03-am") == 1
+    assert await record_sent(digest_conn, OTHER_USER_ID, ["shared"], "2026-08-03-am") == 1
+
+    assert await digest_conn.notification_pairs() == {
+        (TEST_USER_ID, "shared"),
+        (OTHER_USER_ID, "shared"),
+    }
+    for user in (TEST_USER_ID, OTHER_USER_ID):
+        assert [j["canonical_id"] for j in await fetch_candidates(digest_conn, user)] == []
+        assert await record_sent(digest_conn, user, ["shared"], "2026-08-04-am") == 0
 
 
 async def test_deleting_a_user_takes_their_notification_rows(digest_conn):
@@ -369,43 +413,68 @@ async def test_after_the_backfill_a_digest_sends_zero(digest_conn):
     assert await digest_conn.sent_log() == []
 
 
-async def test_without_the_backfill_the_same_digest_would_flood(digest_conn):
+async def test_without_any_suppression_the_same_history_would_flood(digest_conn):
     """The counterfactual, so the test above is evidence rather than a tautology.
 
-    Same twenty rows, backfill NOT run, and the per-user table read alone — which
-    is what 1d would do if the queue predicate dropped the boolean clause. Every
-    single historical match comes back as a candidate.
-
-    This is the failure being prevented, written down and executed once, so that
-    "the backfill matters" is a thing the suite demonstrates rather than a thing
-    the docstrings claim.
+    Twenty matching open rows that nothing has marked as history — not seeded,
+    not recorded against anyone. Every one is a candidate. That is what an
+    unprotected queue looks like, and it is the state the two suppressions exist
+    to keep the table out of.
     """
-    await seed_history(digest_conn, 20)
+    await unseeded_history(digest_conn, 20)
 
-    assert len(await queued_by_per_user_clause(digest_conn, TEST_USER_ID)) == 20, (
-        "unbackfilled, every historical match is queued again"
-    )
+    queued = await fetch_candidates(digest_conn, TEST_USER_ID)
+    assert len(queued) == 20, "with nothing marking them as history, all of them queue"
 
 
-async def test_the_silent_seed_stays_suppressed_by_the_boolean(digest_conn):
-    """The seed hole, and why the 1d queue is a conjunction rather than a swap.
+async def test_the_silent_seed_is_suppressed_by_the_seeded_flag(digest_conn):
+    """THE SECOND 1d TRIPWIRE, AND WHAT 1e REPLACED IT WITH.
 
-    crawler/store.mark_new stamps notified = TRUE across a whole back catalogue
-    on a company's first-ever crawl, and the crawl path is user-blind by design —
-    so those rows have NO per-user record and never will until 1e teaches the
-    seed to fan out. A queue reading only the new table would hand every one of
-    them to the next digest; one discovery sweep once seeded 6,496 rows.
+    This test used to be called ..._by_the_boolean and it asserted that
+    `notified = FALSE` in the queue predicate was what held a freshly-seeded back
+    catalogue back. That was true and it was the reason the 1d queue had to be a
+    conjunction — but the boolean was carrying two different facts, and the one
+    about a PERSON is why a job emailed to me disappeared from everyone else's
+    queue too.
 
-    Until 1e, the boolean is what holds them back. If this test fails, 1g dropped
-    the column too early.
+    1e separated them. "This row is back catalogue" is now jobs.seeded, written
+    by crawler/store.mark_new from the same `seeding` flag, read by the queue in
+    the exact position the boolean occupied. The crawl path still knows nothing
+    about users — a column describing a crawl is not a step towards that, and the
+    invariant tests below still say so.
+
+    So the property this file has always defended survives the rewrite: a
+    company's first-ever crawl reaches NOBODY's inbox. One discovery sweep once
+    seeded 6,496 rows in an afternoon, and every one of them is covered by this
+    clause rather than by 6,496 rows per user in the notification table.
+
+    If this fails, 1g dropped something it should not have.
     """
+    await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
+    await digest_conn.track_company(OTHER_USER_ID, 1)
     await seed_history(digest_conn, 5)
 
-    # Deliberately NOT backfilled: this is a company seeded after the migration.
+    # Nothing records these against anyone, and nothing needs to.
     assert await digest_conn.notification_pairs() == set()
 
+    for user in (TEST_USER_ID, OTHER_USER_ID):
+        queued = [j["canonical_id"] for j in await fetch_candidates(digest_conn, user)]
+        assert queued == [], "a silent seed is silent for every user, not just the first"
+
+
+async def test_the_seed_clause_is_what_holds_them_and_not_the_old_boolean(digest_conn):
+    """Which clause is doing the work — asked so 1g cannot answer it wrongly.
+
+    Same five back-catalogue rows, with the old global boolean cleared and only
+    jobs.seeded left standing. They stay out of the queue. This is 1g's dropping
+    of jobs.notified rehearsed in a test: if removing the column changed what a
+    digest contains, it would fail here rather than in an inbox.
+    """
+    await seed_history(digest_conn, 5)
+    await digest_conn.execute("UPDATE jobs SET notified = 0")
+
     queued = [j["canonical_id"] for j in await fetch_candidates(digest_conn, TEST_USER_ID)]
-    assert queued == [], "seeded rows have no per-user record; the boolean must still hold them"
+    assert queued == [], "seeded is the clause that suppresses; the boolean is vestigial"
 
 
 async def test_a_genuinely_new_job_still_reaches_the_queue(digest_conn):
@@ -424,7 +493,10 @@ async def test_a_genuinely_new_job_still_reaches_the_queue(digest_conn):
 
 
 @pytest.mark.parametrize("relative_path", CRAWL_PATH_FILES)
-@pytest.mark.parametrize("forbidden", ("user_job_notifications", "record_notified"))
+@pytest.mark.parametrize(
+    "forbidden",
+    ("user_job_notifications", "record_notified", "suppress_company_history"),
+)
 def test_no_crawl_path_module_mentions_per_user_notification_state(relative_path, forbidden):
     """The crawl stays user-blind, and this table must not be the thing that ends it.
 
@@ -441,9 +513,165 @@ def test_no_crawl_path_module_mentions_per_user_notification_state(relative_path
     statement since 1b (PREFERENCES_SQL), and the two functions enrichment calls
     from it touch no user state at all. The invariant is about what a crawl-path
     module itself says, because that is what an edit can change locally.
+
+    PHASE 1e ADDED A COLUMN TO THE CRAWL AND NOT A USER. crawler/store.mark_new
+    now writes jobs.seeded beside jobs.notified, and `seeded` is deliberately
+    absent from this forbidden list: it describes the CRAWL that stored the row —
+    user-blind, permanent, the same answer for everybody — which is precisely why
+    1e could put the silent-seed rule there instead of teaching the seed to fan
+    out. The temptation this table creates is unchanged and still forbidden: one
+    line in mark_new writing a per-user row would close the seed hole and make
+    seeding conditional on who exists, which is the fan-out, which lives in
+    notify/.
     """
     source = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
     assert forbidden not in source, f"{relative_path} must not reference {forbidden!r}"
+
+
+def test_the_queue_predicate_asks_three_questions_and_not_the_old_boolean():
+    """The statement itself, because the change of predicate IS the sub-phase.
+
+    The behavioural tests above prove what the queue returns. This one proves
+    what it asks, and exists because the two failure modes differ: a predicate
+    that returns the right rows today by coincidence of the data is one seeded
+    company away from returning the wrong ones.
+
+    `j.notified` must be ABSENT. While it was there, one user's send silenced a
+    job for everybody — the flattening 1d documented and 1e removed — and leaving
+    it in alongside the new clauses would look like belt-and-braces while being
+    exactly the bug.
+    """
+    from notify.store import CANDIDATES_IGNORING_NOTIFIED_SQL, CANDIDATES_SQL
+
+    assert "j.notified" not in CANDIDATES_SQL
+    assert "FROM user_companies uc" in CANDIDATES_SQL      # whose
+    assert "j.seeded = FALSE" in CANDIDATES_SQL            # what kind
+    assert "FROM user_job_notifications n" in CANDIDATES_SQL  # who already knows
+
+    # The preview query is deliberately none of the above: it answers "what would
+    # my filter pick out of everything open", which is the question
+    # `npm run match-parity` asks of the live database. Narrowing it to one
+    # person's watch list would make the two totals stop being comparable.
+    for clause in ("user_companies", "seeded", "user_job_notifications", "notified"):
+        assert clause not in CANDIDATES_IGNORING_NOTIFIED_SQL
+
+
+# --- the other half of the history hazard: starting to track ---------------
+
+
+async def test_tracking_a_company_does_not_deliver_its_history(digest_conn):
+    """THE 1e HAZARD, second ordering: the history is already there.
+
+    jobs.seeded covers a company's FIRST-EVER crawl. It says nothing about the
+    weeks of ordinary crawling afterwards, which leave perfectly normal open rows
+    that were never emailed to anybody — and the instant somebody starts tracking
+    that company, every one of them is in their queue. Two hundred jobs in one
+    email is the same cry-wolf failure by a different door.
+
+    So creating the pair records them. Note that these rows are NOT seeded and NOT
+    notified: nothing about them is special, which is exactly why the suppression
+    has to be attached to the act of tracking rather than to a property of a job.
+    """
+    await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
+    await unseeded_history(digest_conn, 20)
+
+    await track_companies(digest_conn, OTHER_USER_ID, [1])
+
+    queued = await fetch_candidates(digest_conn, OTHER_USER_ID)
+    assert queued == [], "a new watch list is a subscription, not a backfill"
+    assert await count_notified_for_user(digest_conn, OTHER_USER_ID) == 20
+
+
+async def test_a_job_arriving_after_you_track_still_reaches_you(digest_conn):
+    """The other direction, and the reason the suppression is a snapshot.
+
+    Suppressing "everything currently stored" is only correct if it happens once,
+    at the moment the pair is created. A job that appears afterwards is the whole
+    point of tracking the company, and it must come through — otherwise the
+    suppression would be an off switch nobody could see.
+    """
+    await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
+    await unseeded_history(digest_conn, 5)
+
+    await track_companies(digest_conn, OTHER_USER_ID, [1])
+    await digest_conn.add_job("posted-later", title="Backend Engineer")
+
+    queued = [j["canonical_id"] for j in await fetch_candidates(digest_conn, OTHER_USER_ID)]
+    assert queued == ["posted-later"]
+
+
+async def test_tracking_twice_does_not_swallow_the_jobs_that_arrived_since(digest_conn):
+    """The sharp edge, asserted rather than described.
+
+    Suppression records everything the company has RIGHT NOW. Running it against
+    a pair that already exists would therefore eat the person's actual queue,
+    silently. track_companies drives it from RETURNING — a company already
+    tracked yields no row and so suppresses nothing — which is what makes a
+    second run genuinely idempotent instead of idempotent-looking.
+    """
+    await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
+    await unseeded_history(digest_conn, 3)
+    await track_companies(digest_conn, OTHER_USER_ID, [1])
+
+    await digest_conn.add_job("arrived-since", title="Backend Engineer")
+    assert await track_companies(digest_conn, OTHER_USER_ID, [1]) == []
+
+    queued = [j["canonical_id"] for j in await fetch_candidates(digest_conn, OTHER_USER_ID)]
+    assert queued == ["arrived-since"], "re-tracking must not eat the queue"
+
+
+async def test_untracking_and_tracking_again_does_not_re_flood(digest_conn):
+    """Remove the pair, add it back. The history stays history.
+
+    The suppression rows survive the tracking row — they are about a person and a
+    job, not about a subscription — so the second track re-records a set that is
+    already recorded and inserts nothing. Anything stored in the meantime is
+    history the person genuinely did not ask to hear about, which is the same
+    answer they got the first time.
+    """
+    await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
+    await unseeded_history(digest_conn, 4)
+    await track_companies(digest_conn, OTHER_USER_ID, [1])
+
+    await digest_conn.execute(
+        "DELETE FROM user_companies WHERE user_id = $1 AND company_id = $2", OTHER_USER_ID, 1
+    )
+    await digest_conn.add_job("while-away", title="Backend Engineer")
+    await track_companies(digest_conn, OTHER_USER_ID, [1])
+
+    assert await fetch_candidates(digest_conn, OTHER_USER_ID) == []
+
+
+async def test_suppression_covers_closed_jobs_too(digest_conn):
+    """Every job of the company, not only the open ones.
+
+    A closed job is one reappearance away from being open again: UPSERT_SEEN sets
+    status='open' and miss_count=0 while keeping the row's identity. Scoping the
+    suppression to open rows would leave a hole exactly one flap wide, and
+    `reappeared` is the set the crawler most deliberately refuses to treat as
+    news.
+    """
+    await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
+    await digest_conn.add_job("was-closed", title="Backend Engineer", status="closed")
+
+    await track_companies(digest_conn, OTHER_USER_ID, [1])
+    await digest_conn.execute(
+        "UPDATE jobs SET status = 'open', miss_count = 0 WHERE canonical_id = $1", "was-closed"
+    )
+
+    assert await fetch_candidates(digest_conn, OTHER_USER_ID) == []
+
+
+async def test_tracking_suppresses_only_that_company(digest_conn):
+    """One company's history, not the catalog's. The pair is the unit."""
+    await digest_conn.add_company(2, "Otherco")
+    await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
+    await digest_conn.add_job("theirs", title="Backend Engineer", company_id=1)
+    await digest_conn.add_job("elsewhere", title="Backend Engineer", company_id=2)
+
+    await track_companies(digest_conn, OTHER_USER_ID, [1])
+
+    assert await digest_conn.notification_pairs() == {(OTHER_USER_ID, "theirs")}
 
 
 async def test_a_silent_day_sends_nothing_and_writes_nothing(digest_conn):

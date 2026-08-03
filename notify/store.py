@@ -3,7 +3,8 @@
 Five operations, and the split between them is the whole safety story:
 
     load_preferences           read the filter
-    fetch_candidates           read the queue  (open, and not yet notified to ME)
+    fetch_candidates           read the queue  (open, watched by THEM, not back
+                                                catalogue, not yet sent to THEM)
     fetch_enrichment_targets   read the jobs whose description is unread
     save_description_facts     write what reading a description taught us
     record_sent                write the receipt, ONLY after Resend returned an id
@@ -20,24 +21,25 @@ dashboard shows every open job that fits, emailed or not, so every open job that
 fits has to have had its description read. That difference is the whole bug fix;
 the digest's own queue is still fetch_candidates.
 
-NOTIFICATION STATE IS PER-USER SINCE PHASE 1d
-----------------------------------------------
-"Have I been told about this job" is a row in user_job_notifications, not the
-global jobs.notified boolean — see db/notifications.py and the table's comment
-block in db/schema.sql. fetch_candidates therefore takes a user_id, and
-record_sent takes one too.
+THE QUEUE IS ONE PERSON'S, SINCE PHASE 1e
+------------------------------------------
+fetch_candidates answers "what is open, in a company THIS user watches, not back
+catalogue, and not already sent to THEM" — three clauses, three different
+questions, spelled out above CANDIDATES_SQL. Every read in this module that
+decides anything now takes a user_id, and the fan-out in notify/digest.py calls
+them once per user.
 
-The boolean has NOT gone away and is still written, in the same transaction. It
-is the rollback net for the riskiest migration in Phase 1, it is the backfill's
-source of truth, and the dashboard still derives its NEW/NOTIFIED badge from it.
-1g drops it, after 1e proves the fan-out.
+The global jobs.notified boolean is no longer read here at all. It was doing two
+jobs at once: "this is back catalogue" (a fact about a crawl) and "somebody was
+emailed this" (a fact about a person). 1d moved the person half into
+user_job_notifications; 1e moved the crawl half into jobs.seeded, which
+crawler/store.mark_new writes from the same seeding flag — so the crawl path
+stays user-blind and the queue stops flattening two users into one.
 
-Which means the queue predicate is a CONJUNCTION rather than a swap, and the
-first half of it is doing real work: crawler/store.mark_new stamps notified=TRUE
-across a company's whole back catalogue on its first-ever crawl, and the crawl
-path is user-blind by design, so those rows have no per-user record and reading
-the new table alone would queue every one of them. See the schema comment for the
-obligation that hands to 1e.
+The boolean is still WRITTEN by record_sent, in the same transaction: it is the
+rollback net, it is the 1d backfill's source of truth, and the dashboard still
+derives its NEW/NOTIFIED badge from it. 1g drops it, and after 1e that drop is a
+no-op rather than a behaviour change.
 
 record_sent is deliberately the last thing that happens in a digest run, after
 the network call has already succeeded. That ordering is the same idea as the
@@ -98,31 +100,53 @@ SELECT j.canonical_id, j.title, j.location, j.city, j.url,
  ORDER BY c.name, j.title
 """
 
-# THE QUEUE, AND WHY IT IS TWO CLAUSES RATHER THAN ONE.
+# THE QUEUE — ONE USER'S, AND THREE CLAUSES THAT ANSWER THREE DIFFERENT
+# QUESTIONS. This is the Phase-1e fan-out, and the shape of it is the point:
 #
-# The second clause is the Phase-1d rule: this user has no row in
-# user_job_notifications for this job, so this user has not been told about it.
-# NOT EXISTS rather than a LEFT JOIN ... IS NULL because the question is
-# existence, the anti-join is what Postgres reads it as either way, and a LEFT
-# JOIN on a table with a UNIQUE (user_id, canonical_id) invites the reader to
-# wonder whether it can duplicate rows. It cannot; NOT EXISTS says so without
-# being asked.
+#   EXISTS user_companies    "is this job's company one you asked about?"
+#                            WHOSE — the watch list, per person. Before 1e the
+#                            digest considered the whole catalog, which was
+#                            correct only because one person tracked all of it.
+#   j.seeded = FALSE         "is this job back catalogue?"
+#                            WHAT KIND — a property of the crawl, user-blind and
+#                            permanent. This clause is the silent seed, and it
+#                            sits exactly where `j.notified = FALSE` sat in 1d.
+#   NOT EXISTS user_job_...  "have YOU been told about it?"
+#                            WHO ALREADY KNOWS — per person, since 1d.
 #
-# The FIRST clause is the old global boolean, and it is not vestigial. It is the
-# silent-seed suppressor: crawler/store.mark_new writes notified=TRUE across a
-# company's entire back catalogue on its first-ever crawl, and the crawl path
-# neither knows nor may learn who the users are (tests/test_user_companies.py
-# asserts that absence three ways). Those seeded rows therefore have no per-user
-# record at all, and a queue reading only the new table would hand every one of
-# them to the next digest — one discovery sweep once seeded 6,496 rows.
+# WHY THE BOOLEAN CLAUSE IS GONE, AND WHAT REPLACED IT. `j.notified = FALSE` was
+# never one rule. It meant "not seeded AND not emailed", and the second half of
+# that is a statement about a PERSON — which is why a job emailed to me silenced
+# it for everybody, the flattening tests/test_user_notifications.py spelled out
+# in 1d and the exact failure user_job_notifications exists to prevent. So the
+# two halves were separated rather than swapped: the person half moved into the
+# table (1d), and the crawl half moved into jobs.seeded, which crawler/store.
+# mark_new writes from the same `seeding` flag it always used. The crawl path
+# still knows nothing about users, and still may not.
 #
-# Today, with the backfill applied, the two clauses describe exactly the same
-# set, which is what makes 1d a no-op for the existing user. 1e teaches the seed
-# to fan out; 1g then drops the boolean and this clause together. Neither may
-# happen without the other.
+# EXISTS rather than a JOIN to user_companies, for the reason the NOT EXISTS
+# below already gives: the question is existence, Postgres reads both as a
+# semi-join anyway, and a JOIN invites the reader to wonder whether the row can
+# come back twice. It cannot — UNIQUE (user_id, company_id) — but EXISTS says so
+# without being asked, and keeps the SELECT list free of a table it never reads.
+#
+# $1 appears three times. asyncpg repeats a bound parameter natively and the test
+# shim's _translate maps placeholders in order of appearance precisely so that
+# works, so the statement the tests run is this one character for character.
+#
+# WHAT THIS DELIBERATELY DOES NOT ASK: companies.tracked. That is the crawl's
+# exclusion axis — a property of the catalog — and a person's watch list is a
+# property of a person. Conflating them would mean a dashboard toggle silently
+# emptying somebody else's digest. See db/watchlist.py.
 CANDIDATES_SQL = _CANDIDATES_TEMPLATE.format(
     queue_filter="""
-   AND j.notified = FALSE
+   AND EXISTS (
+         SELECT 1
+           FROM user_companies uc
+          WHERE uc.user_id = $1
+            AND uc.company_id = j.company_id
+       )
+   AND j.seeded = FALSE
    AND NOT EXISTS (
          SELECT 1
            FROM user_job_notifications n
@@ -135,6 +159,13 @@ CANDIDATES_SQL = _CANDIDATES_TEMPLATE.format(
 # --ignore-notified, which never writes: it answers "what WOULD my filter have
 # picked out of everything currently open", against a table whose rows are almost
 # all already notified.
+#
+# Deliberately NOT narrowed to the watch list by 1e, even though every other read
+# in this module now is. This statement is the matcher's own preview and its total
+# is what `npm run match-parity` is compared against — that check walks every open
+# row in the live database, so scoping this to one person's tracked companies
+# would make the two numbers stop meaning the same thing, silently, and the drift
+# would look like a matcher bug.
 #
 # Note that this one binds NO parameter, which is why fetch_candidates branches
 # on how it calls conn.fetch rather than passing user_id either way: asyncpg
@@ -252,9 +283,14 @@ async def fetch_candidates(
 ) -> list[Mapping[str, Any]]:
     """Rows eligible to be considered — before any filtering.
 
-    Eligible means open, and not yet notified TO THIS USER. Whether a job is
-    *interesting* is decided afterwards, by notify/match.py, over the rows this
-    returns.
+    Eligible means open, in a company THIS USER tracks, not stored by a silent
+    seed, and not yet notified TO THIS USER. Whether a job is *interesting* is
+    decided afterwards, by notify/match.py, over the rows this returns.
+
+    Note which of those four is not about the user: `seeded` is a property of the
+    crawl that stored the row, so it excludes the same rows for everybody. That
+    is what "the silent seed is silent for all of us" means, and it is the clause
+    that replaced the old global notified = FALSE.
 
     `user_id` is required rather than defaulted, and that is deliberate: a
     default would be a guess about whose queue this is, and the failure mode of

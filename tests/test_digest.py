@@ -91,15 +91,17 @@ async def lifecycle(conn) -> dict[str, dict]:
 # --- selection ------------------------------------------------------------
 
 
-async def test_only_unnotified_open_and_matching_jobs_are_selected(digest_conn):
+async def test_only_unsent_open_and_matching_jobs_are_selected(digest_conn):
     """Three independent filters, and all three have to agree.
 
-    The already-notified row is the one that matters: it matches the filter
-    perfectly and must still never appear, because it has been sent before.
+    The already-sent row is the one that matters: it matches the filter perfectly
+    and must still never appear, because this user has been told about it. Since
+    Phase 1e "told" means a user_job_notifications row rather than the global
+    boolean — see add_sent_job, which writes the state production writes.
     """
     await digest_conn.add_job("wanted", title="Backend Engineer")
     await digest_conn.add_job("also-wanted", title="Platform Engineer", location="Pune, India")
-    await digest_conn.add_job("already-sent", title="Backend Engineer", notified=True)
+    await digest_conn.add_sent_job("already-sent", title="Backend Engineer")
     await digest_conn.add_job("closed", title="Backend Engineer", status="closed")
     await digest_conn.add_job("wrong-city", title="Backend Engineer", location="Berlin, Germany")
     await digest_conn.add_job("excluded", title="Senior Backend Engineer")
@@ -114,9 +116,9 @@ async def test_only_unnotified_open_and_matching_jobs_are_selected(digest_conn):
     assert len(resend.calls) == 1
 
 
-async def test_a_matching_but_already_notified_job_is_never_re_sent(digest_conn):
-    """The exactly-once guarantee, stated directly."""
-    await digest_conn.add_job("sent-yesterday", title="Backend Engineer", notified=True)
+async def test_a_matching_but_already_sent_job_is_never_re_sent(digest_conn):
+    """The exactly-once guarantee, stated directly — per user, since 1d/1e."""
+    await digest_conn.add_sent_job("sent-yesterday", title="Backend Engineer")
 
     run = await run_digest(digest_conn, today=TODAY, sender=FakeResend())
 
@@ -141,10 +143,15 @@ async def test_zero_matches_sends_nothing_at_all(digest_conn):
 
 
 async def test_candidates_query_respects_the_queue_but_preview_can_ignore_it(digest_conn):
-    """--ignore-notified widens the read and only the read. It writes nothing."""
+    """--ignore-notified widens the read and only the read. It writes nothing.
+
+    Widened means the WHOLE queue filter goes: the watch list, jobs.seeded and
+    the per-user rows alike. That is what keeps its total comparable with
+    `npm run match-parity`, which walks every open row in the live database.
+    """
     await digest_conn.add_job("queued", title="Backend Engineer")
-    await digest_conn.add_job("sent", title="Backend Engineer", notified=True)
-    await digest_conn.add_job("closed", title="Backend Engineer", status="closed", notified=True)
+    await digest_conn.add_sent_job("sent", title="Backend Engineer")
+    await digest_conn.add_sent_job("closed", title="Backend Engineer", status="closed")
 
     assert {j["canonical_id"] for j in await fetch_candidates(digest_conn, TEST_USER_ID)} == {"queued"}
     everything = await fetch_candidates(digest_conn, TEST_USER_ID, ignore_notified=True)
@@ -371,7 +378,8 @@ async def test_record_sent_on_an_empty_list_is_a_no_op(digest_conn):
 
 
 def test_sending_anywhere_but_my_email_is_refused_before_the_network():
-    with pytest.raises(DigestError, match="may only go to MY_EMAIL"):
+    """Under the sandbox sender, which is what this install actually uses."""
+    with pytest.raises(DigestError, match="can only deliver to the address"):
         assert_self_send("onboarding@resend.dev", "someone@else.test", "me@example.test")
 
 
@@ -384,11 +392,26 @@ def test_my_own_address_passes_regardless_of_case():
     assert_self_send("onboarding@resend.dev", "Me@Example.TEST", "me@example.test") is None
 
 
+def test_a_verified_domain_may_send_to_someone_else():
+    """The Phase-1e narrowing: the guard fires for its REASON, not as an absolute.
+
+    The restriction has always been a property of onboarding@resend.dev — the
+    error message said so before this changed. Stated as "only MY_EMAIL, ever",
+    it would refuse every second user's digest permanently and verifying a domain
+    would fix nothing, which turns a deliverability limit into a product one.
+
+    This install still uses the sandbox sender, so nothing about today moves; the
+    test above is the one describing the live configuration.
+    """
+    assert_self_send("digest@job-radar.test", "someone@else.test", "me@example.test") is None
+
+
 async def test_run_digest_refuses_a_foreign_recipient_without_sending(digest_conn):
+    """A mistyped recipient never reaches the network, and writes nothing."""
     await digest_conn.add_job("a", title="Backend Engineer")
     resend = FakeResend()
 
-    with pytest.raises(DigestError, match="may only go to MY_EMAIL"):
+    with pytest.raises(DigestError, match="can only deliver to the address"):
         await run_digest(digest_conn, to="attacker@elsewhere.test", sender=resend)
 
     assert resend.calls == []

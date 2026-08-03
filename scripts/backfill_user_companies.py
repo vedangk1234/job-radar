@@ -29,6 +29,14 @@ Idempotent, and the guard is the table's own UNIQUE (user_id, company_id) via
 ON CONFLICT DO NOTHING rather than a check in Python. A second run inserts
 nothing, reports "already tracking N companies", and cannot duplicate a row.
 
+SINCE PHASE 1e THIS ALSO SUPPRESSES HISTORY, because creating a tracking row now
+has two halves — see db/watchlist.track_companies. For the original user that is
+a no-op (the 1d backfill already recorded every notified job against them, and
+the rest of the catalog's rows were already in their queue before any of this
+existed). For a SECOND user run through this script it is the whole safety story:
+fifty companies' stored jobs would otherwise be their first digest. The count is
+reported below so that no-op is visible rather than assumed.
+
     python scripts/backfill_user_companies.py
 """
 
@@ -43,6 +51,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from db.connection import get_crawler_conn  # noqa: E402
+from db.notifications import count_notified_for_user  # noqa: E402
 from db.users import resolve_current_user_id  # noqa: E402
 from db.watchlist import (  # noqa: E402
     catalog_company_ids,
@@ -94,7 +103,9 @@ async def main() -> int:
         # new company invisible instead of named.)
         catalog_before = await catalog_company_ids(conn)
 
+        suppressed_before = await count_notified_for_user(conn, user_id)
         newly_tracked = await track_all_companies(conn, user_id)
+        suppressed_after = await count_notified_for_user(conn, user_id)
 
         tracked_after = await tracked_company_ids(conn, user_id)
         catalog_after = await catalog_company_ids(conn)
@@ -113,6 +124,15 @@ async def main() -> int:
     print(
         f"catalog: {len(catalog_before)} company/ies at snapshot; "
         f"user_companies: {len(tracked_after)} row(s) for this user."
+    )
+
+    # The Phase-1e half. Zero is the expected number for the ORIGINAL user and is
+    # printed rather than skipped, because "nothing was suppressed" and "the
+    # suppression did not run" look identical in an inbox six hours later.
+    suppressed = suppressed_after - suppressed_before
+    print(
+        f"history suppressed: {suppressed} job(s) recorded as already-notified for "
+        f"this user, so newly-tracked companies do not deliver their back catalogue."
     )
 
     # A company that appeared while this ran. Named rather than counted, because

@@ -89,6 +89,47 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS desc_checked_at   TIMESTAMPTZ;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS applied    BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ;
 
+-- jobs.seeded — "this row was stored during a company's first-ever crawl."
+--
+-- THE SEED MARKER, TAKEN OUT OF notified. Until Phase 1e the crawl recorded a
+-- silent seed by writing notified = TRUE across the whole back catalogue, and
+-- that one column was carrying two unrelated facts:
+--
+--     "this row is back catalogue"   a property of the CRAWL. User-blind,
+--                                    permanent, and true for everybody forever.
+--     "somebody was emailed this"    a property of a PERSON — which is exactly
+--                                    why 1d moved it into user_job_notifications.
+--
+-- Conflating them is why the 1d queue had to be a CONJUNCTION: read the per-user
+-- table alone and the seed meaning has nowhere left to live, so a freshly-seeded
+-- back catalogue walks straight into the next digest. One discovery sweep once
+-- seeded 6,496 rows in an afternoon.
+--
+-- So this column takes the first fact and keeps it where the crawl can write it
+-- without learning anything about users. crawler/store.mark_new writes it in the
+-- same statement it writes notified, from the same `seeding` flag decided by
+-- scripts/crawl.py from the company's stored row count. The crawl path stays
+-- user-blind — tests/test_user_companies.py and tests/test_user_notifications.py
+-- both still assert that absence three ways, and a column about a crawl event is
+-- not a step towards it.
+--
+-- READ BY THE QUEUE, in the place notified = FALSE used to sit. See
+-- notify/store.CANDIDATES_SQL: a seeded row is never emailed to anyone, ever,
+-- which is precisely what "silent seed" has always meant. What that buys is that
+-- 1g's drop of `notified` becomes a genuine no-op instead of a behaviour change
+-- with an inbox-shaped failure mode.
+--
+-- NOT NULL DEFAULT FALSE, so the ALTER backfills every existing row to "not
+-- seeded" — which is the SAFE direction and deliberately not the accurate one.
+-- FALSE means "eligible for someone's queue", and every historical row that
+-- really was seeded already carries a user_job_notifications row naming the one
+-- existing user (the 1d backfill), so nothing enters a queue it was not already
+-- in. scripts/backfill_seeded_flag.py is what then makes the column HONEST about
+-- history, and it gates on exactly that: it refuses to stamp a row that is not
+-- already covered for every user who tracks its company, so a mistake in the
+-- reconstruction cannot remove anything from anybody's digest.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS seeded BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- One-time re-open of the rows the OLD enrichment marked checked without ever
 -- reading anything. Before crawler/enrich.py existed, enrichment ran only in
 -- the digest path, and notify/description.fetch_description had no route for
@@ -140,9 +181,16 @@ CREATE TABLE IF NOT EXISTS notifications (
 -- the database and not in a Python constant: the Step 5 dashboard edits it
 -- with an UPDATE, and the very next digest obeys it. No redeploy, no commit.
 --
--- Exactly one row, forever. The CHECK plus the fixed default is what enforces
--- that — every INSERT lands on id=1 and collides with the row already there,
--- so "the preferences" is never an ambiguous question.
+-- Exactly one row, forever — as this table was FIRST created. The CHECK plus
+-- the fixed default enforced that: every INSERT landed on id=1 and collided with
+-- the row already there, so "the preferences" was never an ambiguous question.
+--
+-- That is no longer true and the statement is left standing only because
+-- CREATE TABLE IF NOT EXISTS never re-runs against a live database. Phase 1b
+-- gave the row an OWNER (user_id, below) and Phase 1e took the CHECK back off,
+-- because a fan-out with one filter is not a fan-out. Read on to the
+-- DROP CONSTRAINT near the bottom of this block; the rule now is one row per
+-- USER, enforced by preferences_one_per_user_idx.
 CREATE TABLE IF NOT EXISTS preferences (
   id          INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
   cities      TEXT[] NOT NULL DEFAULT '{}',  -- city labels to include; see fetchers/normalize.city_label
@@ -312,6 +360,41 @@ ALTER TABLE preferences ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES public.
 CREATE UNIQUE INDEX IF NOT EXISTS preferences_one_per_user_idx
     ON preferences (user_id) WHERE user_id IS NOT NULL;
 
+-- THE ONE-ROW CAP COMES DOWN HERE. Phase 1e, and the sub-phase the paragraph
+-- above predicted: "whichever sub-phase first needs a second preferences row".
+--
+-- The fan-out sends each user a digest of their own matches, and "their own
+-- matches" is meaningless while the whole table is capped at one filter. Two
+-- users with the same filter would not test isolation at all — it is the second
+-- FILTER that proves a digest was computed for a person rather than for the
+-- install. So the CHECK goes, and with it the fixed DEFAULT 1, which would make
+-- every unqualified INSERT collide with the row already there.
+--
+-- WHAT DOES NOT CHANGE: preferences_one_per_user_idx above still allows exactly
+-- one row per user. This lifts the cap on the TABLE, not the rule about a
+-- PERSON, and named multi-profiles stay exactly where the index comment left
+-- them — one DROP INDEX away, not accidentally opened by this.
+--
+-- DROP CONSTRAINT IF EXISTS is the one idempotent shape available: Postgres has
+-- no ADD CONSTRAINT IF NOT EXISTS (which is why the rule above is an index), but
+-- it does have this, so the removal stays a plain re-runnable statement like
+-- every other line in this file. preferences_id_check is the name Postgres gives
+-- an inline column CHECK: <table>_<column>_check.
+ALTER TABLE preferences DROP CONSTRAINT IF EXISTS preferences_id_check;
+
+-- id needs a real sequence now that more than one row may exist. Three
+-- statements rather than a type change, because ALTER COLUMN ... TYPE SERIAL is
+-- not a thing Postgres accepts — SERIAL is sugar for exactly this trio, and
+-- spelling it out is also what makes each part independently idempotent.
+--
+-- setval to the current maximum rather than to a literal: the existing row is
+-- id=1 today, but this file has to be correct against a database that has
+-- already grown a few. COALESCE covers the empty table, which is the state a
+-- fresh install applies this in.
+CREATE SEQUENCE IF NOT EXISTS preferences_id_seq OWNED BY preferences.id;
+ALTER TABLE preferences ALTER COLUMN id SET DEFAULT nextval('preferences_id_seq');
+SELECT setval('preferences_id_seq', COALESCE((SELECT max(id) FROM preferences), 1));
+
 -- user_companies: which user watches which company. The schema behind
 -- "crawl once, fan out" — and it is only the first half of that phrase.
 --
@@ -473,27 +556,47 @@ CREATE INDEX IF NOT EXISTS user_job_notifications_job_idx
 --      sub-phase. Dual-writing is what keeps those badges honest without
 --      touching any TypeScript in 1d.
 --
--- THE OBLIGATION 1e INHERITS, WRITTEN DOWN SO IT CANNOT BE FORGOTTEN.
--- The 1d digest queue is a CONJUNCTION, not a straight swap:
+-- THE OBLIGATION 1d HANDED TO 1e, AND HOW 1e DISCHARGED IT.
+-- The 1d digest queue was a CONJUNCTION, not a straight swap:
 --
 --     AND j.notified = FALSE
 --     AND NOT EXISTS (SELECT 1 FROM user_job_notifications n
 --                      WHERE n.user_id = $1 AND n.canonical_id = j.canonical_id)
 --
--- The second clause is the new per-user rule. The FIRST clause is still load
--- bearing, and it is load bearing on the CRAWL path: crawler/store.mark_new
--- writes notified = TRUE for a company's whole back catalogue on its first-ever
--- crawl (the silent seed), and the crawl path is user-blind by design and must
--- stay that way — tests/test_user_companies.py asserts that absence three ways.
--- Those seeded rows therefore have NO row in this table. Reading this table
--- alone would put an entire freshly-seeded back catalogue into the digest queue;
--- one discovery sweep once seeded 6,496 rows in a single afternoon.
+-- The second clause was the new per-user rule. The first was load bearing on the
+-- CRAWL path: crawler/store.mark_new writes a company's whole back catalogue
+-- notified = TRUE on its first-ever crawl (the silent seed), the crawl path is
+-- user-blind by design, and those seeded rows therefore have NO row in this
+-- table. Reading this table alone would have put an entire freshly-seeded back
+-- catalogue into the digest queue — one discovery sweep once seeded 6,496 rows
+-- in a single afternoon.
 --
--- So the boolean remains the SILENT-SEED SUPPRESSOR until 1e teaches the seed to
--- fan out (or replaces the seed marker outright). Until that is done, dropping
--- either the column or the first clause re-opens exactly the flood this table
--- was introduced to prevent. 1e does the fan-out; 1g drops the column; neither
--- may happen before the other.
+-- 1e took the second of the two options that paragraph named: it REPLACED THE
+-- SEED MARKER OUTRIGHT. jobs.seeded now carries "this row is back catalogue",
+-- written by the same crawl statement, read by the queue in the exact position
+-- notified = FALSE used to occupy. The queue is now
+--
+--     AND EXISTS     (user_companies for this user and this job's company)
+--     AND j.seeded = FALSE
+--     AND NOT EXISTS (user_job_notifications for this user and this job)
+--
+-- which is per-user in the two places that decide, and user-blind in the one
+-- that describes a crawl. See notify/store.CANDIDATES_SQL.
+--
+-- WHAT STILL PUTS ROWS IN THIS TABLE WITHOUT AN EMAIL. The seed is one half of
+-- the history hazard; the other is a user who starts tracking a company that
+-- ALREADY has stored history — those rows are not seeded (they accumulated at
+-- notified = FALSE over weeks) and would be that person's first digest, in bulk.
+-- db/watchlist.track_companies creates the pair and records that history as
+-- already-notified for them IN ONE TRANSACTION. Such a row means "this person
+-- will never be emailed about this job", which is what every row here has always
+-- meant; notified_at stays record-keeping and nothing branches on it.
+--
+-- jobs.notified is now genuinely vestigial as a READ: nothing reads it to decide
+-- anything except the dashboard's NEW/NOTIFIED badge (1f). It is still WRITTEN,
+-- by record_sent and by mark_new, for the three reasons below, and 1g drops it —
+-- a drop that is now a no-op rather than a behaviour change, which was the whole
+-- point of doing 1e first.
 --
 -- No seed row here, for the same reason public.users and user_companies have
 -- none: the only user is a real person resolved from MY_EMAIL at runtime and

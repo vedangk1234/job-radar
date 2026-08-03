@@ -4,16 +4,24 @@ The jobs table is the crawler's only memory. There is no snapshot table: the
 rows themselves are the previous snapshot, which means these helpers must be
 careful about which columns they are allowed to overwrite.
 
-Three columns are write-once and are never stomped by a routine re-sighting:
+Four columns are write-once and are never stomped by a routine re-sighting:
 
     first_seen_at  our own observation of when a posting appeared. Set by
                    mark_new on brand-new rows only. This is the timestamp the
                    digest will show, and it must not drift when a recruiter
                    edits the title.
-    notified       the queue flag Step 4 reads. Set by mark_new once. An upsert
-                   must never reset it to FALSE, or every crawl would re-alert
-                   the entire board.
+    seeded         "this row is back catalogue" — set by mark_new on a company's
+                   first-ever crawl. Since Phase 1e this is what keeps a silent
+                   seed out of every user's digest, so an upsert clearing it
+                   would hand a whole back catalogue to the next send.
+    notified       the old global boolean. Set by mark_new once, and still
+                   written by notify/store.record_sent; the authority moved to
+                   per-user state in Phase 1d and 1g drops this column.
     canonical_id   the identity itself.
+
+Both flags are absent from UPSERT_SEEN's ON CONFLICT clause, which is what makes
+"a re-sighting cannot re-queue a job" a property of the SQL rather than a rule
+the write path has to remember.
 
 And one column is never written at all: the job description. It is not fetched,
 not normalised, not stored. Metadata only — that is what keeps this on a free
@@ -59,9 +67,13 @@ ON CONFLICT (canonical_id) DO UPDATE
        miss_count       = 0,
        status           = 'open'
 """
-# On conflict: first_seen_at and notified are absent by design (see module
-# docstring). status='open' + miss_count=0 is what REOPENS a closed job that
-# came back, and what forgives a job that missed one or two fetches.
+# On conflict: first_seen_at, notified and seeded are absent by design (see
+# module docstring). `seeded` is absent from the INSERT list too, taking its
+# column default of FALSE — mark_new sets it a moment later for the rows the diff
+# actually called new, which is the only place that knows whether this is a
+# company's first-ever crawl. status='open' + miss_count=0 is what REOPENS a
+# closed job that came back, and what forgives a job that missed one or two
+# fetches.
 
 
 def _chunks(items: Sequence[str]) -> Iterable[Sequence[str]]:
@@ -150,15 +162,37 @@ async def upsert_seen(conn, company_id: int, fetched_jobs: Mapping[str, Mapping[
 
 
 async def mark_new(conn, ids: Iterable[str], notified: bool) -> int:
-    """Stamp first_seen_at and set the notify flag on brand-new rows.
+    """Stamp first_seen_at and record the silent seed on brand-new rows.
 
     Called only with diff_snapshots().truly_new, so "brand-new" is already
     established by set membership rather than re-derived from the row.
 
-    `notified` is the silent-seed switch. TRUE on a seed run means "consider
-    these already sent" and the backlog never reaches an inbox; FALSE on every
-    later run leaves the row sitting in the queue for Step 4 to pick up. No
-    email is sent from here — this flag IS the queue.
+    `notified` is the silent-seed switch, and since Phase 1e it writes TWO
+    columns from that one flag — deliberately, because the flag was always
+    carrying two different facts and only one of them belongs to a crawl:
+
+        seeded    "this row is back catalogue". A property of THIS CRAWL:
+                  user-blind, permanent, and true for everybody forever. Since
+                  1e this is what the digest queue reads, in the exact position
+                  notified = FALSE used to sit (notify/store.CANDIDATES_SQL), so
+                  a seeded row is never emailed to anyone, ever.
+        notified  "somebody was emailed this". A property of a PERSON, which is
+                  why 1d moved that authority out of this table altogether.
+                  Still written here so the boolean stays an accurate rollback
+                  net and the dashboard's NEW/NOTIFIED badge stays honest; 1g
+                  drops it.
+
+    Writing both from one parameter is the point rather than a shortcut: on a
+    seed run they are the same statement about the same rows, and separating
+    them into two writes would invite exactly one of the pair to be forgotten.
+
+    This function still knows nothing about users, and must not. It is handed a
+    set of ids and a boolean; who cares about those jobs is a question the notify
+    path asks, and the crawl-path invariant tests assert that absence across
+    every module a crawl executes — by name, so a docstring cannot break it
+    either.
+
+    No email is sent from here.
     """
     ids = list(ids)
     if not ids:
@@ -167,7 +201,7 @@ async def mark_new(conn, ids: Iterable[str], notified: bool) -> int:
     total = 0
     for chunk in _chunks(ids):
         sql = (
-            "UPDATE jobs SET first_seen_at = now(), notified = $1 "
+            "UPDATE jobs SET first_seen_at = now(), notified = $1, seeded = $1 "
             f"WHERE canonical_id IN ({_placeholders(len(chunk), 2)})"
         )
         rows = await conn.fetch(sql + " RETURNING canonical_id", notified, *chunk)

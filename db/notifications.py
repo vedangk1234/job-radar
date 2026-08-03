@@ -21,7 +21,23 @@ The digest's own queue read is NOT here. It lives in notify/store.CANDIDATES_SQL
 because it is one statement joining jobs to companies and splitting it across two
 modules to isolate four lines of predicate would make the query harder to read
 than the coupling it removed. What lives here is everything that writes this
-table, plus the two statements the backfill's gate is built from.
+table, plus the statements the two backfills' gates are built from.
+
+TWO KINDS OF ROW, AND NEITHER IS A LIE
+--------------------------------------
+Most rows here are receipts: notify/store.record_sent wrote them after Resend
+returned an id. The rest were written because the job must NEVER be emailed to
+that person — the 1d backfill of everything the old boolean covered, and (since
+1e) SUPPRESS_COMPANY_HISTORY_SQL, which records a company's existing jobs the
+moment somebody starts tracking it. Both kinds say the same thing to the queue,
+which is the only thing that reads them: this person will not be told about this
+job. What they do not share is a `notifications` receipt, and that is honest —
+one was sent, the other never will be.
+
+The silent seed is deliberately NOT handled by writing rows here. It is a
+property of a crawl rather than of a person, so it lives in jobs.seeded and the
+queue reads it directly; see db/schema.sql for why that is the shape that lets
+1g drop the old boolean without changing behaviour.
 
 SQL portability note (same as crawler/store.py and notify/store.py): these stay
 inside the subset Postgres and SQLite agree on, so the tests run them against the
@@ -51,8 +67,7 @@ CHUNK = 400
 # scripts/backfill_user_notifications.py exists so that outcome cannot be reached
 # by believing a migration succeeded when it did not.
 #
-# INSERT ... SELECT rather than a Python loop, for the reason
-# db/watchlist.TRACK_ALL_COMPANIES_SQL gives: the set is decided by the database
+# INSERT ... SELECT rather than a Python loop: the set is decided by the database
 # at the instant the statement runs, so there is no window in which "which jobs
 # are notified" and "record them" can disagree.
 #
@@ -70,11 +85,12 @@ CHUNK = 400
 # would be inventing a fact, and db/schema.sql spells out why nothing may ever
 # branch on it.
 #
-# No `WHERE TRUE` disambiguator is needed here, unlike TRACK_ALL_COMPANIES_SQL.
-# That trick exists because SQLite cannot parse INSERT ... SELECT ... ON CONFLICT
-# when the SELECT has no WHERE clause (it reads `ON` as beginning a join). This
-# statement has a real predicate in that position, so it parses in both engines
-# and the tests run it character for character.
+# No `WHERE TRUE` disambiguator is needed here, and it is worth knowing why the
+# question comes up: SQLite cannot parse INSERT ... SELECT ... ON CONFLICT when
+# the SELECT has no WHERE clause — it reads `ON` as beginning a join — and
+# documents `WHERE true` as the fix. This statement has a real predicate in that
+# position, so it parses in both engines and the tests run it character for
+# character.
 BACKFILL_SQL = """
 INSERT INTO user_job_notifications (user_id, canonical_id)
 SELECT $1, j.canonical_id
@@ -105,6 +121,48 @@ RETURNING canonical_id
 RECORD_NOTIFIED_TEMPLATE = """
 INSERT INTO user_job_notifications (user_id, canonical_id)
 VALUES {rows}
+ON CONFLICT (user_id, canonical_id) DO NOTHING
+RETURNING canonical_id
+"""
+
+
+# THE OTHER HALF OF THE HISTORY HAZARD — a person, not a crawl.
+#
+# jobs.seeded keeps a company's FIRST-EVER crawl out of everyone's digest. It
+# does nothing about the other way history reaches a new inbox: a user starts
+# tracking a company that has been in the catalog for weeks, whose recent
+# postings are perfectly ordinary rows — not seeded, never emailed to anyone,
+# sitting open. Nothing about those rows is special, and that is the problem:
+# there can be hundreds, and they would all be that person's first digest.
+#
+# So the moment a (user, company) pair is created, every job stored for that
+# company becomes that user's history and is recorded here. "You start hearing
+# about a company when you add it, not from its archive."
+#
+# THE ROWS THIS WRITES MEAN WHAT EVERY ROW HERE MEANS: this person will never be
+# emailed about this job. They carry no receipt because no email was sent, which
+# is the same shape the 1d backfill's rows have, and notified_at takes its
+# DEFAULT for the same reason — it records when the state was written, nothing
+# branches on it, and inventing a send date would be the mistake source_posted_at
+# exists to name.
+#
+# EVERY job of that company, not just the open ones. A closed job that reopens
+# gets status='open' and miss_count=0 back from crawler/store.UPSERT_SEEN while
+# keeping its identity — so scoping this to open rows would leave a hole that
+# takes exactly one flap to walk through, and `reappeared` is precisely the set
+# the crawler refuses to treat as news.
+#
+# INSERT ... SELECT rather than a Python loop, the same argument BACKFILL_SQL
+# above makes: the set is decided by the database at the instant the statement
+# runs, so there is no window between "which jobs does this company have" and
+# "record them" for the two answers to disagree. The
+# caller runs it in the same transaction as the tracking row itself, which closes
+# the same window one level up.
+SUPPRESS_COMPANY_HISTORY_SQL = """
+INSERT INTO user_job_notifications (user_id, canonical_id)
+SELECT $1, j.canonical_id
+  FROM jobs j
+ WHERE j.company_id = $2
 ON CONFLICT (user_id, canonical_id) DO NOTHING
 RETURNING canonical_id
 """
@@ -154,6 +212,40 @@ COUNT_MINE_SQL = "SELECT count(*) FROM user_job_notifications WHERE user_id = $1
 
 COUNT_NOTIFIED_JOBS_SQL = "SELECT count(*) FROM jobs WHERE notified = TRUE"
 
+# THE 1e GATE: "would stamping seeded take anything out of anybody's queue?"
+#
+# Every (user, job) pair where the job is back catalogue, the user watches its
+# company, and nothing here says they have been told. Since 1e the queue reads
+# `j.seeded = FALSE`, so each such pair is a job that WAS in that user's digest
+# queue and now is not — which for a genuine seed is the entire intention, and
+# for a mis-stamped row is a job silently deleted from someone's inbox with no
+# trace anywhere.
+#
+# scripts/backfill_seeded_flag.py runs this before and after its UPDATE and
+# refuses to keep the change unless the number is unmoved. That is what makes the
+# historical reconstruction safe INDEPENDENTLY of whether its derivation is
+# right: the rows it stamps are already covered per-user by the 1d backfill, so
+# a wrong guess about which of them were seeded cannot change what anyone is
+# sent. The derivation and the migration stop depending on each other.
+#
+# Joined across every user rather than scoped to one, unlike the gates above:
+# this asks about the fan-out as a whole, and a second account is exactly the
+# case it has to catch.
+SEEDED_BUT_UNCOVERED_SQL = """
+SELECT count(*)
+  FROM jobs j
+  JOIN user_companies uc ON uc.company_id = j.company_id
+ WHERE j.seeded = TRUE
+   AND NOT EXISTS (
+         SELECT 1
+           FROM user_job_notifications n
+          WHERE n.user_id = uc.user_id
+            AND n.canonical_id = j.canonical_id
+       )
+"""
+
+COUNT_SEEDED_JOBS_SQL = "SELECT count(*) FROM jobs WHERE seeded = TRUE"
+
 
 def _chunks(items: Sequence[str]) -> Iterable[Sequence[str]]:
     for start in range(0, len(items), CHUNK):
@@ -187,6 +279,42 @@ async def record_notified(conn, user_id: Any, canonical_ids: Iterable[str]) -> i
         rows = await conn.fetch(record_notified_sql(len(chunk)), user_id, *chunk)
         inserted += len(rows)
     return inserted
+
+
+async def suppress_company_history(conn, user_id: Any, company_id: int) -> list[str]:
+    """Record this company's stored jobs as already-notified for this user.
+
+    Returns the canonical_ids genuinely inserted. Called when a (user, company)
+    pair is created — see db/watchlist.track_companies, which runs it in the same
+    transaction as the tracking row, so there is no instant in which the pair
+    exists and its history does not.
+
+    Not wrapped in a transaction here for that reason: the caller holds one, and
+    a nested one would claim a guarantee this function cannot make on its own.
+
+    An empty list means every job of that company was already recorded for this
+    user — the ordinary result of untracking and re-tracking, which is exactly
+    the case that must not re-flood an inbox.
+    """
+    rows = await conn.fetch(SUPPRESS_COMPANY_HISTORY_SQL, user_id, company_id)
+    return [row["canonical_id"] for row in rows]
+
+
+async def count_seeded_uncovered(conn) -> int:
+    """Seeded jobs a watching user has no notification row for. The 1e gate.
+
+    Since the queue reads `seeded = FALSE`, every pair this counts is a job that
+    left someone's queue without an email. For a real silent seed that is the
+    whole point; for a mis-stamped row it is a job silently withheld. So the
+    number is not required to be zero — it is required not to MOVE when the
+    historical backfill runs. See SEEDED_BUT_UNCOVERED_SQL.
+    """
+    return int(await conn.fetchval(SEEDED_BUT_UNCOVERED_SQL))
+
+
+async def count_seeded_jobs(conn) -> int:
+    """How many jobs are marked as back catalogue."""
+    return int(await conn.fetchval(COUNT_SEEDED_JOBS_SQL))
 
 
 async def count_notified_for_user(conn, user_id: Any) -> int:

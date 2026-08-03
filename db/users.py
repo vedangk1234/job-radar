@@ -49,6 +49,27 @@ PLACEHOLDER_EMAIL = "you@example.com"
 # no search_path at all. See the users block in db/schema.sql.
 CURRENT_USER_SQL = "SELECT id FROM public.users WHERE lower(email) = lower($1)"
 
+# Everyone the fan-out sends to. NOT part of the MY_EMAIL bridge — this one
+# outlives Phase 2, because "which accounts get a digest this hour" is a question
+# about the database rather than about whose laptop is running the script.
+#
+# is_active is the account-level off switch the users table has carried since 1a
+# with nothing reading it. This is what reads it: a deactivated account keeps its
+# preferences, its watch list and its notification history, and stops receiving
+# email. Deleting the row would also stop the email and would take all three with
+# it — which is a different decision, and one nobody can undo.
+#
+# ORDER BY lower(email) so a fan-out run is deterministic. Nothing depends on the
+# order today; a run whose output moves between invocations for no reason is
+# harder to compare against yesterday's, and the two-user verification in
+# Phase 1e is exactly such a comparison.
+DIGEST_USERS_SQL = """
+SELECT id, email
+  FROM public.users
+ WHERE is_active = TRUE
+ ORDER BY lower(email)
+"""
+
 
 def current_user_email() -> str:
     """MY_EMAIL from .env, lowercased, or a clear error naming what is missing.
@@ -73,6 +94,51 @@ def current_user_email() -> str:
         raise RuntimeError(f"MY_EMAIL does not look like an email address: {email!r}")
 
     return email
+
+
+USER_EMAIL_SQL = "SELECT email FROM public.users WHERE id = $1"
+
+
+async def email_for_user(conn, user_id: Any) -> str:
+    """Where this user's digest goes. A property of the person, not of the run.
+
+    Phase 1e needs this because the recipient stopped being a constant. Before
+    the fan-out there was one digest and it went to MY_EMAIL; now there is one
+    digest PER USER, and defaulting any of them to the environment would mean
+    computing a second person's matches and posting them to my inbox — a failure
+    that sends a real email, passes assert_self_send, and looks like a working
+    system.
+
+    Raises rather than returning None. The id was itself read out of this table,
+    so a miss here is a row deleted mid-run or the wrong database entirely, and
+    neither is something to send email through.
+    """
+    email = await conn.fetchval(USER_EMAIL_SQL, user_id)
+    if email is None:
+        raise RuntimeError(
+            f"no public.users row for {user_id!r}: cannot decide where this "
+            f"digest should go, so nothing is sent."
+        )
+    return str(email)
+
+
+async def digest_users(conn) -> list[tuple[Any, str]]:
+    """[(user_id, email)] for every active account, in a stable order.
+
+    The fan-out's recipient list. An empty list is a real answer — an install
+    with no active account sends nothing — and the caller reports it rather than
+    treating it as a failure, because "nobody is due a digest" is the same kind of
+    outcome as "nothing matched".
+
+    Note what this does NOT do: check that each user has a preferences row or a
+    watch list. Those are that user's own business and each has its own defined
+    behaviour further down (a filter falls back, an empty watch list matches
+    nothing). Answering "who exists" and "what do they want" in one query would
+    make a user with no watch list indistinguishable from a user who was never
+    there.
+    """
+    rows = await conn.fetch(DIGEST_USERS_SQL)
+    return [(row["id"], row["email"]) for row in rows]
 
 
 async def resolve_current_user_id(conn) -> Any:

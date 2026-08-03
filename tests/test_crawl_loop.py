@@ -36,12 +36,19 @@ async def queued(conn) -> set[str]:
 # --- (a) the silent seed --------------------------------------------------
 
 
-async def test_seed_run_stores_every_job_already_notified(conn):
+async def test_seed_run_stores_every_job_as_back_catalogue(conn):
     """A first-ever crawl records the whole back catalogue and alerts on none.
 
     This is the guard against sending 3000 emails on day one. Every job on the
-    board looks new because we have never seen the board — so the seed run
-    stores them notified=TRUE and the queue comes out empty.
+    board looks new because we have never seen the board — so the seed run marks
+    them and the queue comes out empty.
+
+    BOTH FLAGS, since Phase 1e. `seeded` is the one that means what this test is
+    about — "this row is back catalogue", a fact about this crawl, user-blind and
+    permanent, and since 1e the clause the digest queue actually reads.
+    `notified` is the old global boolean, still dual-written until 1g drops it.
+    Asserting both is what makes 1g's drop provably a no-op rather than an
+    argument.
     """
     board = load_board()
     result = await run(conn, [board], seeding=True)
@@ -50,6 +57,7 @@ async def test_seed_run_stores_every_job_already_notified(conn):
     assert result.fetched == len(board) == 11
     assert result.truly_new == 11
     assert len(rows) == 11
+    assert all(r["seeded"] == 1 for r in rows.values())
     assert all(r["notified"] == 1 for r in rows.values())
     assert all(r["status"] == "open" and r["miss_count"] == 0 for r in rows.values())
     assert await queued(conn) == set()  # zero would-be notifications
@@ -110,6 +118,12 @@ async def test_one_added_job_is_the_only_thing_queued(conn):
     assert result.reappeared == 11
     assert await queued(conn) == {new_id}
     assert rows[new_id]["notified"] == 0
+    # Not back catalogue: this is the one row a digest is allowed to reach. A
+    # non-seeding crawl writing seeded=TRUE would hide every genuinely new job
+    # from every user, permanently and silently — the exact inverse of the flood
+    # the flag exists to prevent, and the reason both directions are asserted.
+    assert rows[new_id]["seeded"] == 0
+    assert all(rows[k]["seeded"] == 1 for k in rows if k != new_id)
     assert rows[new_id]["city"] == "pune"
     assert rows[new_id]["status"] == "open"
     assert rows[new_id]["first_seen_at"] is not None
@@ -314,6 +328,11 @@ async def test_closed_job_that_comes_back_is_reopened_not_re_notified(conn):
     assert reopened["status"] == "open"
     assert reopened["miss_count"] == 0
     assert reopened["notified"] == 1  # still counts as already told
+    # And still back catalogue. An upsert clearing `seeded` would hand a whole
+    # seeded board to every user the first time it flapped — the same failure the
+    # `notified` assertion above has always guarded, now on the column that
+    # actually decides.
+    assert reopened["seeded"] == 1
     assert reopened["first_seen_at"] == closed_row["first_seen_at"]  # not restamped
     assert await queued(conn) == set()
 

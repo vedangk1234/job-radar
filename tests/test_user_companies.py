@@ -23,10 +23,10 @@ import pytest
 
 from conftest import TEST_USER_ID
 from db.watchlist import (
-    TRACK_ALL_COMPANIES_SQL,
     catalog_company_ids,
     count_tracked,
     track_all_companies,
+    track_companies,
     tracked_company_ids,
 )
 from scripts.backfill_user_companies import uncovered
@@ -97,6 +97,21 @@ async def test_two_users_may_track_the_same_company(conn):
 
 
 # --- the backfill ---------------------------------------------------------
+
+
+async def test_tracking_a_specific_subset_leaves_the_rest_alone(conn):
+    """The Phase-1e entry point: track these companies, not the catalog.
+
+    What scripts/track_companies.py and the Phase-3 picker call. The backfill's
+    "all of them" is now a special case of this rather than a separate statement,
+    so there is exactly one way a tracking row can be created — and therefore
+    exactly one place the history suppression can be forgotten.
+    """
+    await catalog(conn, 4)
+    user = await conn.add_user()
+
+    assert sorted(await track_companies(conn, user, [2, 4])) == [2, 4]
+    assert await tracked_company_ids(conn, user) == [2, 4]
 
 
 async def test_backfill_tracks_exactly_the_catalog_that_exists(conn):
@@ -251,7 +266,17 @@ CRAWL_PATH_FILES = [
     "fetchers/workday.py",
 ]
 
-FORBIDDEN_ON_THE_CRAWL_PATH = ("user_companies", "watchlist", "tracked_company_ids")
+FORBIDDEN_ON_THE_CRAWL_PATH = (
+    "user_companies",
+    "watchlist",
+    "tracked_company_ids",
+    # Added by Phase 1e, which gave this module the function that creates a
+    # tracking row AND suppresses the company's history. It is the one call that
+    # would be most tempting to make from a crawl — "seed this company, then tell
+    # everyone watching it" is one line — and the whole reason the seed rule went
+    # into jobs.seeded instead.
+    "track_companies",
+)
 
 # The company selection, as it stood before user_companies existed and as it must
 # still stand. Whitespace-normalised on both sides; nothing else is.

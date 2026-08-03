@@ -25,6 +25,7 @@ EXPECTED_TABLES = [
     "preferences",
     "users",
     "user_companies",
+    "user_job_notifications",
 ]
 
 
