@@ -659,3 +659,132 @@ CREATE INDEX IF NOT EXISTS user_job_notifications_job_idx
 -- none: the only user is a real person resolved from MY_EMAIL at runtime and
 -- this file cannot name them. scripts/backfill_user_notifications.py is the
 -- seed, and it is the highest-risk step in Phase 1 — see its docstring.
+
+
+-- ===========================================================================
+-- ANON AND AUTHENTICATED REACH NOTHING — the PostgREST surface, closed in SQL
+-- ===========================================================================
+--
+-- Phase 2a publishes NEXT_PUBLIC_SUPABASE_ANON_KEY into the browser bundle,
+-- because that is what the key is for: the Supabase JS client needs it to run
+-- the OAuth handshake. Publishing it is safe only if the key opens nothing but
+-- /auth/v1. Before this block it opened rather more than that.
+--
+-- WHAT WAS ACTUALLY TRUE, measured against the live database on 2026-08-04:
+-- seven of the ten tables in this schema had RLS OFF, and the anon role held
+-- SELECT, INSERT, UPDATE, DELETE and TRUNCATE on every one of them — 70 grants
+-- for anon and 70 more for authenticated. All six sequences carried anon=rwU,
+-- where the w is setval. Supabase grants those by default to whatever appears
+-- in `public`, and this project never asked it not to, because until now no key
+-- that uses them had ever left the server. Neither runtime speaks PostgREST at
+-- all: the crawler is asyncpg on the session pooler and the dashboard is
+-- postgres.js on the transaction pooler. It was reachable surface that no code
+-- path here has ever needed.
+--
+-- SO THE KEY IS NOT THE BUG AND HIDING IT IS NOT THE FIX. An anon key is meant
+-- to be public; what makes it harmless everywhere else is that RLS stands
+-- behind it. Three locks are set below, and they fail independently:
+--
+--   1. ENABLE ROW LEVEL SECURITY, with NO policy on any table. RLS on plus zero
+--      policies is deny-all: anon and authenticated match nothing and read
+--      nothing. A policy added later is then a deliberate act with a name.
+--   2. REVOKE ALL on what exists, so the privilege is not merely unusable but
+--      absent — on the eight tables and on the six sequences behind their
+--      SERIAL columns.
+--   3. ALTER DEFAULT PRIVILEGES, so what does not exist yet arrives closed.
+--
+-- WHY THE THIRD IS NOT REDUNDANT, and it is the one that matters most going
+-- forward. Locks 1 and 2 are statements about the tables that exist today. A
+-- table created after this runs inherits Supabase's default grants and arrives
+-- OPEN — and Phase 3 is going to create tables (the company picker). Without
+-- lock 3 the guard is a tripwire that fires after the hole is already open;
+-- with it, the hole never opens. tests/test_rls.py and scripts/check_rls.py
+-- both sweep whatever tables exist rather than a fixed list, so they remain the
+-- belt to this suspender rather than being replaced by it.
+--
+-- THE CAVEAT ALTER DEFAULT PRIVILEGES ALWAYS CARRIES: it applies only to
+-- objects created by the ROLE THAT RUNS IT, and silently does nothing for
+-- anything created by anyone else. So it matters who executes this file.
+-- Measured rather than assumed: pg_default_acl's entry for schema `public`,
+-- object type TABLES, is set_by = postgres and reads anon=arwdDxtm/postgres.
+-- Both DSNs in this project authenticate as postgres.<project-ref>, which IS
+-- that role, and scripts/init_db.py applies this file over CRAWLER_DB_URL — so
+-- the statements below target exactly the entry that is currently granting
+-- anon, and every table either runtime creates is covered. Applying this file
+-- as some other role would be a silent no-op, which is why check_rls.py reports
+-- the connecting role rather than only the verdict.
+--
+-- WHY THIS CANNOT BREAK EITHER RUNTIME, and again it is evidence rather than an
+-- argument. pg_roles reports rolbypassrls = TRUE for postgres, which owns all
+-- ten tables; anon and authenticated have rolbypassrls = FALSE and are not
+-- superusers, so RLS binds them and not us. The proof is already in the
+-- database and predates this block: public.users has had RLS ON since it was
+-- created, carries no policy, and every read in both runtimes has worked the
+-- whole of Phase 1. This block reproduces on the other tables a configuration
+-- that has been running in production on this one.
+--
+-- The dashboard toggle (Project Settings -> API -> Exposed schemas) closes the
+-- same door and is what unblocks the deploy. It is a console setting on an
+-- account, not a property of this database — someone re-exposing `public` in a
+-- year would silently undo it, and nothing would fail. These statements are the
+-- durable half, and scripts/check_rls.py is what reads the answer back.
+--
+-- ENUMERATED rather than ALL TABLES IN SCHEMA public, deliberately. The two
+-- jobs_notified_backup_* tables are Phase-1d/1g leftovers that already have RLS
+-- on; they are not this schema's, they are not this phase's business, and a
+-- blanket statement here would quietly adopt them. public.users IS listed even
+-- though its RLS is already on: stating it costs a no-op and stops the file
+-- implying that the one table holding account identity was somehow exempt.
+--
+-- SCOPE, stated so the gaps are chosen rather than missed. Schema `public`
+-- only. Supabase's own `storage`, `graphql` and `graphql_public` schemas carry
+-- the identical default grants and are deliberately untouched — they are not
+-- this project's to configure, and `storage` is empty here. FUNCTIONS are
+-- included in lock 3 although `public` currently holds none, because a function
+-- is how PostgREST exposes RPC and the cost of covering it in advance is one
+-- line.
+--
+-- EVERY STATEMENT BELOW IS A NO-OP ON RE-RUN. ENABLE ROW LEVEL SECURITY on an
+-- RLS-enabled table does nothing; REVOKE of a privilege nobody holds does
+-- nothing; ALTER DEFAULT PRIVILEGES re-revoking an absent default does nothing.
+-- This file stays safe to re-apply against a live database.
+
+-- Lock 1 — RLS on, no policies anywhere, which is deny-all.
+ALTER TABLE public.companies              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.discovered_companies   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.jobs                   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.notifications          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.preferences            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_companies         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_job_notifications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.users                  ENABLE ROW LEVEL SECURITY;
+
+-- Lock 2a — the privileges on the tables that exist.
+REVOKE ALL PRIVILEGES ON public.companies              FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON public.discovered_companies   FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON public.jobs                   FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON public.notifications          FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON public.preferences            FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON public.user_companies         FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON public.user_job_notifications FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON public.users                  FROM anon, authenticated;
+
+-- Lock 2b — the sequences behind the SERIAL columns. Enumerated for the same
+-- reason the tables are, and they are a real exposure rather than tidiness:
+-- anon=rwU includes UPDATE, which on a sequence is setval — an anon caller
+-- could have reset companies_id_seq and made the next insert collide.
+-- public.users and public.jobs have no sequence (uuid and text keys).
+REVOKE ALL PRIVILEGES ON SEQUENCE public.companies_id_seq              FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON SEQUENCE public.discovered_companies_id_seq   FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON SEQUENCE public.notifications_id_seq          FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON SEQUENCE public.preferences_id_seq            FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON SEQUENCE public.user_companies_id_seq         FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON SEQUENCE public.user_job_notifications_id_seq FROM anon, authenticated;
+
+-- Lock 3 — what does not exist yet arrives closed. See the caveat above: this
+-- binds objects created by the role that RUNS it, which is postgres, which is
+-- the role both DSNs use and the role pg_default_acl already records as the
+-- grantor of the entries being revoked here.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES    FROM anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM anon, authenticated;

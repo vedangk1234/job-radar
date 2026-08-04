@@ -1,0 +1,388 @@
+"""Ask the live database whether anon and authenticated can reach anything.
+
+    python scripts/check_rls.py
+
+This is the read-back for the RLS/REVOKE block at the end of db/schema.sql, and
+it is the same question asked from the other side: that file states the
+intention, this asks Postgres what is actually true. Phase 2a is what makes the
+question urgent — NEXT_PUBLIC_SUPABASE_ANON_KEY goes into the browser bundle, so
+from then on "what can the anon role do" is a question about the internet rather
+than about a role nobody assumes.
+
+FIVE PROPERTIES, asked separately because they fail apart:
+
+  1. Every base table in `public` has RLS enabled. With no policies defined that
+     is deny-all — anon matches nothing.
+  2. anon and authenticated hold no table privileges, so the deny is not merely
+     enforced but has nothing to enforce against.
+  3. Nor any sequence privileges. anon=rwU on a sequence includes UPDATE, which
+     for a sequence is setval.
+  4. The default privileges of the CONNECTING ROLE grant them nothing, so the
+     next object this project creates arrives closed rather than open.
+  5. No table in `public` is owned by some OTHER role whose default privileges
+     do grant them — which is the only way a foreign default ACL can ever bite.
+
+WHY 4 AND 5 ARE TWO QUESTIONS AND NOT ONE, which is the correction this script
+had to be rewritten for. A default ACL governs only objects created BY the role
+that set it. This database carries two entries per object type for schema
+`public`: one set by `postgres` — the role both DSNs use and the role
+scripts/init_db.py applies the schema with — and one set by `supabase_admin`,
+which is Supabase's own and which `postgres` cannot revoke (it is neither a
+member of that role nor a superuser). An earlier version of this file failed on
+BOTH, which made it permanently red for a condition nobody here can fix, and a
+check that cannot go green is a check that gets ignored.
+
+The honest form of the question is therefore ownership. Every table in `public`
+is owned by `postgres`, so the `supabase_admin` entry governs nothing that
+exists and is reported rather than failed. The day a `supabase_admin`-owned
+table appears in `public`, property 5 goes red — which is exactly the moment it
+should, because that is the first object the foreign entry would actually open.
+
+Belt and braces from a different direction: MS-4b removes `public` from the Data
+API's exposed schemas, so PostgREST cannot reach any of this regardless of
+grants. These statements are the half that survives someone re-flipping a
+console toggle.
+
+THE CONNECTING ROLE IS REPORTED, NOT ASSUMED. Both halves of the verdict depend
+on who is asking: ALTER DEFAULT PRIVILEGES binds only the role that ran it, and
+RLS binds only roles that do not bypass it. A run as the wrong role could report
+success about a different set of objects entirely.
+
+It asks over WHATEVER OBJECTS EXIST rather than over a fixed list, deliberately.
+A check written against today's eight table names would report success while a
+ninth sat exposed, and "the table nobody remembered" is the exact failure here.
+
+Read-only. It changes nothing and is safe to run against production at any time.
+Exit code 0 if all five hold, 1 otherwise, so it can gate a deploy.
+
+The verdict lives in `evaluate()`, which is pure — it takes the gathered facts
+and returns failures, touching no database and no clock. That is what lets
+tests/test_rls.py mutation-confirm the criteria against synthetic inputs,
+including the supabase_admin-owned table that must flip property 5 red and that
+does not exist to be tested against for real.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import sys
+from pathlib import Path
+
+# Allow `python scripts/check_rls.py` without installing the project as a package.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+EXPOSED_ROLES = ("anon", "authenticated")
+
+# Tables this project did not create and was told not to migrate: the Phase-1d
+# and 1g backups of jobs.notified. Reported separately rather than silently
+# skipped, and not counted as a failure, because RLS is ON for both and RLS with
+# no policy is deny-all — the grants they still carry cannot be exercised. That
+# exclusion is CONDITIONAL ON THE RLS STATE rather than on the name alone: if
+# RLS ever came off one of them the grants become live and it fails.
+NOT_OURS = ("jobs_notified_backup_1g", "jobs_notified_backup_pre1d")
+
+# An aclitem renders as `grantee=privs/grantor`. A grantee of "" is PUBLIC,
+# which is not what this asks about, so the names are anchored.
+ACL_RE = re.compile(rf"^({'|'.join(EXPOSED_ROLES)})=")
+
+OBJTYPE_LABELS = {"r": "TABLES", "S": "SEQUENCES", "f": "FUNCTIONS", "T": "TYPES"}
+
+
+# --- the facts ---------------------------------------------------------------
+
+# Base tables only: views and foreign tables are not what Supabase's default
+# grants land on, and pg_tables is the same catalogue the Supabase dashboard's
+# Database page reads, so the two cannot disagree about what exists.
+RLS_SQL = """
+SELECT tablename, rowsecurity
+  FROM pg_tables
+ WHERE schemaname = 'public'
+ ORDER BY tablename
+"""
+
+# information_schema.role_table_grants resolves grants THROUGH role membership,
+# which is what makes it the honest question: a privilege reached by anon being
+# granted some other role is still a privilege anon holds, and a query against
+# pg_class.relacl alone would miss it.
+GRANTS_SQL = """
+SELECT grantee, table_name, privilege_type
+  FROM information_schema.role_table_grants
+ WHERE table_schema = 'public'
+   AND grantee = ANY($1::text[])
+ ORDER BY grantee, table_name, privilege_type
+"""
+
+# Sequences are not tables and do not appear above. relkind = 'S'.
+SEQUENCES_SQL = """
+SELECT c.relname AS name, c.relacl::text[] AS acl
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public' AND c.relkind = 'S'
+ ORDER BY c.relname
+"""
+
+# Who owns each table — the join that turns "some other role's default ACL
+# grants anon" from a scary-sounding fact into a checkable one.
+TABLE_OWNERS_SQL = """
+SELECT c.relname AS name, pg_get_userbyid(c.relowner) AS owner
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public' AND c.relkind = 'r'
+ ORDER BY c.relname
+"""
+
+# defaclobjtype is Postgres's internal "char" type, which asyncpg hands back as
+# BYTES (b'r'), not str — so it is cast to text here. Left uncast it misses
+# every OBJTYPE_LABELS lookup and then blows up formatting, which is exactly
+# what it did on the first live run.
+DEFAULT_ACL_SQL = """
+SELECT d.defaclobjtype::text AS objtype,
+       pg_get_userbyid(d.defaclrole) AS set_by,
+       d.defaclacl::text[] AS acl
+  FROM pg_default_acl d
+  JOIN pg_namespace n ON n.oid = d.defaclnamespace
+ WHERE n.nspname = 'public'
+ ORDER BY pg_get_userbyid(d.defaclrole), d.defaclobjtype
+"""
+
+# A policy is not a failure — it is a deliberate act. But an unnoticed one turns
+# deny-all into something narrower, so they are reported rather than judged.
+POLICIES_SQL = """
+SELECT tablename, policyname, cmd, roles::text AS roles
+  FROM pg_policies
+ WHERE schemaname = 'public'
+ ORDER BY tablename, policyname
+"""
+
+# If this is not BYPASSRLS the locks would apply to US, which is the one way
+# this change could break the crawler — so it is checked rather than assumed.
+ROLE_SQL = """
+SELECT current_user AS role_name,
+       (SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user) AS bypassrls
+"""
+
+
+# --- the verdict, pure -------------------------------------------------------
+
+
+def granting_roles(default_acls) -> dict[str, list[str]]:
+    """{role: [object types]} for every default ACL that grants an exposed role.
+
+    Keyed by the role that SET the default, because that is the role whose
+    creations it governs. A role absent from this mapping cannot open anything.
+    """
+    out: dict[str, list[str]] = {}
+    for row in default_acls:
+        if any(ACL_RE.match(a) for a in (row["acl"] or [])):
+            label = OBJTYPE_LABELS.get(row["objtype"], row["objtype"])
+            out.setdefault(row["set_by"], []).append(label)
+    return out
+
+
+def evaluate(
+    *,
+    connecting_role: str,
+    bypassrls: bool,
+    rls_rows,
+    grant_rows,
+    sequence_rows,
+    default_acls,
+    table_owners,
+) -> tuple[list[str], list[str]]:
+    """(failures, notes) for the five properties. No database, no clock.
+
+    Pure so the criteria can be mutation-tested against inputs that do not exist
+    on the real database — above all a supabase_admin-owned table in `public`,
+    which is the condition property 5 is FOR and which cannot be created here to
+    test against.
+    """
+    failures: list[str] = []
+    notes: list[str] = []
+    roles_label = " / ".join(EXPOSED_ROLES)
+    rls_by_table = {r["tablename"]: r["rowsecurity"] for r in rls_rows}
+
+    if not bypassrls:
+        failures.append(
+            f"the connecting role {connecting_role!r} is NOT bypassrls — enabling RLS "
+            f"applies to this project's own queries, not just to anon, and any "
+            f"ALTER DEFAULT PRIVILEGES applied by a different role did not bind this one."
+        )
+
+    # 1. RLS everywhere.
+    unprotected = [r["tablename"] for r in rls_rows if not r["rowsecurity"]]
+    if unprotected:
+        failures.append("RLS is OFF on: " + ", ".join(f"public.{t}" for t in unprotected))
+
+    # 2. No table grants — on tables this schema owns.
+    ours = [r for r in grant_rows if r["table_name"] not in NOT_OURS]
+    if ours:
+        tables = sorted({r["table_name"] for r in ours})
+        failures.append(
+            f"{len(ours)} table grant(s) still held by {roles_label} across "
+            f"{len(tables)} table(s): {', '.join(tables)}"
+        )
+
+    # The excluded backups: inert only while RLS denies them.
+    theirs = sorted({r["table_name"] for r in grant_rows if r["table_name"] in NOT_OURS})
+    still_open = [t for t in theirs if not rls_by_table.get(t)]
+    if still_open:
+        failures.append(
+            f"the excluded backup table(s) {', '.join(still_open)} have RLS OFF *and* "
+            f"carry grants to {roles_label} — the exclusion only holds while RLS denies them"
+        )
+    elif theirs:
+        notes.append(
+            f"excluded Phase-1 backups {', '.join(theirs)} still carry grants, but RLS is "
+            f"ON for each, so {roles_label} cannot exercise them"
+        )
+
+    # 3. No sequence grants.
+    leaked = [r["name"] for r in sequence_rows if any(ACL_RE.match(a) for a in (r["acl"] or []))]
+    if leaked:
+        failures.append(
+            f"{roles_label} still hold privileges on sequence(s): {', '.join(leaked)} "
+            f"— rwU includes setval"
+        )
+
+    granting = granting_roles(default_acls)
+
+    # 4. The connecting role's own defaults — what we control.
+    if connecting_role in granting:
+        failures.append(
+            f"the next object THIS project creates would arrive OPEN — the default "
+            f"privileges of the connecting role {connecting_role!r} still grant "
+            f"{roles_label} on: {', '.join(sorted(granting[connecting_role]))}"
+        )
+
+    # 5. Foreign defaults, judged by ownership rather than by existence.
+    foreign = {role: types for role, types in granting.items() if role != connecting_role}
+    for role, types in sorted(foreign.items()):
+        owned = sorted(t["name"] for t in table_owners if t["owner"] == role)
+        if owned:
+            failures.append(
+                f"table(s) {', '.join(owned)} in public are owned by {role!r}, whose "
+                f"default privileges grant {roles_label} on {', '.join(sorted(types))} — "
+                f"so objects it creates arrive open and this one may already be"
+            )
+        else:
+            notes.append(
+                f"{role!r} has default privileges granting {roles_label} on "
+                f"{', '.join(sorted(types))}, and they are INERT: a default ACL governs "
+                f"only objects created by that role, and no table in public is owned by "
+                f"it. {connecting_role!r} cannot revoke them (not a member, not superuser)"
+            )
+
+    return failures, notes
+
+
+# --- the run -----------------------------------------------------------------
+
+
+async def main() -> int:
+    from db.connection import get_crawler_conn
+
+    conn = await get_crawler_conn()
+    try:
+        role = await conn.fetchrow(ROLE_SQL)
+        rls_rows = await conn.fetch(RLS_SQL)
+        grant_rows = await conn.fetch(GRANTS_SQL, list(EXPOSED_ROLES))
+        sequence_rows = await conn.fetch(SEQUENCES_SQL)
+        table_owners = await conn.fetch(TABLE_OWNERS_SQL)
+        default_acls = await conn.fetch(DEFAULT_ACL_SQL)
+        policy_rows = await conn.fetch(POLICIES_SQL)
+    finally:
+        await conn.close()
+
+    roles_label = " / ".join(EXPOSED_ROLES)
+    connecting_role = role["role_name"]
+
+    print(f"connected as: {connecting_role}  (rolbypassrls = {role['bypassrls']})")
+
+    print(f"\ntables in public: {len(rls_rows)}")
+    owner_of = {t["name"]: t["owner"] for t in table_owners}
+    for row in rls_rows:
+        name = row["tablename"]
+        print(
+            f"  {'ON ' if row['rowsecurity'] else 'OFF'}  public.{name}"
+            f"  (owner {owner_of.get(name, '?')})"
+        )
+
+    ours = [r for r in grant_rows if r["table_name"] not in NOT_OURS]
+    theirs = [r for r in grant_rows if r["table_name"] in NOT_OURS]
+    print(f"\ntable grants held by {roles_label}: {len(grant_rows)} total")
+    print(f"  on tables this schema owns: {len(ours)}")
+    for row in ours[:15]:
+        print(f"    {row['grantee']} -> {row['table_name']}.{row['privilege_type']}")
+    if len(ours) > 15:
+        print(f"    ... and {len(ours) - 15} more")
+    if theirs:
+        names = sorted({r["table_name"] for r in theirs})
+        print(f"  on excluded Phase-1 backups: {len(theirs)} across {', '.join(names)}")
+
+    print(f"\nsequences in public: {len(sequence_rows)}")
+    for row in sequence_rows:
+        held = [a for a in (row["acl"] or []) if ACL_RE.match(a)]
+        print(f"  public.{row['name']}  {roles_label}: {' '.join(held) if held else '(none)'}")
+
+    print("\ndefault privileges for schema public:")
+    if not default_acls:
+        print("  (no pg_default_acl rows — nothing is granted to anyone by default)")
+    for row in default_acls:
+        label = OBJTYPE_LABELS.get(row["objtype"], row["objtype"])
+        held = [a for a in (row["acl"] or []) if ACL_RE.match(a)]
+        marker = "  <- ours" if row["set_by"] == connecting_role else ""
+        print(
+            f"  {label:<10} set_by={row['set_by']:<16} "
+            f"{roles_label}: {' '.join(held) if held else '(none)'}{marker}"
+        )
+
+    print(f"\npolicies on public.*: {len(policy_rows)}")
+    for row in policy_rows:
+        print(f"  {row['tablename']}.{row['policyname']} {row['cmd']} roles={row['roles']}")
+    if not policy_rows:
+        print("  (none — RLS with no policy is deny-all, which is the intent here)")
+
+    failures, notes = evaluate(
+        connecting_role=connecting_role,
+        bypassrls=bool(role["bypassrls"]),
+        rls_rows=rls_rows,
+        grant_rows=grant_rows,
+        sequence_rows=sequence_rows,
+        default_acls=default_acls,
+        table_owners=table_owners,
+    )
+
+    if notes:
+        print("\nREPORTED (not failures):")
+        for line in notes:
+            print(f"  - {line}")
+
+    if failures:
+        print("\nFAILED:", file=sys.stderr)
+        for line in failures:
+            print(f"  - {line}", file=sys.stderr)
+        print(
+            "\nApply db/schema.sql (python scripts/init_db.py) — the RLS/REVOKE block "
+            "at the end of that file is what closes the parts this project controls.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"\nSUCCESS: RLS is on for all {len(rls_rows)} tables in public; {roles_label} "
+        f"hold no privileges on any table this schema owns or on any of the "
+        f"{len(sequence_rows)} sequences; {connecting_role!r}'s default privileges grant "
+        f"them nothing, so the next object this project creates arrives closed; and no "
+        f"table here is owned by a role whose defaults would open one."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(asyncio.run(main()))
+    except Exception as exc:  # noqa: BLE001 - top-level CLI error reporting
+        print(f"\nFAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+        sys.exit(1)
