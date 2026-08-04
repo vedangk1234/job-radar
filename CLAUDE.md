@@ -2,11 +2,17 @@
 
 A personal, India-scoped job-alert crawler. It watches the ATS boards of a
 hand-picked list of companies, stores every posting it finds without judging any
-of them, and emails a digest containing only roles that are *genuinely* new and
-match a tight filter — with a private dashboard to manage the watch list, edit
-the filter, and see what the filter dropped. "New" means *we* had never seen the
-posting before, not that a vendor's date field says so; that distinction is the
-reason the inbox stays worth opening.
+of them, and emails **each user** a digest containing only the roles that are
+*genuinely* new to them and match their own tight filter — with a private
+dashboard to manage the company catalog, edit the filter, and see what the filter
+dropped. "New" means *we* had never seen the posting before, not that a vendor's
+date field says so; that distinction is the reason the inbox stays worth opening.
+
+Phase 1 turned the single implicit user into rows: a `public.users` table, a
+watch list, a filter and a notification history per person, and a digest that
+fans out. The crawl underneath is unchanged and stays user-blind — **crawl once,
+fan out**. Auth is still one Google account and one `MY_EMAIL`; the bridge
+between them is Phase 2's job to remove.
 
 This file is a **living record of what the project is and how it works**. It
 describes the code as it stands, not a specification the code has to obey — when
@@ -21,8 +27,9 @@ Every stage is deliberately allowed to know less than the next one.
 
 ```
 CRAWL                  STORE / DIFF                  NOTIFY
-fetch every job        observation-based             filter tightly
-no judgment      ->    never trusts source dates  -> email exactly once
+fetch every job        observation-based             filter tightly, per person
+no judgment      ->    never trusts source dates  -> email each user exactly once
+user-blind             user-blind                    the only user-aware stage
 ```
 
 1. **Crawl** — fetch the whole board for a company and normalise it to one row
@@ -34,12 +41,38 @@ no judgment      ->    never trusts source dates  -> email exactly once
    stored state**. Vendor `posted_at` fields are advisory and never decide
    anything: Workday's is the literal string "Posted 3 Days Ago", and Greenhouse
    re-stamps `updated_at` when a recruiter fixes a typo.
-3. **Notify** — apply the filter, email what survives, and record that it was
-   sent so it is never sent twice.
+3. **Notify** — for each active user in turn: their filter, over the companies
+   *they* watch, over the jobs *they* have not been told about; email what
+   survives to their own address, and record that it was sent **to them** so
+   they are never sent it twice.
 
 The slogan is **store loosely, notify tightly**. `jobs` keeps every posting in
-every city forever; `preferences` decides what reaches an inbox, and can be
-changed at any time without losing the history to re-decide against.
+every city forever; a `preferences` row decides what reaches *one* inbox, and
+can be changed at any time without losing the history to re-decide against.
+
+### Crawl once, fan out
+
+Stages 1 and 2 are **user-blind and must stay that way**; all the narrowing
+happens in stage 3. Phase 1 made that a fact about the schema rather than a
+coincidence of there being one account:
+
+```
+CRAWL ONCE                          FAN OUT
+every tracked board, for            for each active user:
+everybody, knows nothing     ->       their preferences row
+about users                           their user_companies
+                                      their user_job_notifications
+                                      -> one email, to their own address
+```
+
+Two users watching Adobe is one board fetch an hour, not two. The temptation is
+to crawl only what somebody currently watches, and it inverts the design:
+seeding is decided from a company's stored row count, so a board that went
+unwatched for a month would go dark and then re-alert its entire back catalogue
+the day someone added it back. `tests/test_user_companies.py` and
+`tests/test_leakage.py` assert the separation rather than leaving it to care —
+the first that no crawl-path module so much as names the per-user tables, the
+second that nothing of one user's ever appears in another's answer.
 
 ### Two runtimes, one database
 
@@ -105,7 +138,7 @@ that re-applying the schema can never reset a value the dashboard has edited.
 | `last_seen_at` | most recent fetch that contained it |
 | `miss_count` | consecutive fetches that did *not* contain it |
 | `status` | `open` \| `closed` |
-| `notified` | it has been emailed (or was stored during a silent seed) |
+| `seeded` | stored during this company's first-ever crawl — **back catalogue, never emailed to anybody** |
 | `min_experience` | years the description demands as a minimum. **NULL = unknown, and unknown means keep** |
 | `is_pm_role` | the description frames the role as product/people management |
 | `desc_checked` | the description has been read once; never read twice |
@@ -113,6 +146,33 @@ that re-applying the schema can never reset a value the dashboard has edited.
 | `desc_checked_at` | when we last looked. NULL = never |
 | `applied` | **dashboard-owned.** I applied to this. The crawler never writes it |
 | `applied_at` | when the box was first ticked. NULL whenever `applied` is FALSE |
+
+**There was a `notified` boolean here until Phase 1g, and it was two facts
+wearing one name.** "This row is back catalogue" is a property of the **crawl** —
+user-blind, permanent, true for everybody forever. "Somebody was emailed this" is
+a property of a **person**. While the install had one account the second was an
+adequate paraphrase of "I was emailed this"; the moment there are two, the first
+user's digest silences the job for the second, who never hears about it at all
+and has nothing anywhere recording that they didn't. So the two were separated
+rather than renamed:
+
+| The fact | Where it lives now | Written by |
+|---|---|---|
+| this row is back catalogue | `jobs.seeded` — one column, user-blind | `crawler/store.mark_new`, from the same `seeding` flag `scripts/crawl.py` decides from the company's stored row count |
+| this person was told | `user_job_notifications` — one row per (user, job) | `notify/store.record_sent`, after Resend returned an id |
+
+`seeded` is the **silent-seed marker and nothing else**, so a crawl still has no
+opinion about anybody's inbox. It joins `first_seen_at` and `canonical_id` as a
+write-once column: it is absent from `UPSERT_SEEN`'s `ON CONFLICT` clause, which
+is what makes "a re-sighting cannot re-queue a job" a property of the SQL rather
+than a rule the write path has to remember.
+
+The order mattered more than the destination. 1d gave the person half an owner,
+1e moved the crawl half into `seeded` **and switched the queue onto it**, 1f
+moved the dashboard badge across, and only then did 1g drop the column — so the
+drop was a genuine no-op against a queue that had been reading `seeded` for a
+whole sub-phase, rather than a behaviour change with an inbox-shaped failure
+mode. See *The diffing guards* for the queue itself.
 
 The five description-derived columns are the **only** trace a job description
 ever leaves in this database. There is no description column, on purpose: two
@@ -139,7 +199,8 @@ about again. `desc_checked_at` is what makes that retry occasional (once a day)
 rather than once per crawl.
 
 ### `discovered_companies` — everything the sweep looked at
-Written by `scripts/run_discovery.py`: `job_count`, `last_posting_at`,
+Written by `crawler/discover.py` (driven by `scripts/run_discovery.py`):
+`job_count`, `last_posting_at`,
 `city_hits`, `looks_like_services`, `source`, `promoted`, `UNIQUE (ats, token)`.
 
 It is the **audit log of the discovery sweep, not a queue** — a company that
@@ -161,7 +222,57 @@ name as typed, the city spread, a probe error, and the `"try Workday"` note.
 
 ### `notifications`
 The sent-log: `canonical_id`, `sent_at`, `digest` (e.g. `2026-07-25-am`). A
-receipt per email, so a job is never emailed twice.
+receipt per email, so a job is never emailed twice. It is **not** the thing that
+decides — `user_job_notifications` is — and the two are written in one
+transaction; see below.
+
+### `public.users` — the account, made explicit
+Columns: `id` (`UUID`, `DEFAULT gen_random_uuid()`), `email` (`TEXT NOT NULL
+UNIQUE`), `created_at`, `plan` (`TEXT`, default `free`, no `CHECK` — matching
+`companies.category`), `is_active` (`BOOLEAN`, default TRUE). Plus
+`users_email_lower_idx`, a unique index on `lower(email)`.
+
+**The anchor the rest of Phase 1 hangs off.** Until 1a the single user was
+implicit — one preferences row, one `ALLOWED_EMAIL`, one `MY_EMAIL` recipient,
+and nothing in the database naming any of them. Everything per-user added since
+is a foreign key back to this table.
+
+**Why `UUID` and not the `SERIAL` the rest of the schema uses.** Phase 2 adds
+magic-link auth, and both Supabase Auth (`auth.users.id`) and the Auth.js
+database adapters key users by uuid. A `SERIAL` here would mean carrying a
+separate provider-id column to join on forever. `gen_random_uuid()` is built into
+Postgres 13+, so this needs no extension on Supabase.
+
+**Why it is the one schema-qualified table in the file.** Supabase ships its own
+`auth.users`, so `users` is the single ambiguous table name on this database, and
+a bare `CREATE TABLE IF NOT EXISTS` resolves against the connection's
+`search_path` — which `db/connection.py` does not set, making the target a
+server-side default this project does not own. The failure that guards against is
+silent, not loud: with `auth` ahead of `public` on the path, `IF NOT EXISTS`
+would find `auth.users` already there, skip, report success, and leave
+`public.users` uncreated. **Every statement naming this table, in both runtimes,
+says `public.users`.**
+
+**Why the lowercase index is separate from the `UNIQUE`.** Email identity is
+case-insensitive in practice and `TEXT UNIQUE` is not, so `Me@example.com` and
+`me@example.com` would be two accounts — and under Phase 2 magic links, two
+accounts a person cannot tell apart. The plain `UNIQUE` stays because it is what
+`ON CONFLICT (email)` targets; the index is what makes the identity
+one-per-person. Both runtimes compare `lower(email)` on both sides to match it.
+
+**No seed row, and this is the one table where the schema cannot supply one.**
+Every other seed in `db/schema.sql` is a literal; this one is a real person's
+address, and "no hardcoded personal data, anywhere" is enforced rather than
+requested — the pre-commit hook would block the `INSERT`. `scripts/seed_user.py`
+is the seed and reads `MY_EMAIL`, exactly as `notify/digest.py` does. Apply the
+schema, run that, and the anchor row is back: a fresh database is reproducible
+without the repo ever holding the address.
+
+`is_active` is the account-level off switch, and it sat unread from 1a until 1e.
+`db/users.DIGEST_USERS_SQL` is what reads it: a deactivated account keeps its
+preferences, its watch list and its notification history and stops receiving
+email. Deleting the row would also stop the email and take all three with it,
+which is a different decision and one nobody can undo.
 
 ### `preferences` — the filter, as data rather than code
 Columns: `cities`, `keywords`, `exclusions` (all `TEXT[]`), `max_level` (`INT`,
@@ -177,9 +288,19 @@ constants are never an override.
 `id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1)` — and every loader in both
 runtimes said so. Phase 1b replaced that with `WHERE user_id = <current user>`;
 `preferences_one_per_user_idx` (a *partial unique index*, chosen so named
-multi-profiles stay one `DROP INDEX` away) enforces one row per user. The
-`CHECK (id = 1)` is still there and still caps the table at one row overall;
-that comes down in whichever sub-phase first needs a second row.
+multi-profiles stay one `DROP INDEX` away) enforces one row per user.
+
+The `CHECK (id = 1)` outlived 1b and came down in **1e**, which is exactly the
+sub-phase the schema comment predicted would need it: a fan-out with one filter
+is not a fan-out, and two users sharing a filter would not test isolation at all
+— it is the second *filter* that proves a digest was computed for a person rather
+than for the install. So the `CHECK` and the fixed `DEFAULT 1` went (an
+unqualified `INSERT` would otherwise collide with the row already there) and `id`
+got a real sequence, spelled out as the three statements `SERIAL` is sugar for so
+each stays independently idempotent. `preferences_one_per_user_idx` is untouched
+by that: the cap came off the **table**, not off the rule about a person, and
+named multi-profiles are still one `DROP INDEX` away rather than accidentally
+opened.
 
 **Whose row? The MY_EMAIL bridge, and it is temporary.** Auth is Phase 2, so
 until then both runtimes resolve "the current user" the same way: look up
@@ -191,6 +312,14 @@ because two variables that must agree about who you are can disagree silently.
 Both files are marked for deletion when magic-link auth lands. Note the
 asymmetry: the TS half memoises (a Next server has no single entrypoint), the
 Python half does not (its entrypoints resolve once and thread the id down).
+
+**The bridge is not how the fan-out finds people, and that distinction is what
+keeps it disposable.** `db/users.digest_users` reads every `is_active` row and
+`run_fan_out` passes each id down explicitly, so the send path never asks who is
+running the script. The bridge answers a different question — "whose dashboard is
+this, whose preview is this" — which is precisely the question a Phase-2 session
+answers instead. Deleting these two files therefore removes a lookup, not a
+capability.
 
 **The nullable window.** `user_id` is nullable, because `ADD COLUMN … NOT NULL`
 would need a default the schema cannot know — the UUID is resolved from the
@@ -242,6 +371,87 @@ company mid-run, and a gate that re-counted the catalog would fail a migration
 that did its job perfectly. A company that appears mid-run is named in the output
 and picked up by the next run.
 
+**Creating a pair has two halves, since 1e.** A tracking row does not only say
+"send me this company's jobs" — it also decides what counts as this person's
+history. The queue is "open, in a company you watch, not back catalogue, not yet
+sent to you", so the instant the row exists every job that company already has is
+in that person's queue, and their first digest is an archive dump. `jobs.seeded`
+does not cover this: it stops a company's **first-ever crawl** reaching anyone and
+says nothing about the weeks of ordinary crawling after it, which is the door
+history walks through. So `db/watchlist.track_companies` writes the pair **and**
+records that company's stored jobs as already-notified for that user, in one
+transaction — there is no instant in which the pair exists and the suppression
+does not, and the hourly digest runs in exactly such an instant if the process
+dies there.
+
+Two sharp edges are worth keeping in mind. The suppression runs **only on a
+genuine insert** (`RETURNING` against `ON CONFLICT DO NOTHING`), because running
+it over an already-tracked pair would swallow every job that arrived since —
+somebody's actual queue, silently. And there is now **one statement and one
+function** for creating a tracking row: the bulk `INSERT ... SELECT` that tracked
+the whole catalog in 1c was deleted rather than kept-but-unused, because a
+convenient path that skips the second obligation is a loaded gun aimed at
+whichever future caller reaches for it. `scripts/track_companies.py` is the
+command-line form and takes `--email` rather than `MY_EMAIL`, unlike every
+migration script here — it acts on a *named* person, and defaulting the target to
+whoever the environment belongs to is how you quietly configure your own account.
+
+### `user_job_notifications` — "this person has been told about this job"
+Columns: `id` (`SERIAL`), `user_id` (`UUID` → `public.users`), `canonical_id`
+(`TEXT` → `jobs`), `notified_at`, `UNIQUE (user_id, canonical_id)`, plus
+`user_job_notifications_job_idx` on `canonical_id`.
+
+**A row existing is the entire decision.** This user has been told about this
+job; no row means not yet. There is no flag on it and no state in between, which
+is the difference from the boolean it replaced — there is nothing to misread.
+
+**The job side is `canonical_id`, not a `job_id`, because `jobs` has no `id`.**
+The primary key there is `canonical_id TEXT`. `notifications` already spells the
+key exactly this way, and a second name for the same key on a sibling table is
+how a join gets written wrong once and reviewed as correct forever. So this table
+carries `TEXT` against the `UUID` on the other side — two deliberately different
+key types on one table, each being what the thing it references actually is,
+exactly as `user_companies` carries `UUID` against `INT`.
+
+**Both foreign keys are `ON DELETE CASCADE`**, the same argument the other two
+per-user tables make: a receipt that outlives its owner records that nobody was
+told something, which is not data. The job side has a sharper version — the
+fan-out is an *anti-join* of `jobs` against these rows, so an orphan is a row no
+join can ever return, and the table's count and the join's count would disagree
+for reasons nobody can see.
+
+**`notified_at` is record-keeping and nothing branches on it**, deliberately. It
+means "when this state was recorded", which for the 1d backfill is the migration
+itself: for the ~7,700 rows the silent seed had marked notified we do not know
+when, or whether, an email ever went out — `notifications` holds fifteen receipts
+against them. Back-dating from `first_seen_at` would put an invented send date in
+a column, which is the mistake `source_posted_at` exists to name. So it follows
+`notifications.sent_at` (written, never read to decide) and deliberately **not**
+`desc_checked_at`, which *does* branch. A future "re-notify after N days" has to
+argue with this paragraph first, because the moment anything branches on the
+value, "when recorded" and "when sent" stop being interchangeable and the
+backfilled rows start lying.
+
+**Two kinds of row, and neither is a lie.** Most are receipts written by
+`record_sent` after a real send. The rest were written because the job must
+*never* be emailed to that person — the 1d backfill of everything the old boolean
+covered, and the tracking-time history suppression above. Both say the identical
+thing to the only query that reads them: this person will not be told about this
+job. What they do not share is a `notifications` receipt, and that is honest —
+one was sent, the other never will be.
+
+**The silent seed is deliberately not handled here.** It is a property of a crawl
+rather than of a person, so it lives in `jobs.seeded` and the queue reads it
+directly. Handling it here instead would mean one row per user per seeded job —
+6,496 of them from a single afternoon's discovery sweep, times everyone who ever
+signs up.
+
+`db/notifications.py` holds every statement that **writes** this table and
+nothing else. The digest's own read is not there: it is four lines of predicate
+inside one query joining `jobs` to `companies`, and splitting that across two
+modules to isolate them would make the query harder to read than the coupling it
+removed. It lives in `notify/store.CANDIDATES_SQL`.
+
 ---
 
 ## The diffing guards (why the inbox stays trustworthy)
@@ -280,13 +490,50 @@ Guards 1 and 2 `return` before any write, so "it changed nothing" is structural
 rather than something the write path has to remember.
 
 **The silent seed.** On a company's first-ever crawl its whole back catalogue
-looks new. A seeding run therefore stores everything with `notified = TRUE`, so
-nothing is ever emailed for it; real alerting starts on crawl #2. `seeding` is
-decided by the caller from the company's stored row count and changes exactly
-one thing — that flag.
+looks new. A seeding run therefore stores everything with `seeded = TRUE`, so
+nothing is ever emailed for it **to anybody**; real alerting starts on crawl #2.
+`seeding` is decided by the caller from the company's stored row count and
+changes exactly one thing — that flag. Being a property of the crawl, it excludes
+the same rows for every user forever, which is what "the silent seed is silent
+for all of us" means.
 
 Nothing is emailed from the crawl loop. Brand-new jobs are simply left
-`notified = FALSE`, and that flag *is* the queue the digest reads.
+`seeded = FALSE`, which makes them *eligible* for a queue — but eligibility is
+not the queue, and since the fan-out it takes two more clauses to become one.
+
+**What the digest actually reads** (`notify/store.CANDIDATES_SQL`), three clauses
+answering three different questions:
+
+```sql
+ WHERE j.status = 'open'
+   AND EXISTS     (user_companies uc WHERE uc.user_id = $1
+                                       AND uc.company_id = j.company_id)
+   AND j.seeded = FALSE
+   AND NOT EXISTS (user_job_notifications n WHERE n.user_id = $1
+                                              AND n.canonical_id = j.canonical_id)
+```
+
+| Clause | Asks | Whose fact |
+|---|---|---|
+| `EXISTS user_companies` | is this job's company one *you* asked about? | a person's — the watch list |
+| `j.seeded = FALSE` | is this job back catalogue? | a crawl's — user-blind and permanent |
+| `NOT EXISTS user_job_notifications` | have *you* been told about it? | a person's — since 1d |
+
+Per-user in the two places that decide, user-blind in the one that describes a
+crawl. The middle clause sits in exactly the position `j.notified = FALSE`
+occupied before it, and that is the whole reason the swap was safe: the old
+boolean was never one rule. It meant "not seeded **and** not emailed", and only
+the second half is about a person — which is why a job emailed to me silenced it
+for everybody else. The two halves were separated rather than swapped.
+
+`EXISTS` rather than a join to `user_companies` for a reason the `NOT EXISTS`
+already gives: the question is existence, Postgres reads both as a semi-join
+anyway, and a join invites the reader to wonder whether the row can come back
+twice. It cannot — `UNIQUE (user_id, company_id)` — but `EXISTS` says so without
+being asked. And note what the queue deliberately does *not* ask:
+`companies.tracked`. That is the crawl's exclusion axis, a property of the
+catalog; conflating it with a watch list would mean a dashboard toggle silently
+emptying somebody else's digest.
 
 ---
 
@@ -310,6 +557,14 @@ location, it does not decide whether the label is interesting.
 - **Tier 3** (`fetchers/tier3.py`) — `custom_jsonld` (scrape `JobPosting`
   JSON-LD) and `custom_sitemap`, for companies on no supported ATS. These expose
   no vendor id, so they get the `hash:` form of `canonical_id`.
+
+Nine ATSes are supported; the live watch list currently uses five of them —
+greenhouse 28, smartrecruiters 8, lever 6, workday 5, ashby 3. `workable`,
+`recruitee` and both Tier-3 custom routes have **no tracked company at all**
+right now, which is worth knowing before trusting any of them: they are exercised
+by fixtures and by the discovery probe, not by the hourly crawl. The Tier-3 pair
+is the one where that gap bites, because it is also the pair with no description
+route (see *Enrichment*).
 
 `fetchers/http.py` provides the shared politeness: one client, a global
 semaphore, per-host pacing, and 429/5xx backoff. Its User-Agent carries a
@@ -448,18 +703,37 @@ fetches each candidate's description exactly once for as long as the posting
 exists, reduces it to `min_experience` and `is_pm_role`, writes those plus the
 three bookkeeping flags, and discards the text.
 
-It used to run only in the digest path, which reads the `notified = FALSE`
-queue — so a description was first read when a job was first considered for an
-*email*. The dashboard's Home screen asks a different question (everything open
-that fits, emailed or not), so a freshly-discovered job appeared there with
-nothing known about its experience requirement and was therefore kept. That is
-correct behaviour on incomplete evidence; the fix was the evidence, not the rule.
-One crawl cycle is now the worst case for how long a job can be shown with its
+It used to run only in the digest path, which reads a send queue — so a
+description was first read when a job was first considered for an *email*. The
+dashboard's Home screen asks a different question (everything open that fits,
+emailed or not), so a freshly-discovered job appeared there with nothing known
+about its experience requirement and was therefore kept. That is correct
+behaviour on incomplete evidence; the fix was the evidence, not the rule. One
+crawl cycle is now the worst case for how long a job can be shown with its
 experience unknown.
 
 Enrichment must never touch a lifecycle column, and that is a property of the
 SQL rather than a promise: the `UPDATE` in `notify/store.py` names only the five
-description columns, so it cannot re-open a closed job or clear a notified flag.
+description columns. No `seeded`, no `status`, no `first_seen_at` — so it cannot
+re-open a closed job, cannot hand a back catalogue to a digest, and cannot make a
+job look newly seen. That is what makes it safe to run in the middle of a crawl.
+
+`fetch_enrichment_targets` correspondingly filters on **no** notification state
+of any kind, in either the old global form or the per-user one. It is the
+*crawl's* queue, not a digest's: every open job that fits has to have had its
+description read, whether or not anybody has been emailed about it.
+
+**One user-shaped seam does exist here, and it is worth knowing about.**
+`enrich_matches` narrows the pass to title-stage matches, which needs *a*
+preferences row — and being a crawl entrypoint it resolves one through the
+MY_EMAIL bridge. So today enrichment is scoped to the bridge user's filter, not
+to the union of everybody's. With one real account the two are identical; with a
+second account whose keywords differ, that user's matches could reach their
+digest with `desc_checked = FALSE`, which means `min_experience` NULL, which
+means **keep** — the same shape as the Step 7c leak, arriving by a different
+route. It is listed under *Pending* rather than fixed here because the fix is a
+design choice (union of active filters, or enrich per user) that Phase 2's auth
+work will re-frame.
 
 **Where the description comes from**, per ATS — and the split is one request
 versus zero:
@@ -570,7 +844,20 @@ crawl path, never in the cron.
 ## Discovery — how a company gets onto the watch list
 
 Everything above assumes a watch list exists. For the first six steps that list
-was hand-typed. `scripts/run_discovery.py` is the machine that grows it.
+was hand-typed. Discovery is the machine that grows it, and it is **two modules,
+split along the line between a verdict and a sweep**:
+
+- `crawler/discover.py` — **one candidate in, one verdict out.** It resolves a
+  name to a board, applies the two bars, and writes the row. Both of the "never"
+  guarantees below are statements about the two SQL constants here (`TRACK_SQL`,
+  `LOG_SQL`), not about the script that calls them.
+- `scripts/run_discovery.py` — the **sweep**: collect candidate names from every
+  source, dedupe them against what is already known, run them through
+  `crawler.discover` concurrently, write every ten, and print the report.
+
+The split is why the guarantees are testable. A rule enforced inside the thing
+that writes one row holds however that row is reached — from the sweep, from
+`--seed-file`, from `--recheck`, or from a future caller that does not exist yet.
 
 ```
 NAMES                    PROBE                        VERDICT
@@ -631,11 +918,20 @@ never required.
 
 - **Never writes `jobs`.** A newly-tracked company has zero stored rows, so the
   next `crawl.py` detects a first-ever crawl and seeds its whole back catalogue
-  with `notified = TRUE` — the same silent seed every other company got. That is
+  with `seeded = TRUE` — the same silent seed every other company got. That is
   the entire reason a run that tracks forty boards does not produce forty
   boards' worth of email, and `tests/test_discovery.py` asserts it twice: once
   against the statement text, once by counting rows after a track.
-- **Never `DO UPDATE` on `companies`.** The upsert is `ON CONFLICT DO NOTHING`.
+- **Never writes `user_companies`.** "Tracked" here means *in the catalog and
+  crawled*, which since 1c is a different axis from *somebody wants alerts about
+  it*. A swept-in company is therefore stored, diffed and enriched from the next
+  hour onwards, and appears in nobody's digest until a `user_companies` row
+  exists for it — `scripts/track_companies.py` is what creates one. That is the
+  correct default rather than an oversight (auto-subscribing every account to
+  whatever a sweep found is the archive-dump failure with a different trigger),
+  but it *is* a step that now has to be taken deliberately. See *Pending*.
+- **Never `DO UPDATE` on `companies`.** `crawler/discover.TRACK_SQL` is
+  `ON CONFLICT DO NOTHING`.
   An existing row knows things the sweep does not — a corrected name, a
   hand-tagged category, a Workday config, or the fact that a person set
   `tracked = FALSE` on purpose. `DO UPDATE` would undo that decision on every
@@ -698,23 +994,35 @@ Next.js App Router + TypeScript in `dashboard/`. Read-mostly.
 
 - **Home (`/`)** — per-company collapsible rows showing **matches only**, with a
   "for you" count per company and, once there is one, an "N applied" count
-  beside it. `notified` is deliberately *not* part of this filter: Home answers
-  "what fits me right now", not "what has not been emailed yet" — a job sent in
-  this morning's digest is still worth applying to this afternoon. It is shown
-  as a badge instead. Every job row carries an **Applied** checkbox.
+  beside it. Whether a job has been emailed is deliberately *not* part of this
+  filter, in either its old global form or the per-user one: Home answers "what
+  fits me right now", not "what has not been emailed yet" — a job sent in this
+  morning's digest is still worth applying to this afternoon. It is shown as a
+  badge instead. Every job row carries an **Applied** checkbox.
 - **Jobs (`/jobs`)** — literally the same component with one prop different
   (`mode="all"`), showing every open posting unfiltered. This is the screen that
   answers "did the crawler miss it, or did the filter drop it?". In this mode
-  each job additionally shows its `status`, whether it is notified, and a
-  SUGGESTED badge if it also passes the filter. There is no Applied checkbox
-  here: this screen is the raw reference, and the tick belongs on the list of
-  jobs worth applying to.
+  each job additionally shows its `status` and a SUGGESTED badge if it also
+  passes the filter. There is no Applied checkbox here: this screen is the raw
+  reference, and the tick belongs on the list of jobs worth applying to.
 - **Add (`/add`)** — resolve a company **by name** (guess the board token from
   the name, trying mechanical variants against greenhouse → lever → ashby, first
   non-empty board wins) or **by URL** (including Workday, parsed for
-  host/tenant/site).
-- **Preferences (`/preferences`)** — edits the single `preferences` row. `PUT`
-  rather than `PATCH`, because the editor sends the full lists it is showing.
+  host/tenant/site). It writes `companies` and **only** `companies`: as with the
+  discovery sweep, adding a board to the catalog is not the same act as somebody
+  subscribing to it, and no `user_companies` row is created here yet.
+- **Preferences (`/preferences`)** — edits **this user's** `preferences` row,
+  found by owner since 1b rather than at `id = 1`. `PUT` rather than `PATCH`,
+  because the editor sends the full lists it is showing.
+
+**The company list is still the shared catalog, on both screens.** Phase 1 made
+the watch list per-user in the database and stopped there on purpose — 1f moved
+the badge and explicitly left the company list alone. So the dashboard shows
+every catalog company rather than the ones you track, and there is no picker for
+adding or removing one. `scripts/track_companies.py` is the only supported way to
+create a tracking row until that screen exists (Phase 3). Worth knowing because
+the two halves now disagree: a company can be visible on Home, crawled hourly,
+full of matching jobs, and still in nobody's digest.
 
 Both screens ship only counts, never job rows: sending ~790 rows of JSON with
 the page to render twelve numbers would be wasted, and eleven of twelve rows
@@ -730,14 +1038,47 @@ minimum years) so an unenriched row says so rather than looking judged.
 `dashboard/src/lib/jobs.ts` require `status = 'open'`, so a job closed by
 Guard 3 (`miss_count >= 3`) disappears from both screens.
 
+### `src/lib/` — what is where, and why some of it is split
+
+| Module | Holds |
+|---|---|
+| `db.ts` | the postgres.js pool, `prepare: false` |
+| `env.ts` | every env read, with `required()` for the ones that must not default |
+| `jobs.ts` | the two job queries and `setApplied` — the app's only write to `jobs` |
+| `companies.ts` | shared company queries + `upsertCompany`; read by routes *and* by server components directly |
+| `preferences.ts` | load/save this user's row, `cleanList` |
+| `currentUser.ts` | the MY_EMAIL → `public.users.id` bridge, memoised. **Temporary; deleted at Phase 2 auth** |
+| `labels.ts` | `Preferences`, `CITY_LABELS` — **constants with no database import** |
+| `match.ts` | the port of `notify/match.py` |
+| `ats.ts` / `workday.ts` | the port of `fetchers/resolve.py` |
+| `board-url.ts` | a pasted URL → `(ats, token, config)`. Dashboard-only; no Python counterpart |
+| `badges.ts` | the derived NEW / NOTIFIED / SUGGESTED rule |
+| `guard.ts` | `requireSession()`, called at the top of every API route |
+
+Two of those splits are load-bearing rather than tidiness.
+
+`labels.ts` exists because a client component that imports a **value** from a
+module drags that module's whole import graph into the browser bundle — and
+`preferences.ts` imports postgres.js, which needs Node's `net` and fails the
+build. Types are erased at compile time and travel anywhere; values do not. So
+the constants live in a file that imports nothing.
+
+`guard.ts` is belt-and-braces with `middleware.ts` on purpose. Middleware
+protection is a regex matcher, and a matcher is one careless edit away from a
+hole nothing tests. Re-checking inside the handler makes the guarantee local to
+the code that touches the database: a route can be read in isolation and seen to
+be protected. `CITY_LABELS` does similar work at the other end — the preferences
+API rejects a city outside that set, because a typo there matches nothing,
+silently, forever, and would otherwise be discovered three empty digests later.
+
 ### Status badges — derived, never stored
 
 One badge per job row, computed at render from data the row already carries:
 
 | Badge | Screen | Rule |
 |---|---|---|
-| `NEW` | Home | is a match **and** `notified = FALSE` — queued, not yet emailed |
-| `NOTIFIED` | Home | is a match **and** `notified = TRUE` — already went out |
+| `NEW` | Home | is a match **and** *I* have not been told — no `user_job_notifications` row for me and this job |
+| `NOTIFIED` | Home | is a match **and** *I* have been told — such a row exists |
 | `SUGGESTED` | Jobs | passes the same shared filter, on a list that does not apply it |
 
 A non-matching row on Jobs gets no badge, which is the point — that screen is
@@ -745,20 +1086,45 @@ several hundred postings including the sales roles, and SUGGESTED is what makes
 the few that fit findable in it. Showing NEW/NOTIFIED there, or SUGGESTED on
 Home, would put the same badge on every row and therefore say nothing.
 
+**"Told me", not "told somebody" — the Phase 1f change.** The first two badges
+read `jobs.notified` until 1f, and that boolean means "somebody was emailed about
+this": a faithful paraphrase of "I was emailed about this" for exactly as long as
+there is one account. With two, the first person's digest turns the second
+person's NEW into NOTIFIED — a badge asserting an email that person never
+received. The screen was the boolean's last reader, which is why 1f had to happen
+before 1g could drop it. `user_notified` now comes from
+`lib/jobs.notifiedToUser`, the **same predicate the digest queue asks** in
+`CANDIDATES_SQL`, read from the other side: the queue asks `NOT EXISTS` to decide
+what to send, the badge asks `EXISTS` to decide what to say. Two readings of one
+table, and no third place for the rule to be restated slightly differently.
+
+For the one real account both readings cover the identical set of jobs, so 1f
+changed no badge on any screen — and that is verified rather than assumed:
+`npm run badge-check` compares them against the live database and proves the
+per-user half with a second account inside a transaction that always rolls back.
+
 There is **no column** for any of this and there must not be. A badge is a
-reading of the match rules plus `notified`, and the match rules read the
+reading of the match rules plus a per-user fact, and the match rules read the
 `preferences` row, which is editable from another tab — so a stored badge would
 be a cached answer to a question whose inputs change under it, wrong within
 seconds and wrong silently. Deriving it costs one boolean per row and cannot go
 stale. `dashboard/src/lib/badges.ts` states the rule; the `matches` half comes
 from `lib/match.ts`, the same parity-checked port the "for you" count uses.
 
+That is also the argument behind the three-step type ladder in `lib/jobs.ts`,
+which 1f is what made necessary: `JobRow` is the columns of `jobs` (the same
+answer for everybody, forever), `UserJobRow` adds *have I been told about this*,
+`JobView` adds *does it pass my filter right now*. Only the first is stored.
+Keeping them as separate types is what stops the second and third drifting back
+into the table, which is the mistake `jobs.notified` was.
+
 NEW is not speculative. It was originally verified by temporarily flipping one
-live match to `notified = FALSE`, confirming the badge, and restoring the row —
-because at that point the table had been silently seeded and nothing else had
-ever been queued. Since Step 6 it is simply the ordinary state: the hourly crawl
-queues genuinely-new postings at `notified = FALSE`, and they read NEW on Home
-until that hour's digest sends and flips them.
+live match, confirming the badge, and restoring the row — because at that point
+the table had been silently seeded and nothing else had ever been queued. Since
+Step 6 it is simply the ordinary state: the hourly crawl queues genuinely-new
+postings, they read NEW on Home until that hour's digest sends, and the receipt
+that digest writes flips them. A job that **somebody else's** digest sent stays
+NEW here, which is the whole point of the change.
 
 ### The Applied checkbox
 
@@ -796,11 +1162,20 @@ because the module is evaluated at import time including during `next build` —
 and **every fallback is the closed one**: a missing `ALLOWED_EMAIL` authorises
 nobody.
 
+**Auth is still `ALLOWED_EMAIL`, and that is a separate axis from Phase 1.** One
+Google account may sign in; `MY_EMAIL` decides which `public.users` row that
+session reads. The two must name the same person and nothing checks that they do
+— which is safe only because the install has one of each, and is exactly what
+Phase 2 replaces with a session carrying a real user id.
+
 **Writes the dashboard is allowed to make**, and nothing else:
-`companies.tracked`, `companies.category`, the single `preferences` row,
+`companies.tracked`, `companies.category`, this user's `preferences` row,
 inserting a company, and `jobs.applied` / `jobs.applied_at`. Everything else
 about a job stays read-only — the crawler owns the lifecycle, and a dashboard
-able to edit `notified` or `status` could silently un-send or re-send a digest.
+able to edit `seeded` or `status` could silently un-send or re-send a digest.
+Note what is *not* on that list: `user_companies` and `user_job_notifications`.
+The dashboard reads the second (for the badge) and neither reads nor writes the
+first, so it cannot subscribe you to a company and cannot mark a job as sent.
 The applied pair is not a hole in that rule but the other side of it: those two
 columns record something no crawl can observe, so nothing but the dashboard
 could write them. `lib/jobs.setApplied` is the one statement in the app that
@@ -830,10 +1205,54 @@ disagreement:
 Run `match-parity` after touching either matcher; its total is directly
 comparable to `python scripts/preview_digest.py --dry-run --ignore-notified`.
 
-A third check answers a different question. `npm run ui-check` needs a **running**
+Two more checks answer questions parity cannot. Neither is about drift between
+the two languages; both are about a thing being *true against the real database*.
+
+| Command | Asks |
+|---|---|
+| `npm run db:check` | does the transaction pooler actually work? Several parameterised and concurrent queries in a row, not one `SELECT 1` — the prepared-statement failure is never the first query, it is the second or third |
+| `npm run config-roundtrip` | does a company added through the dashboard store `config` as a jsonb **object**? |
+| `npm run badge-check` | is the NEW / NOTIFIED badge genuinely **per-user**? |
+
+`badge-check` is the Phase-1f/1g check and is shaped by what it cannot prove from
+one account. §1 asserts the drop actually happened — `jobs` has no `notified` and
+nothing in `dashboard/` names it — and asks both halves, because they fail apart:
+a database the migration never reached still carries the column while no code
+reads it, and a revert of 1g's diff has code naming a column the schema no longer
+has. §2 is the interesting one. "A job notified to B reads NEW for me" cannot be
+demonstrated by a user who owns no rows, so it **creates a second account inside
+a transaction**, asks the production predicate under both identities, and rolls
+back in a `finally` that does not depend on the assertions passing — then
+re-counts outside the transaction to verify the rollback rather than assuming it.
+§3 checks the "for you" counts come from my preferences row and nobody else's. It
+imports `lib/jobs.notifiedToUser` and `lib/badges.homeBadge` themselves rather
+than restating them, which is the same discipline `match-parity` enforces one
+language over: a check that restates the rule proves a copy of it.
+
+`config-roundtrip` is the Step 5e bug turned into a test, and its assertion is
+deliberately not "what I put in comes back out" — that would have **passed**
+against the bug. `upsertCompany` bound `${JSON.stringify(config)}::jsonb`, and
+postgres.js serialises jsonb with its own `JSON.stringify`, so the value was
+encoded twice and the column held a jsonb *string* of JSON text. Every dashboard
+screen looked right, because postgres.js parsed it back once on the way out. The
+failure surfaced 30 minutes later, in the other language: asyncpg returns jsonb
+as text, `Company.from_row` decoded it once into a `str`, and `config.get("host")`
+raised `'str' object has no attribute 'get'` — which Guard 1 logged as a fetch
+error, so the company crawled to nothing indefinitely while looking like an
+unreachable board. So the check asks `jsonb_typeof(config) = 'object'`, of
+Postgres, which is the only question whose answer both sides share. The empty
+config is checked too and is not redundant: `'"{}"'::jsonb` is not `'{}'::jsonb`,
+so a double-encoded blank also defeats the `ON CONFLICT` rule that refuses to
+overwrite a stored config with an empty one — a re-add by name could then blank a
+Workday row's host/site.
+
+A further check answers a different question. `npm run ui-check` needs a **running**
 dev server: it fetches real rows from the real API over HTTP with a minted
-session, renders the shipped `JobLine` component with them, and asserts the
-checkbox and the badges are actually in the markup. It exists because the Applied
+session (minted by `npm run mint-session`, which encrypts a token with the same
+`AUTH_SECRET` and the same `encode` the real callback uses — Google's consent
+screen needs a browser, which would otherwise make the entire authorised half of
+the app untestable from a terminal), renders the shipped `JobLine` component with
+them, and asserts the checkbox and the badges are actually in the markup. It exists because the Applied
 checkbox and the badges were once specified, agreed and never built, and nothing
 in the repo could tell the difference — a type checker proves the props line up
 and a query proves the column exists, but neither proves a person opening the
@@ -863,7 +1282,7 @@ placeholders.
 | `SUPABASE_CA_CERT` | `db/connection.py` | *optional* — path to the downloaded CA to verify the pooler certificate for real |
 | `RESEND_API_KEY` | `notify/digest.py` | rejected if still the `re_xxxx` placeholder |
 | `FROM_EMAIL` | `notify/digest.py` | `onboarding@resend.dev` (Resend's sandbox sender) unless a domain is verified |
-| `MY_EMAIL` | `notify/digest.py`, `fetchers/http.py`, `dashboard/src/lib/ats.ts`, **`db/users.py`**, **`dashboard/src/lib/currentUser.ts`** | digest recipient; the contact address in the outbound User-Agent; and, since Phase 1b, **the identity the current user is resolved from in both runtimes**. Falls back to `unknown@example.com` in the two User-Agent paths only. The digest requires it, and so does anything that loads preferences — including **the dashboard**, where it was previously optional. Must now be set on Vercel |
+| `MY_EMAIL` | `notify/digest.py`, `fetchers/http.py`, `dashboard/src/lib/ats.ts`, **`db/users.py`**, **`dashboard/src/lib/currentUser.ts`** | the contact address in the outbound User-Agent; the sandbox-sender assertion in `assert_self_send`; and, since Phase 1b, **the identity the current user is resolved from in both runtimes**. Falls back to `unknown@example.com` in the two User-Agent paths only. The digest requires it, and so does anything that loads preferences — including **the dashboard**, where it was previously optional. **Required on Vercel** |
 | `GOOGLE_CLIENT_ID` | `dashboard/src/auth.ts` | |
 | `GOOGLE_CLIENT_SECRET` | `dashboard/src/auth.ts` | |
 | `AUTH_SECRET` | Auth.js | signs the session cookie; changing it logs you out everywhere |
@@ -873,9 +1292,34 @@ placeholders.
 | `GITHUB_TOKEN` | `fetchers/discovery.py` | *optional* — unlocks GitHub **code** search, which is 401 unauthenticated. Without it the sweep falls back to repository search + README mining and works fine, just narrower |
 
 Because the sandbox sender can only deliver to the address that owns the API
-key, `notify/digest.py` asserts locally that the recipient equals `MY_EMAIL`
-before making any network call — so a mistyped recipient fails with a message
-naming the actual constraint rather than as a 403 that reads like an auth error.
+key, `notify/digest.assert_self_send` refuses locally the send Resend would
+refuse remotely — so a wrong recipient fails with a message naming the actual
+constraint rather than as a 403 that reads like an auth error, and fails before
+any network call and before any write.
+
+**That guard was narrowed in 1e, and the narrowing is a tightening rather than a
+loosening.** It used to be stated as an absolute — "the digest may only go to
+`MY_EMAIL`" — which was an accurate paraphrase while there was one digest and one
+person, but the *reason* it is true has always been the sandbox sender. With the
+rule stated absolutely, every second user's digest would be refused forever and
+verifying a domain would change nothing. So the guard now fires exactly when the
+constraint exists: recipient equals `MY_EMAIL`, fine; `FROM_EMAIL` is not the
+sandbox sender, fine (Resend will deliver, and refusing would be this function
+inventing a restriction rather than reporting one); otherwise it raises. Today's
+behaviour is unchanged to the character, because `FROM_EMAIL` *is* still
+`onboarding@resend.dev` — **only the `MY_EMAIL` account can actually receive a
+digest on this install, and a second real user's send fails loudly.** What
+changed is that verifying a domain is now sufficient to make the fan-out real.
+
+**`MY_EMAIL` as identity is a bridge with an expiry date.** `db/users.py` and
+`dashboard/src/lib/currentUser.ts` resolve the current user by looking that
+address up in `public.users`, in both runtimes, because auth is Phase 2 and there
+is no session to ask yet. Deriving it from the address the install already had —
+rather than adding a `DEFAULT_USER_ID` — is deliberate: two variables that must
+agree about who you are can disagree, silently, and the failure surfaces as an
+empty digest rather than as an error. **Both files are marked for deletion when
+magic-link auth lands**, and neither is on the send path: the fan-out gets its
+recipients from `public.users` and threads an explicit id down.
 
 ---
 
@@ -888,9 +1332,29 @@ scripts that were already proven by hand and adds no logic of its own:
 every hour (cron '0 * * * *', UTC)   or   Actions -> crawl -> Run workflow
   └─ checkout -> setup-python 3.12 -> pip install -r requirements.txt
      └─ verify secrets -> python scripts/crawl.py -> python scripts/send_digest.py --tag cron
+                          ─────────────────────     ─────────────────────────────
+                          crawl once, user-blind    fan out, one email per user
 ```
 
 The repo is public, so Actions minutes are free and unlimited.
+
+**Two steps, and the asymmetry between them is the design.** `crawl.py` fetches
+every tracked board once, for everybody, and knows nothing about users — it is
+not per-user and never will be. `send_digest.py` is where all the narrowing
+happens: for each active account, their preferences row, their tracked companies,
+their queue, their email, their receipts. The step names say so
+(*Crawl every tracked board*, then *Send the digests*), and the workflow gained
+nothing else in Phase 1 — the fan-out is entirely inside the second script.
+
+**One user's failure is not everyone's.** `run_fan_out` catches `DigestError`
+per account — a refused recipient, a Resend outage — records it against that user
+and continues, because the alternative is one broken account silencing every
+other. Nothing is written for the user who failed: `run_digest` raises before any
+row is touched, which is Guard 1 applied to email. The script then reports them
+and exits non-zero, so the step goes red; a failure that appears only in a log is
+a failure nobody sees. A user with zero matches sends nothing, writes nothing,
+and never reaches `email_config()` — which is why the preflight secret check
+below survives the fan-out unchanged and still does the work it always did.
 
 **Why hourly for everything.** An earlier note here planned two tiers — 30
 minutes for `tracked` companies, daily for the rest. There is no second tier to
@@ -916,7 +1380,9 @@ for the import.)
   arbitrary statement and keep the *newer* one, when the older may already have
   jobs queued and an email in flight. Queueing means a slow run only delays the
   next one.
-- **`timeout-minutes: 20`.** A full crawl of 14 boards takes ~2 minutes. The
+- **`timeout-minutes: 20`.** The ceiling was set against 14 boards; the watch
+  list is **50** since Step 7 and the run still finishes inside it comfortably,
+  because `fetchers/http.py` overlaps boards rather than walking them. The
   ceiling is for a vendor that accepts a connection and then never answers, and
   it sits well under the hourly cadence so a hung run cannot still hold the
   concurrency group when the next is due.
@@ -950,7 +1416,7 @@ Four, and only four — the values are the ones already in the local `.env`:
 | `CRAWLER_DB_URL` | `.env` | Supabase **session** pooler, port **5432** |
 | `RESEND_API_KEY` | `.env` | |
 | `FROM_EMAIL` | `.env` | `onboarding@resend.dev` |
-| `MY_EMAIL` | `.env` | must be the Resend account address |
+| `MY_EMAIL` | `.env` | must be the Resend account address, **and must match a `public.users` row** — the cron resolves the current user from it |
 
 `DASHBOARD_DB_URL`, `GOOGLE_*`, `AUTH_SECRET` and `ALLOWED_EMAIL` are
 dashboard-only and are deliberately **not** set here; the crawler never reads
@@ -978,14 +1444,17 @@ Actions → the red run → the `crawl` job → expand the step that failed.
 | `Verify required secrets` | a secret is unset or misspelled; the error names which |
 | `Install runtime dependencies` | a dependency yanked or a wheel missing for 3.12 |
 | `Crawl every tracked board` | the database is unreachable — check the DSN is the 5432 pooler, and that the Supabase project is not paused |
-| `Send the digest` | Resend rejected the send; the message names the HTTP status |
+| `Send the digests` | Resend rejected a send, or one account failed; the message names the HTTP status and the affected address |
 
-A red `Send the digest` **loses nothing**. A failed send is a no-write, so the
-matched jobs stay `notified = FALSE` and the next hourly run picks them up. The
-same is true of a run that never started: the queue is a database column, not an
-in-memory list, so a skipped hour is deferred rather than dropped. GitHub's
-scheduler is best-effort and does run late under load — the cron is a floor on
-the interval, not a promise.
+A red `Send the digests` **loses nothing**, and since the fan-out it loses
+nothing *for the accounts that succeeded either* — the step is red if any user
+failed, and the ones that sent are already recorded. A failed send is a no-write,
+so those matched jobs stay in that user's queue (no `user_job_notifications` row
+was written for them) and the next hourly run picks them up. The same is true of
+a run that never started: the queue is a set of rows, not an in-memory list, so a
+skipped hour is deferred rather than dropped. GitHub's scheduler is best-effort
+and does run late under load — the cron is a floor on the interval, not a
+promise.
 
 ## Build status / changelog
 
@@ -1154,6 +1623,97 @@ Newest last. Append here as the project evolves.
   re-asks every failed row once and cannot touch a clean read (those are never
   re-read whatever the cutoff says).
 
+- **2026-08-02 — First week unattended, and a doc-drift pass.** No code changed;
+  this entry records what running the thing for five days actually showed, and
+  what reading the doc against the tree turned up.
+
+  *The system runs.* The hourly cron has been crawling all **50** companies
+  without intervention — most recent sighting 2026-08-02 05:04 UTC, and **every
+  one of the 50 has stored rows**, so no board was tracked into permanent
+  failure. **8,587** jobs stored, **7,674** open, **913** closed by Guard 3.
+  Newest first-sighting 2026-08-01, so the diff is still finding genuinely new
+  postings a week in rather than having gone quiet.
+
+  *The inbox is quiet, which is the design working.* Five digests exist in
+  `notifications`, fifteen receipts in total: `2026-07-26-first-real` (2),
+  `2026-07-27-local-verify` (5), then the cron's own — 07-28 (5), 07-29 (2),
+  07-31 (1). **07-30 and 08-01 produced no digest at all**, because nothing
+  matched. That is the outcome the preflight secret check exists for, now
+  observed in production rather than argued for: two of five days sent nothing,
+  so a mistyped email secret would genuinely have gone unnoticed on those days.
+  Note also that 7,706 rows carry `notified = TRUE` against fifteen receipts —
+  the gap is the silent seed, exactly as intended.
+
+  *7c held.* Of the open jobs, **zero** carry `desc_fetch_failed` — the
+  SmartRecruiters route did not regress, and no other vendor quietly became a
+  route that does not exist. Only 89 open rows are `desc_checked`, which is the
+  title-stage seam doing its job: enrichment reads a few dozen descriptions, not
+  7,674. The stored city spread is `other` 5,838 / `blr` 1,342 / `hyd` 198 /
+  `india-unclear` 192 / `pune` 104 — *store loosely* made visible, and the
+  `india-unclear` bucket is now small and vague-only rather than the 501-row
+  mixed bag 7b relabelled.
+
+  *Doc drift found and fixed here.* Four things the file described less
+  accurately than the code deserved: discovery was attributed entirely to
+  `scripts/run_discovery.py` when the two "never" guarantees are actually
+  properties of `crawler/discover.py`'s SQL; `src/lib/` had no map, hiding two
+  load-bearing splits (`labels.ts` importing no database so client components can
+  import values, `guard.ts` re-checking what middleware already matched);
+  `npm run db:check` and `npm run config-roundtrip` were undocumented despite
+  `config-roundtrip` being the Step 5e bug turned into a test; and the timeout
+  rationale still said "14 boards". Also noted for the first time: **four of the
+  nine supported ATSes have no tracked company**, so `workable`, `recruitee` and
+  both Tier-3 routes are fixture-tested only.
+
+- **2026-08-02 — Phase 1a. The user stops being implicit.** `public.users` —
+  uuid primary key, `email` unique, a unique index on `lower(email)`, `plan` and
+  `is_active`. `scripts/seed_user.py` creates the row from `MY_EMAIL`, so a fresh
+  database is reproducible without the repo ever holding an address.
+
+  The whole point of the step is that it changes nothing. **Nothing reads the
+  table**: no crawler path, no dashboard route, no foreign key. It is
+  deliberately inert, so adding it could break nothing, and every sub-phase after
+  this one is a key pointing back at it.
+
+  Two decisions worth the ink. `UUID` rather than the `SERIAL` the rest of the
+  schema uses, because Phase 2's magic-link auth keys users by uuid on both
+  Supabase Auth and the Auth.js adapters, and a `SERIAL` would mean carrying a
+  provider-id column to join on forever. And **every reference is schema-
+  qualified `public.users`**, because Supabase ships its own `auth.users`: a bare
+  `CREATE TABLE IF NOT EXISTS` resolves against a `search_path` this project does
+  not set, so with `auth` ahead of `public` it would find that table, skip,
+  report success, and leave `public.users` uncreated. A silent failure, not a
+  loud one — which is why the qualification is a rule rather than a preference.
+
+- **2026-08-02 — Phase 1b. The filter gets an owner.** `preferences.user_id`
+  (`UUID` → `public.users`, `ON DELETE CASCADE`, nullable) plus
+  `preferences_one_per_user_idx`, a *partial* unique index so named
+  multi-profiles stay one `DROP INDEX` away. `WHERE id = 1` is gone from every
+  loader in both runtimes; `scripts/backfill_preferences_user.py` attaches the
+  existing row. Behaviour unchanged — match-parity clean, selection fingerprint
+  identical. 8 new tests, 553 total.
+
+  This is where the **MY_EMAIL bridge** appears, in both runtimes at once:
+  `db/users.py` and `dashboard/src/lib/currentUser.ts`, each resolving
+  `public.users WHERE lower(email) = lower(MY_EMAIL)`. Reusing the address the
+  install already had rather than adding a `DEFAULT_USER_ID` is the decision —
+  two variables that must agree about who you are can disagree silently, and the
+  symptom is an empty digest rather than an error. Both files are marked for
+  deletion at Phase 2.
+
+  The half that did not change is the failure mode. `user_id` had to arrive
+  nullable (`ADD COLUMN … NOT NULL` needs a default the schema cannot know), so
+  there is a window in which the row exists unowned and a user-scoped loader
+  finds nothing. Falling back to the seeded defaults there would silently replace
+  a filter someone tuned and *email the results* — so both loaders spend one
+  extra query on the miss path to tell "no row for this user" from "the migration
+  is half-applied", and **raise** on the second. Applying the schema and running
+  the backfill is one unit with no crawl or digest between them.
+
+  `CHECK (id = 1)` was deliberately left standing. A PK reshape with no consumer
+  is a speculative change; it comes down in 1e, which is the first sub-phase that
+  genuinely needs a second row.
+
 - **2026-08-03 — Phase 1c. The watch list becomes per-user.** `user_companies`
   joins `public.users` to `companies`, both sides `ON DELETE CASCADE`, unique per
   pair. `scripts/backfill_user_companies.py` tracks all **50** catalog companies
@@ -1179,10 +1739,169 @@ Newest last. Append here as the project evolves.
   vacuously by asserting nothing. Neutering the pragma fails all three FK tests,
   which is how that was confirmed rather than assumed.
 
+- **2026-08-03 — Phase 1d. "Notified" gets an owner.**
+  `user_job_notifications` — `user_id` `UUID`, `canonical_id` `TEXT` (because
+  `jobs` has no `id` column and `notifications` already spells the key that way),
+  both `ON DELETE CASCADE`, `UNIQUE (user_id, canonical_id)`, reverse index on
+  the job side. A row existing *is* the decision; there is no flag on it and no
+  state in between. The backfill recorded every `notified = TRUE` job against the
+  MY_EMAIL user behind a two-part gate — anti-join uncovered `== 0` **and** count
+  equality — refusing rather than passing on a mismatch. 20 new tests, 634 total;
+  live: uncovered 0, digest a no-op, parity 34 unchanged.
+
+  The half that did not change is `jobs.notified`, and deliberately: the new
+  table became the **read** authority while the boolean went on being **written**
+  in the same transaction. Three reasons, all of which later expired — it was the
+  rollback net (reverting 1d could not re-send anything sent during the 1d
+  window), it was the backfill's only accurate source for a re-run, and the
+  dashboard badge still read it, so dual-writing kept the screen honest without
+  touching a line of TypeScript.
+
+  The queue this step could ship was therefore a **conjunction, not a swap**:
+  `notified = FALSE AND NOT EXISTS (…)`. The first clause was load bearing on the
+  *crawl* path — the silent seed wrote `notified = TRUE` across a whole back
+  catalogue, and those rows have no per-user row at all, so reading the new table
+  alone would have queued an entire freshly-seeded board. One discovery sweep had
+  seeded 6,496 rows in an afternoon. That obligation was written into
+  `schema.sql` and into `CANDIDATES_SQL` as a note addressed to 1e.
+
+- **2026-08-03 — Phase 1e. The fan-out — crawl once, notify each.**
+  `run_fan_out` loops `run_digest` over every active account: their preferences,
+  their tracked companies, their queue, their filter, their own address, their
+  receipts. Isolation is in the SQL (every statement bound to one `user_id`)
+  rather than in the loop being careful, and one user's `DigestError` is recorded
+  against them while everybody else still gets their digest. `scripts/
+  preview_fanout.py` shows what every user *would* receive, with an overlap
+  report — a job at a company two people watch should appear twice; a job at a
+  company only one watches appearing twice is the leak the script exists to make
+  visible. 25 new tests, 679 total; proven live with a real two-user run.
+
+  It discharged 1d's obligation by **replacing the seed marker outright** rather
+  than keeping the conjunction. `jobs.seeded` now carries "this row is back
+  catalogue" — written by the same `mark_new` call from the same `seeding` flag,
+  read by the queue in the exact position `notified = FALSE` occupied. So the
+  queue became per-user in the two clauses that are about a person and user-blind
+  in the one that describes a crawl.
+
+  The hazard this step *found* is the one worth remembering, because
+  `jobs.seeded` does not cover it. A user who starts tracking a company that has
+  been in the catalog for weeks inherits hundreds of perfectly ordinary rows —
+  not seeded, never emailed to anyone, sitting open — and they would all be that
+  person's first digest. So `track_companies` writes the pair and records that
+  company's stored history as already-notified **in one transaction**, only on a
+  genuine insert. The bulk `TRACK_ALL_COMPANIES_SQL` from 1c was *deleted* rather
+  than left unused: a convenient statement that skips the second obligation is a
+  loaded gun aimed at whichever future caller reaches for it.
+
+  Two smaller removals. `CHECK (id = 1)` came off `preferences` with the sequence
+  restored, exactly as 1b predicted — a fan-out with one filter is not a fan-out,
+  and it is the second *filter*, not the second user, that proves a digest was
+  computed for a person. And `assert_self_send` was narrowed to fire only for the
+  sandbox sender: stated as an absolute it would refuse every second user's
+  digest forever and verifying a domain would change nothing. Live behaviour
+  identical to the character.
+
+  Untouched, and asserted so: the crawl path, byte-for-byte.
+
+- **2026-08-03 — Phase 1f. The last reader moves.** `homeBadge` derives NEW /
+  NOTIFIED from `lib/jobs.notifiedToUser(userId)` — the `EXISTS` mirror of the
+  digest's `NOT EXISTS`, same table, same predicate — and `jobs.notified` came
+  out of `jobColumns()` so it travels on no row at all. The type ladder
+  `JobRow → UserJobRow → JobView` is what keeps the three kinds of fact apart:
+  the columns, the one per-user fact, and the filter's verdict at render time.
+  `setApplied` stays column-only, with `user_notified` re-attached client-side.
+  45-case invariant added, 724 total; match-parity 34, typecheck and ui-check
+  clean.
+
+  The change is one of **meaning** — "somebody was told" to "I was told" — and
+  for a single account the two cover the identical set of jobs, so no badge on
+  any screen moved. That is exactly why it could not be proved by looking at a
+  screen: `npm run badge-check` asserts a symmetric difference of zero for the
+  real user, then proves the per-user half in both directions against a second
+  account created inside a transaction that always rolls back. A textual
+  invariant (`tests/test_dashboard_notified.py`) now forbids `.notified` across
+  the whole dashboard, with `badge-check.ts` the single enumerated exemption,
+  scheduled to expire with 1g.
+
+  Deliberately untouched: the matchers, the crawler, the digest, and the
+  dashboard's company list — which is still the shared catalog rather than your
+  watch list, and stays that way until Phase 3.
+
+- **2026-08-03 / 08-04 — Phase 1g. The column goes, and isolation stops being a
+  thing a person checked once.** Two commits, in the only safe order.
+
+  *Code first.* Nothing in the deployed runtime touches `jobs.notified` any more:
+  `UPSERT_SEEN` no longer names it, `mark_new` writes only `seeded` (and its
+  parameter is named for what it writes again), `record_sent` is two writes in
+  one transaction, `ENRICHMENT_TARGETS_SQL` drops it from the SELECT list,
+  `crawl.py` reports seeded/eligible, and `relabel_cities`' fingerprint guards
+  the column that now decides. The DROP was **deliberately not in that commit**:
+  the deployed cron and dashboard were still running code that read the boolean,
+  and old code against a dropped column is an outage, not a no-op. Expand, then
+  contract.
+
+  *Then the schema.* `ALTER TABLE jobs DROP COLUMN IF EXISTS notified` — the
+  first `DROP COLUMN` in the file, following the shape the existing
+  `DROP CONSTRAINT IF EXISTS` already set: the `CREATE TABLE` keeps describing
+  the table as it was built, and the removal is stated once, where there is room
+  to say why. The 1d and 1e backfills were deleted alongside it, because both
+  read the column and neither could outlive it.
+
+  Three things had to be true first, and all three were: no page render, query or
+  badge read it; the code that stopped reading it was **deployed**, not merely
+  written; and every job the boolean called notified was already recorded
+  per-user, with every silently-seeded row already carrying `jobs.seeded`.
+
+  Why it survived three sub-phases after its last reader, and why it stopped:
+  **a net for a rollback nobody can still perform is not a net.** Once 1e was
+  proven in production the earlier phases were not revertible in any case, and a
+  column written by one statement and read by none is worse than absent — the
+  next person to find it reasonably assumes something depends on it, and the
+  first edit made on that assumption is a silent one.
+
+  `tests/test_leakage.py` is the other half of the commit and the more durable
+  one. 1e and 1f were verified **by hand**; this states five properties that run
+  on every commit — no job crosses between two digests (all four watch-list ×
+  filter cells at once), a write for one user touches no row of another's (both
+  directions, both slices snapshotted), send order does not matter, a shared job
+  is one receipt *per person*, and tracking-time suppression is per-user. Every
+  test that could be satisfied by a difference in *filters* gives both users the
+  same filter, so only per-user state can separate them; each property was
+  confirmed to fail under a deliberate mutation of the clause it defends. The
+  suite ends Phase 1 at 724, with the column absent from `information_schema`.
+
 **Pending**
 
 - Work the `discovered_companies` "try Workday" queue by hand with
-  `scripts/add_workday.py` — the sweep cannot resolve a Workday site.
+  `scripts/add_workday.py` — the sweep cannot resolve a Workday site. **97**
+  names carry the flag, out of 224 unresolved rows; 5 Workday tenants are
+  tracked so far.
+- **Tier-3 has no description route and no tracked company**, and those two facts
+  are related: the gap has never bitten because nothing exercises it. If a
+  `custom_jsonld` or `custom_sitemap` company is ever tracked, every one of its
+  postings enters the digest with `min_experience` NULL — the second-stage filter
+  silently off for that vendor, which is precisely the Step 7c failure.
+- **Nothing creates a `user_companies` row except `scripts/track_companies.py`.**
+  The discovery sweep and the dashboard's Add screen both write `companies` and
+  stop there, which is the right default — auto-subscribing every account to
+  whatever a sweep found is the archive dump with a different trigger — but it
+  means a company can now be in the catalog, crawled hourly, full of matching
+  jobs, and in nobody's digest. Since Step 7 the sweep is how most companies
+  arrive. Run `track_companies.py --email … --company-ids …` after a sweep, or
+  build the picker (Phase 3) and stop having to remember.
+- **Enrichment is scoped to the MY_EMAIL user's filter**, because
+  `enrich_matches` is a crawl entrypoint and needs *a* preferences row to pick
+  title-stage matches. Harmless with one account. With a second account whose
+  keywords differ, their matches can reach their digest `desc_checked = FALSE` —
+  `min_experience` NULL, and unknown means keep, which is the Step 7c shape
+  arriving by a new route. The fix is a design choice (enrich over the union of
+  active filters, or per user) that Phase 2 will re-frame, so it is written down
+  rather than guessed at now.
+- **Two comment references in `db/schema.sql` name scripts 1g deleted** —
+  `scripts/backfill_seeded_flag.py` and `scripts/backfill_user_notifications.py`,
+  both in the present tense ("is what then makes the column honest",
+  "is the seed"). The git history has them, which is what the surrounding prose
+  says; the sentences pointing at the working tree need re-tensing.
 
 **Won't do (deliberate)**
 
