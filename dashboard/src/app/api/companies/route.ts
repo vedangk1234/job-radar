@@ -16,7 +16,7 @@ export async function GET() {
   if (!gate.ok) return gate.response;
 
   try {
-    return NextResponse.json({ companies: await listCompanyCards() });
+    return NextResponse.json({ companies: await listCompanyCards(gate.session.userId) });
   } catch (err) {
     return serverError(err, "GET /api/companies");
   }

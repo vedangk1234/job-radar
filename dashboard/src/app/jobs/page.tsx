@@ -31,9 +31,9 @@ export const dynamic = "force-dynamic";
  * applying to.
  */
 export default async function JobsPage() {
-  await requirePage();
+  const { userId } = await requirePage();
 
-  const companies = await listCompanyCards();
+  const companies = await listCompanyCards(userId);
   const openJobs = companies.reduce((n, c) => n + c.open_jobs, 0);
 
   return (

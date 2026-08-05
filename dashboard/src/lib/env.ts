@@ -2,10 +2,14 @@
  * Environment access, in one place, failing loudly.
  *
  * Every value here is required for the dashboard to be correct rather than
- * merely to boot, so a missing one throws instead of defaulting. The one that
- * matters most is ALLOWED_EMAIL: a default of "" combined with a permissive
- * comparison would turn the single-user lock into an open door, so it is read
- * through `allowedEmail()` which throws rather than returns empty.
+ * merely to boot, so a missing one throws instead of defaulting.
+ *
+ * Phase 1 needed a `soft()` wrapper alongside this, because auth.ts read these
+ * at module scope and `next build` has no .env.local. Nothing does that any
+ * more: the Supabase clients are constructed inside request handlers, so a
+ * missing value fails a request with a legible message instead of failing a
+ * build with a stack trace. That is why ALLOWED_EMAIL's fail-closed dance is
+ * gone along with the variable itself.
  */
 
 function required(name: string): string {
@@ -19,9 +23,31 @@ function required(name: string): string {
   return value;
 }
 
-/** The one account allowed to sign in. Lowercased for comparison. */
-export function allowedEmail(): string {
-  return required("ALLOWED_EMAIL").toLowerCase();
+/**
+ * The Supabase project URL and its publishable anon key.
+ *
+ * NEXT_PUBLIC_, so both are inlined into the browser bundle at BUILD time —
+ * which is why they must exist on Vercel before the deploy that needs them, not
+ * after. A variable added later produces a build with `undefined` baked in, and
+ * that fails as a broken Supabase client rather than as a missing variable.
+ *
+ * PUBLISHING THE ANON KEY IS SAFE HERE FOR A REASON THAT HAD TO BE MADE TRUE.
+ * An anon key is designed to be public, but only because RLS stands behind it —
+ * and until Phase 2a seven of this database's ten tables had RLS off with anon
+ * holding full DML on all of them. db/schema.sql's RLS block closed that, and
+ * scripts/check_rls.py is what reads the answer back. The key opens /auth/v1
+ * and nothing else.
+ *
+ * There is deliberately NO service-role key in this app. Every read and write of
+ * this project's own data goes through postgres.js on the transaction pooler,
+ * so the elevated key would be a credential on Vercel with nothing to do.
+ */
+export function supabaseUrl(): string {
+  return required("NEXT_PUBLIC_SUPABASE_URL");
+}
+
+export function supabaseAnonKey(): string {
+  return required("NEXT_PUBLIC_SUPABASE_ANON_KEY");
 }
 
 /**
@@ -37,10 +63,14 @@ export function allowedEmail(): string {
  * correct rather than merely present. The fallback in ats.ts stays where it is
  * and is deliberately not reused.
  *
- * Not ALLOWED_EMAIL, deliberately. That variable is the sign-in gate and keeps
- * that job; identity resolves from MY_EMAIL in BOTH runtimes, because one
- * mechanism that can be wrong is better than two that can disagree. On this
- * install they hold the same address. See lib/currentUser.ts.
+ * PHASE 2a NARROWED WHAT THIS IS FOR, and the narrowing is the point of the
+ * sub-phase. It is no longer the dashboard request path's idea of who you are —
+ * a Supabase session answers that now, per request, per person. What still
+ * reads it here is the headless half: dashboard/scripts/*.ts have no request and
+ * no session, so db-check, match-parity and badge-check resolve the operator's
+ * own row from this variable exactly as db/users.py does on the Python side.
+ * ALLOWED_EMAIL is gone entirely — any verified Google account is a real user.
+ * See lib/currentUser.ts, and 2b for the removal of what remains.
  */
 export function myEmail(): string {
   return required("MY_EMAIL").toLowerCase();

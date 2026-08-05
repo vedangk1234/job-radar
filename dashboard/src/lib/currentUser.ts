@@ -2,33 +2,32 @@ import { sql } from "./db";
 import { myEmail } from "./env";
 
 /**
- * Who "the current user" is — TEMPORARY, and deleted when Phase 2 lands.
+ * The MY_EMAIL bridge — NARROWED IN 2a, DELETED IN 2b.
  *
- * THIS WHOLE FILE IS A PHASE-2 BRIDGE. Phase 1 gives rows an owner; Phase 2
- * gives the app a way to know who is asking. Magic-link auth will put a real
- * user id in the session, every caller of currentUserId() will read it from
- * there instead, and this file goes away. Nothing here should grow a feature.
+ * WHAT THIS FILE STOPPED BEING. Through Phase 1 this answered "who is the
+ * current user" for the whole dashboard: every page render and every route
+ * resolved MY_EMAIL to a public.users id through here, because there was no
+ * session to ask. Phase 2a gives the request path a real answer — lib/guard.ts
+ * resolves the Supabase session to a public.users row via lib/link-user.ts and
+ * threads that id down explicitly — so NOTHING UNDER src/app OR src/lib CALLS
+ * THIS ANY MORE. tests/test_dashboard_auth.py asserts that, because a single
+ * surviving caller would be a page serving the operator's data to whoever
+ * happens to be signed in.
  *
- * The TypeScript half of db/users.py — same variable, same query, same
- * lowercase comparison, so both runtimes resolve the same person from the same
- * input. Deriving the id from MY_EMAIL rather than adding a DEFAULT_USER_ID is
- * deliberate: two variables that must agree about who you are is two variables
- * that can disagree, silently, surfacing as an empty dashboard rather than an
- * error.
+ * WHAT IT STILL IS. dashboard/scripts/*.ts are headless: db-check, match-parity
+ * and badge-check run from a terminal with no request, no cookies and no
+ * session, and they need to name a user to check anything about one. They ask
+ * the same question db/users.py asks on the Python side, from the same
+ * variable, so the two runtimes still agree about who the operator is. That is
+ * the whole of the bridge that remains, and 2b removes it together with
+ * db/users.py's half when the crawler stops resolving identity from the
+ * environment too.
  *
- * MEMOISED, where the Python side is not. The asymmetry is real rather than an
- * oversight. Python has entrypoints — run_digest, enrich_matches, each script's
- * main — that resolve once and thread the id down, so "one lookup per run" is
- * structural there. A Next server has no such entrypoint: every server
- * component and every route handler is its own, and without this the id would
- * be looked up several times per page render. The promise (not the resolved
+ * MEMOISED, where the Python side is not — unchanged, and the asymmetry is
+ * still real. Python has entrypoints that resolve once and thread the id down;
+ * a Node script can call this from anywhere. The promise (not the resolved
  * value) is cached so concurrent callers share one in-flight query, and a
- * REJECTION is not cached — a failed lookup during a deploy with the variable
- * still missing must not poison the instance for its whole lifetime.
- *
- * Cached on globalThis for the same reason lib/db.ts is: Next's dev server
- * re-evaluates modules on hot reload, and a module-local would be re-resolved
- * on every edit.
+ * REJECTION is not cached, so a failed lookup does not poison the process.
  */
 
 const globalForUser = globalThis as unknown as { jobRadarUserId?: Promise<string> };
@@ -55,7 +54,14 @@ async function resolve(): Promise<string> {
   return row.id;
 }
 
-/** The public.users id for MY_EMAIL. Throws rather than guessing. */
+/**
+ * The public.users id for MY_EMAIL. Throws rather than guessing.
+ *
+ * FOR dashboard/scripts/*.ts ONLY. If you are writing a page, a server
+ * component or a route handler, the id you want is on the session — call
+ * requirePage() or requireSession() from lib/guard.ts. Calling this from the
+ * request path would hand every visitor the operator's account.
+ */
 export function currentUserId(): Promise<string> {
   if (!globalForUser.jobRadarUserId) {
     globalForUser.jobRadarUserId = resolve().catch((err) => {

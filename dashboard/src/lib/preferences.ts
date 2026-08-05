@@ -1,4 +1,3 @@
-import { currentUserId } from "./currentUser";
 import { sql } from "./db";
 import { CITY_LABELS, type Preferences } from "./labels";
 
@@ -49,8 +48,7 @@ async function explainMissingRow(): Promise<never> {
   );
 }
 
-export async function loadPreferences(): Promise<Preferences> {
-  const userId = await currentUserId();
+export async function loadPreferences(userId: string): Promise<Preferences> {
   const [row] = await sql<Preferences[]>`
     SELECT cities, keywords, exclusions, max_level, updated_at
       FROM preferences
@@ -67,13 +65,15 @@ export async function loadPreferences(): Promise<Preferences> {
  * filter — under the old `WHERE id = 1` that was true by there being only one
  * row, which is a property of the schema rather than of this statement.
  */
-export async function savePreferences(next: {
-  cities: string[];
-  keywords: string[];
-  exclusions: string[];
-  max_level: number;
-}): Promise<Preferences> {
-  const userId = await currentUserId();
+export async function savePreferences(
+  userId: string,
+  next: {
+    cities: string[];
+    keywords: string[];
+    exclusions: string[];
+    max_level: number;
+  },
+): Promise<Preferences> {
   const [row] = await sql<Preferences[]>`
     UPDATE preferences
        SET cities     = ${next.cities}::text[],

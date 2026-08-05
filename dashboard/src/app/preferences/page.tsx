@@ -1,3 +1,4 @@
+import { requirePage } from "@/lib/guard";
 import { loadPreferences } from "@/lib/preferences";
 import { PreferencesEditor } from "@/components/PreferencesEditor";
 
@@ -5,7 +6,12 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export default async function PreferencesPage() {
-  const preferences = await loadPreferences();
+  // This page had NO guard until Phase 2a — it relied on the middleware matcher
+  // alone while reading the database on the server, which is exactly the case
+  // the belt-and-braces rule in lib/guard.ts exists for. It also now needs the
+  // user id, so the omission could not survive the sub-phase in any event.
+  const { userId } = await requirePage();
+  const preferences = await loadPreferences(userId);
 
   return (
     <>

@@ -788,3 +788,92 @@ REVOKE ALL PRIVILEGES ON SEQUENCE public.user_job_notifications_id_seq FROM anon
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES    FROM anon, authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM anon, authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM anon, authenticated;
+
+
+-- ===========================================================================
+-- public.users.auth_user_id — the join to Supabase Auth, Phase 2a
+-- ===========================================================================
+--
+-- Phase 2a replaces the single-account ALLOWED_EMAIL gate with real Supabase
+-- Auth, so a Google sign-in creates a row in auth.users and this table needs a
+-- matching one. This column is the join, and it exists instead of the obvious
+-- alternative for one concrete reason: THE OBVIOUS ALTERNATIVE WOULD HAVE
+-- DESTROYED THE EXISTING ACCOUNT.
+--
+-- The tutorial pattern is a trigger on auth.users doing
+--
+--     INSERT INTO public.users (id, email) VALUES (NEW.id, NEW.email)
+--       ON CONFLICT (id) DO NOTHING;
+--
+-- and against this database that is a trap. The one real account predates auth
+-- entirely: its id came from gen_random_uuid() in 1a and has no relationship to
+-- any auth.users id, while its email is the address that person will sign in
+-- with. So the INSERT conflicts on EMAIL, not on id — users_email_lower_idx and
+-- the plain UNIQUE both fire, ON CONFLICT (id) does not catch it, and the
+-- statement raises. Inside a trigger that raise happens in GoTrue's own signup
+-- transaction, which means the sign-in is refused outright with an opaque
+-- "Database error saving new user". The account holding 50 tracked companies
+-- and 7,707 notification rows would have been unreachable, and the error would
+-- have named none of that.
+--
+-- WHAT THIS COLUMN DOES INSTEAD. lib/link-user.ts resolves in three branches,
+-- in one transaction, on the authenticated request path rather than in a
+-- trigger:
+--
+--   1. auth_user_id already set   -> return that public.users.id. The steady
+--                                    state, one indexed lookup, and what makes
+--                                    branch 2 run exactly once ever.
+--   2. lower(email) matches       -> UPDATE ... SET auth_user_id, return the
+--                                    EXISTING id. This is the branch that
+--                                    adopts the Phase-1 account rather than
+--                                    duplicating it.
+--   3. neither                    -> INSERT with id = auth_user_id = the auth
+--                                    uid, plus a preferences row, is_active
+--                                    FALSE.
+--
+-- WHY NOT REKEY THE OLD ROW TO ITS auth.users id. That was the other option and
+-- it would give one uniform invariant — public.users.id = auth.users.id for
+-- everybody. It was rejected because the old id is referenced by 7,758 rows
+-- across three tables (preferences, user_companies, user_job_notifications) and
+-- every one of those foreign keys is declared ON DELETE CASCADE, not ON UPDATE
+-- CASCADE — so the rewrite would be a hand-written multi-table transaction
+-- against the only account that exists, to buy a property nothing currently
+-- reads. The Phase-1 foreign keys reference public.users(id) whatever value it
+-- holds; they do not care whether it equals an auth uid.
+--
+-- WHAT THE EQUALITY IS ACTUALLY WORTH, so the asymmetry is chosen rather than
+-- inherited: RLS policies are written as auth.uid() = user_id, and this project
+-- has no policies (see the block above — RLS is on precisely so that there are
+-- none and everything is denied). Branch 3 keeps id = auth uid for every future
+-- account anyway, so the asymmetry is exactly one row, it is queryable
+-- (WHERE id <> auth_user_id), and adopting the rekey later stays possible.
+--
+-- NULLABLE, like preferences.user_id before it and for the same reason: the
+-- value cannot be known when the column is added. Every row is NULL until its
+-- owner signs in once. NULL therefore means "this account has never
+-- authenticated", which is a true statement about the Phase-1 account until the
+-- first Google sign-in and is why there is no backfill script for this one.
+--
+-- UNIQUE, and that is load bearing rather than tidy: it is what stops two
+-- public.users rows claiming the same Supabase identity if branch 3 ever ran
+-- twice concurrently. Branch 3's ON CONFLICT DO NOTHING plus re-select handles
+-- the race; this constraint is what makes the race impossible to lose silently.
+-- A partial index, so the many NULLs do not collide — in Postgres NULLs are
+-- distinct under a plain UNIQUE anyway, but saying WHERE auth_user_id IS NOT
+-- NULL states the intent and keeps the index to the rows that have a value.
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS auth_user_id UUID;
+
+CREATE UNIQUE INDEX IF NOT EXISTS users_auth_user_id_idx
+    ON public.users (auth_user_id)
+ WHERE auth_user_id IS NOT NULL;
+
+-- No FOREIGN KEY to auth.users, deliberately, and this is the one place this
+-- schema declines a reference it could write. Three reasons, the first
+-- decisive: auth.users is Supabase's table, migrated by Supabase on their
+-- schedule, and a foreign key from our schema into theirs makes their migration
+-- our outage. Second, db/schema.sql is applied by the crawler's role over the
+-- session pooler and is meant to be re-runnable against a database where the
+-- auth schema may not even be readable. Third, the integrity it would buy is
+-- already covered: branch 1 of the link only ever writes an id that GoTrue just
+-- authenticated, and a stale auth_user_id pointing at a deleted auth user
+-- simply falls through to branch 2 and re-links by email.

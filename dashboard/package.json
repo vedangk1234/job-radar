@@ -12,13 +12,13 @@
     "parity": "tsx scripts/parity-check.ts",
     "match-parity": "tsx scripts/match-parity.ts",
     "badge-check": "tsx scripts/badge-check.ts",
-    "mint-session": "tsx scripts/mint-session.ts",
     "ui-check": "tsx --tsconfig tsconfig.scripts.json scripts/ui-check.ts",
     "config-roundtrip": "tsx scripts/config-roundtrip.ts"
   },
   "dependencies": {
+    "@supabase/ssr": "^0.12.4",
+    "@supabase/supabase-js": "^2.109.0",
     "next": "^15.5.22",
-    "next-auth": "^5.0.0-beta.32",
     "postgres": "3.4.5",
     "react": "19.0.0",
     "react-dom": "19.0.0"

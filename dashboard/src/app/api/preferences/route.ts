@@ -10,7 +10,7 @@ export async function GET() {
   const gate = await requireSession();
   if (!gate.ok) return gate.response;
   try {
-    return NextResponse.json({ preferences: await loadPreferences() });
+    return NextResponse.json({ preferences: await loadPreferences(gate.session.userId) });
   } catch (err) {
     return serverError(err, "GET /api/preferences");
   }
@@ -23,7 +23,7 @@ export async function GET() {
  * over one row owned by one user, last-write-wins on a complete document is
  * simpler to reason about than merging partial updates, and there is no second
  * writer to lose an edit to. The row is resolved by owner in lib/preferences.ts,
- * so this route names no id and will not need to when auth lands.
+ * so this route names no id — the owner arrives with the session instead.
  *
  * Validation is strict about two things, both because the failure is SILENT:
  *
@@ -70,7 +70,12 @@ export async function PUT(request: Request) {
   }
 
   try {
-    const preferences = await savePreferences({ cities, keywords, exclusions, max_level: maxLevel });
+    const preferences = await savePreferences(gate.session.userId, {
+      cities,
+      keywords,
+      exclusions,
+      max_level: maxLevel,
+    });
     return NextResponse.json({
       preferences,
       message: `Saved. ${keywords.length} keyword(s), ${cities.length} cit(y/ies), ${exclusions.length} exclusion(s), max_level ${maxLevel}. The next digest uses this.`,

@@ -57,7 +57,7 @@ export async function PATCH(request: Request, ctx: { params: Promise<{ id: strin
   try {
     const found = await updateCompany(id, patch);
     if (!found) return NextResponse.json({ error: "not_found" }, { status: 404 });
-    return NextResponse.json({ company: await companyCard(id) });
+    return NextResponse.json({ company: await companyCard(id, gate.session.userId) });
   } catch (err) {
     return serverError(err, `PATCH /api/companies/${id}`);
   }

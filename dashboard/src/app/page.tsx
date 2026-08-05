@@ -20,8 +20,9 @@ export const dynamic = "force-dynamic";
  * each row reports — the same fact, shown rather than filtered on, so "has the
  * digest told me about this yet" is answerable at a glance without hiding
  * anything. Since Phase 1f that fact is per-user: a row in
- * user_job_notifications for the account MY_EMAIL resolves to, never a boolean
- * on the job that another person's digest could have flipped.
+ * user_job_notifications for the account the session resolves to, never a boolean
+ * on the job that another person's digest could have flipped. Since Phase 2a
+ * that account is the one in your SESSION rather than the one MY_EMAIL names.
  *
  * Ticking "Applied" on a row is the one write either screen makes to the jobs
  * table. See lib/jobs.setApplied for why those two columns are the dashboard's
@@ -32,9 +33,9 @@ export const dynamic = "force-dynamic";
  * API route that would re-check the same session.
  */
 export default async function HomePage() {
-  await requirePage();
+  const { userId } = await requirePage();
 
-  const companies = (await listCompanyCards()).sort(byMatchesThenName);
+  const companies = (await listCompanyCards(userId)).sort(byMatchesThenName);
   const matches = companies.reduce((n, c) => n + c.match_jobs, 0);
   const withMatches = companies.filter((c) => c.match_jobs > 0).length;
   const openJobs = companies.reduce((n, c) => n + c.open_jobs, 0);

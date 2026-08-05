@@ -46,11 +46,12 @@ export async function GET(request: Request, ctx: { params: Promise<{ id: string 
   }
 
   try {
-    const prefs = await loadPreferences();
+    const { userId } = gate.session;
+    const prefs = await loadPreferences(userId);
     const jobs =
       filter === "all"
-        ? await openJobsWithMatchFlag(id, prefs)
-        : await matchingJobsForCompany(id, prefs);
+        ? await openJobsWithMatchFlag(id, prefs, userId)
+        : await matchingJobsForCompany(id, prefs, userId);
     return NextResponse.json({ filter, jobs });
   } catch (err) {
     return serverError(err, `GET /api/companies/${id}/jobs`);

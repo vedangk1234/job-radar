@@ -1,26 +1,32 @@
 "use server";
 
-import { signIn, signOut } from "@/auth";
+import { redirect } from "next/navigation";
+
+import { createClient } from "@/lib/supabase/server";
 
 /**
- * Sign in / out as server actions rather than via next-auth/react.
+ * Sign OUT as a server action, rather than via a client SDK.
  *
- * The client helpers would work, but they pull in a SessionProvider and a
- * client-side session fetch for two buttons that do nothing else. A form posting
- * to a server action needs neither, and it keeps working with JavaScript
- * disabled — which is a fair description of the first paint on a phone with a
- * bad connection, the exact situation this dashboard gets opened in.
+ * The browser helpers would work, but they pull a client-side Supabase instance
+ * and a session listener into the bundle for a button that does nothing else. A
+ * form posting to a server action needs neither, and it keeps working with
+ * JavaScript disabled — which is a fair description of the first paint on a
+ * phone with a bad connection, the exact situation this dashboard gets opened
+ * in. That argument is unchanged from Phase 1; only the library underneath it
+ * changed.
+ *
+ * SIGN-IN USED TO LIVE HERE AND COULD NOT. The two directions look symmetrical
+ * and are not: signing out redirects to a path in this app, signing in has to
+ * hand the browser to accounts.google.com. redirect() from a Server Action is a
+ * client-router navigation, and for an external URL it bounced back to /signin
+ * without ever reaching the provider — so no code was ever issued, and the PKCE
+ * verifier the same call had just written correctly was never redeemed. It is a
+ * Route Handler now: app/auth/signin/route.ts. Sign-out stays here precisely
+ * because its destination is internal.
  */
 
-export async function signInWithGoogle(formData: FormData) {
-  const next = String(formData.get("next") ?? "/");
-  // Path-only, so a crafted ?next= cannot bounce the sign-in through to
-  // another origin. "//evil.com" is a protocol-relative URL, hence the second
-  // check rather than just startsWith("/").
-  const redirectTo = next.startsWith("/") && !next.startsWith("//") ? next : "/";
-  await signIn("google", { redirectTo });
-}
-
 export async function signOutEverywhere() {
-  await signOut({ redirectTo: "/signin" });
+  const supabase = await createClient();
+  await supabase.auth.signOut();
+  redirect("/signin");
 }

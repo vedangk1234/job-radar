@@ -161,7 +161,7 @@ async function main() {
   const userId = await lib.currentUserId();
   console.log(`\ncurrent user, resolved from MY_EMAIL by lib/currentUser.ts: ${userId}`);
 
-  const prefs = await lib.loadPreferences();
+  const prefs = await lib.loadPreferences(userId);
 
   // The rows every section works from.
   const rows = await loadOpenRows(lib, userId);
@@ -322,7 +322,7 @@ async function main() {
   // -------------------------------------------------------------------------
   console.log('\n§3  "for you" is scoped to me');
 
-  const counts = await lib.matchCountsByCompany(prefs);
+  const counts = await lib.matchCountsByCompany(prefs, userId);
   const total = [...counts.values()].reduce((n, c) => n + c.match, 0);
   check(
     total === matched.length,

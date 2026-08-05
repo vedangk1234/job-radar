@@ -74,16 +74,16 @@ export async function listCompanies(): Promise<CompanyRow[]> {
  * still the jobs we hold, and silently dropping a company from the list is how
  * you forget you turned it off.
  */
-export async function listCompanyCards(): Promise<CompanyCard[]> {
-  const prefs = await loadPreferences();
-  const [rows, counts] = await Promise.all([companyRows(), matchCountsByCompany(prefs)]);
+export async function listCompanyCards(userId: string): Promise<CompanyCard[]> {
+  const prefs = await loadPreferences(userId);
+  const [rows, counts] = await Promise.all([companyRows(), matchCountsByCompany(prefs, userId)]);
   return rows.map((row) => withCounts(row, counts));
 }
 
 /** One company, with every count. For the response to a PATCH. */
-export async function companyCard(id: number): Promise<CompanyCard | null> {
-  const prefs = await loadPreferences();
-  const [rows, counts] = await Promise.all([companyRows(id), matchCountsByCompany(prefs)]);
+export async function companyCard(id: number, userId: string): Promise<CompanyCard | null> {
+  const prefs = await loadPreferences(userId);
+  const [rows, counts] = await Promise.all([companyRows(id), matchCountsByCompany(prefs, userId)]);
   return rows[0] ? withCounts(rows[0], counts) : null;
 }
 

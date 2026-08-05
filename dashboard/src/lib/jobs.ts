@@ -1,4 +1,3 @@
-import { currentUserId } from "./currentUser";
 import { sql } from "./db";
 import { isMatch, MAX_MIN_EXPERIENCE, type Preferences } from "./match";
 
@@ -162,12 +161,15 @@ export function notifiedToUser(userId: string) {
  * "jobs we have ever seen here", which is a fact about the crawler rather than
  * about the company.
  *
- * The user is resolved here rather than passed in, exactly as lib/preferences.ts
- * resolves it: the Phase-2 bridge is one file, and the day a session carries a
- * real user id, currentUser.ts is the only thing that changes.
+ * The user is PASSED IN, since Phase 2a — it comes from the session by way of
+ * lib/guard.requireSession(). It used to be resolved here through the MY_EMAIL
+ * bridge, which answered "whose install is this" when the question the row
+ * actually asks is "who is reading this page".
  */
-export async function openJobsForCompany(companyId: number): Promise<UserJobRow[]> {
-  const userId = await currentUserId();
+export async function openJobsForCompany(
+  companyId: number,
+  userId: string,
+): Promise<UserJobRow[]> {
   return sql<UserJobRow[]>`
     SELECT ${jobColumns()},
            ${notifiedToUser(userId)}
@@ -208,10 +210,10 @@ export async function openJobsForCompany(companyId: number): Promise<UserJobRow[
  */
 export async function matchCandidates(
   prefs: Preferences,
+  userId: string,
   companyId: number | null = null,
 ): Promise<UserJobRow[]> {
   const cities = [...prefs.cities];
-  const userId = await currentUserId();
   return sql<UserJobRow[]>`
     SELECT ${jobColumns()},
            ${notifiedToUser(userId)}
@@ -229,8 +231,9 @@ export async function matchCandidates(
 export async function matchingJobsForCompany(
   companyId: number,
   prefs: Preferences,
+  userId: string,
 ): Promise<JobView[]> {
-  const candidates = await matchCandidates(prefs, companyId);
+  const candidates = await matchCandidates(prefs, userId, companyId);
   // `matches: true` is not a claim being made twice: these rows are the output
   // of isMatch, so the field is the filter's verdict carried forward rather than
   // a second opinion about it. The Jobs screen computes the same field the same
@@ -250,8 +253,9 @@ export async function matchingJobsForCompany(
 export async function openJobsWithMatchFlag(
   companyId: number,
   prefs: Preferences,
+  userId: string,
 ): Promise<JobView[]> {
-  const jobs = await openJobsForCompany(companyId);
+  const jobs = await openJobsForCompany(companyId, userId);
   return jobs.map((job) => ({ ...job, matches: isMatch(job, prefs) }));
 }
 
@@ -272,8 +276,9 @@ export type CompanyJobCounts = { match: number; applied: number };
  */
 export async function matchCountsByCompany(
   prefs: Preferences,
+  userId: string,
 ): Promise<Map<number, CompanyJobCounts>> {
-  const candidates = await matchCandidates(prefs);
+  const candidates = await matchCandidates(prefs, userId);
   const counts = new Map<number, CompanyJobCounts>();
   for (const job of candidates) {
     if (!isMatch(job, prefs)) continue;

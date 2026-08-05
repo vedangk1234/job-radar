@@ -1,8 +1,15 @@
 import { AddCompany } from "@/components/AddCompany";
+import { requirePage } from "@/lib/guard";
 
 export const dynamic = "force-dynamic";
 
-export default function AddPage() {
+export default async function AddPage() {
+  // Guarded since Phase 2a. This page reads nothing, so the omission leaked no
+  // data — but it left "every page checks for itself" untrue, and a rule with
+  // one silent exception is a rule nobody can rely on when they add the next
+  // page. The writes behind it were always guarded at their routes.
+  await requirePage();
+
   return (
     <>
       <h1>Add a company</h1>

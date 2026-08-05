@@ -1,0 +1,88 @@
+import { createServerClient } from "@supabase/ssr";
+import { cookies } from "next/headers";
+
+import { supabaseAnonKey, supabaseUrl } from "@/lib/env";
+
+/**
+ * The Supabase client for server components and route handlers.
+ *
+ * Created PER REQUEST rather than once at module scope, which is not a style
+ * choice: the client carries the caller's cookies, so a module-level singleton
+ * on a server handling two people at once would hand one of them the other's
+ * session. lib/db.ts is a singleton for exactly the opposite reason — a
+ * connection pool belongs to the process and to nobody in particular.
+ *
+ * THE ONLY THING THIS CLIENT IS FOR IS AUTH. Every read and write of this
+ * project's own data goes through postgres.js on the transaction pooler, as it
+ * did through the whole of Phase 1. That is why no service-role key exists
+ * anywhere in this app and why the anon key can be published: it opens
+ * /auth/v1 and, since the RLS block in db/schema.sql, nothing else. See
+ * scripts/check_rls.py.
+ */
+export async function createClient() {
+  const cookieStore = await cookies();
+
+  return createServerClient(supabaseUrl(), supabaseAnonKey(), {
+    cookies: {
+      getAll() {
+        return cookieStore.getAll();
+      },
+      setAll(cookiesToSet) {
+        // ONE try PER COOKIE, NOT ONE AROUND THE LOOP. The original wrapped the
+        // whole loop, so the first name that threw abandoned every name after
+        // it — and said nothing. Two cookies commonly arrive together here (the
+        // auth token and its chunk, or a verifier alongside a refresh), and a
+        // partial write is the state that produces a flow which is neither
+        // signed in nor cleanly failed.
+        for (const { name, value, options } of cookiesToSet) {
+          try {
+            cookieStore.set(name, value, options);
+          } catch (err) {
+            // A Server Component cannot set cookies, and Next throws if it
+            // tries. For a rotating auth token that is genuinely harmless —
+            // middleware.ts refreshes on every request, so the write has
+            // already happened somewhere it was allowed to.
+            //
+            // IT IS NOT HARMLESS FOR THE PKCE CODE VERIFIER, and conflating the
+            // two is what cost a whole debugging session. The verifier is
+            // written once, by the sign-in action, and is the only thing that
+            // can redeem the code Google sends back. If that write is dropped
+            // the flow does not fail here — it fails minutes later at
+            // /auth/callback with a code and nothing to exchange it with, and
+            // the swallow meant there was no line anywhere saying so.
+            //
+            // So: everything is logged, and a lost verifier is re-thrown. A
+            // failure the caller can see is worth more than a flow that limps.
+            const fatal = name.includes("code-verifier");
+            console.error(
+              `[supabase/cookies] could not set "${name}"` +
+                (fatal ? " — THIS IS THE PKCE CODE VERIFIER; the sign-in cannot complete without it" : ""),
+              err instanceof Error ? err.message : err,
+            );
+            if (fatal) throw err;
+          }
+        }
+      },
+    },
+  });
+}
+
+/**
+ * The authenticated user, or null — and it is getUser(), never getSession().
+ *
+ * getSession() reads the auth cookie and decodes it WITHOUT verifying the
+ * signature, because it is built for the browser where the cookie came from
+ * your own storage. On a server the cookie came from the network, so trusting
+ * it means anybody who can write a cookie is anybody they say they are.
+ * getUser() verifies the JWT against the auth server. Every gate in this app
+ * calls this function and no gate calls getSession() — tests/test_dashboard_auth
+ * asserts the string does not appear in src/ at all, because this is the kind of
+ * mistake that is one autocomplete away and produces no symptom.
+ */
+export async function getAuthUser() {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  return user;
+}

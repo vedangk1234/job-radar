@@ -39,6 +39,45 @@ export const CATEGORIES = ["product", "gcc", "services", "staffing", "unknown"] 
 export type Category = (typeof CATEGORIES)[number];
 
 /**
+ * The filter a brand-new account starts with — the TypeScript mirror of
+ * notify/match.py's DEFAULT_CITIES / KEYWORDS / EXCLUSIONS / MAX_LEVEL.
+ *
+ * Phase 2a is what makes this necessary. Until now the only preferences row was
+ * created by db/schema.sql's seed, in SQL, once; from 2a a stranger can sign up
+ * and lib/link-user.ts has to give them a row in the same transaction that
+ * creates their account — because loadPreferences() throws when there is none,
+ * and Home, /jobs and /preferences would all 500 on their first page load.
+ *
+ * IT IS A SEED, NOT AN OVERRIDE, exactly as the Python constants are. Nothing
+ * reads this after the row exists: the database is the runtime source of truth
+ * and the very next digest obeys whatever the preferences screen last saved.
+ * The duplication with notify/match.py is real and is the same duplication
+ * lib/match.ts already carries; `npm run match-parity` is what keeps the matcher
+ * halves honest, and these four values are asserted against the Python in
+ * tests/test_default_preferences.py so a drift here is a red test rather than a
+ * new user silently starting with a filter nobody chose.
+ */
+export const DEFAULT_PREFERENCES = {
+  cities: ["blr", "pune", "hyd"],
+  keywords: [
+    "software engineer", "software developer", "software development engineer", "sde",
+    "associate software engineer", "member of technical staff", "mts",
+    "application developer", "programmer", "forward deployed engineer",
+    "backend", "back end", "node", "nodejs", "express", "fastapi", "api", "rest",
+    "microservices", "distributed", "full stack", "fullstack", "frontend", "front end",
+    "react", "react native", "nextjs", "next.js", "python", "javascript", "typescript",
+    "platform", "infrastructure", "infra", "devops", "cloud engineer",
+    "machine learning", "ml engineer", "ai engineer", "mlops", "deep learning",
+    "computer vision", "llm",
+  ],
+  exclusions: [
+    "intern", "senior", "staff", "principal", "lead", "manager", "director", "head",
+    "architect", "sales", "recruiter", "support", "qa", "analyst",
+  ],
+  max_level: 2,
+} as const;
+
+/**
  * notify/match.detect_level's scale, spelled out. Kept as labels rather than
  * bare integers because "max_level = 2" means nothing on a screen.
  */
