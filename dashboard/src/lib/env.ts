@@ -50,31 +50,23 @@ export function supabaseAnonKey(): string {
   return required("NEXT_PUBLIC_SUPABASE_ANON_KEY");
 }
 
-/**
- * The address the current user's database row is keyed by. Lowercased, and it
- * THROWS when unset — which is the whole difference between this and the other
- * reader of the same variable.
+/*
+ * THERE IS NO myEmail() HERE ANY MORE, and its absence is the point of 2b.
  *
- * lib/ats.ts also reads MY_EMAIL and falls back to unknown@example.com. That is
- * right for what it does: the value goes in an outbound User-Agent, so an unset
- * one makes the probe impolite and nothing more. Here the value decides WHOSE
- * preferences row is loaded, and a fallback would resolve to no user at all —
- * so it is read through required(), like every other value that has to be
- * correct rather than merely present. The fallback in ats.ts stays where it is
- * and is deliberately not reused.
+ * It existed to answer "whose preferences row is this", which through Phase 1
+ * meant resolving MY_EMAIL to a public.users id — the identity bridge. 2a made
+ * the session the answer for every request; 2b removed the last caller from
+ * src/ and moved the lookup itself to dashboard/scripts/current-user.ts, where
+ * the only things without a session live. An exported identity read with no
+ * caller in this directory would be an invitation to the next page that needs a
+ * user id in a hurry, and that page would serve the operator's data to whoever
+ * was signed in.
  *
- * PHASE 2a NARROWED WHAT THIS IS FOR, and the narrowing is the point of the
- * sub-phase. It is no longer the dashboard request path's idea of who you are —
- * a Supabase session answers that now, per request, per person. What still
- * reads it here is the headless half: dashboard/scripts/*.ts have no request and
- * no session, so db-check, match-parity and badge-check resolve the operator's
- * own row from this variable exactly as db/users.py does on the Python side.
- * ALLOWED_EMAIL is gone entirely — any verified Google account is a real user.
- * See lib/currentUser.ts, and 2b for the removal of what remains.
+ * MY_EMAIL is still read in two places, neither of them identity: lib/ats.ts
+ * puts it in an outbound User-Agent (falling back to unknown@example.com,
+ * because an unset one makes a probe impolite and nothing more), and the check
+ * scripts read it from process.env directly to name the operator's own account.
  */
-export function myEmail(): string {
-  return required("MY_EMAIL").toLowerCase();
-}
 
 /**
  * The transaction pooler (port 6543). Not the session pooler the crawler uses:

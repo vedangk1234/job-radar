@@ -19,8 +19,10 @@ import { getAuthUser } from "./supabase/server";
  * requireSession() and requirePage() therefore return a userId as well as an
  * email, and it is a public.users.id — already linked, already adopted if this
  * person had a Phase-1 account. Callers thread it down explicitly rather than
- * reaching for an ambient lookup; that is what makes 2b's deletion of
- * currentUser.ts a subtraction rather than a rewrite.
+ * reaching for an ambient lookup, which is what made 2b a subtraction rather
+ * than a rewrite: there is no MY_EMAIL lookup under src/ any more at all — the
+ * headless checks kept theirs in dashboard/scripts/current-user.ts — so THIS is
+ * the only thing in the deployed app that answers "who is asking".
  *
  * STILL BELT AND BRACES WITH middleware.ts, for the reason it always was: the
  * middleware matcher is a regex, and a regex is one careless edit from a hole

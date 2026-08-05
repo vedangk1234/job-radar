@@ -39,6 +39,29 @@ minutes is the crawl interval; a board that was down thirty minutes ago is
 usually still down, and hammering it would be the opposite of what the rest of
 this project does. A day later is a real second chance.
 
+Whose filter decides what is worth a request — Phase 2b
+-------------------------------------------------------
+Nobody's in particular, and that is the change. This pass used to resolve "the
+current user" from MY_EMAIL through db/users.py and narrow itself to that one
+person's filter, which made the last stage of a user-blind crawl quietly
+user-aware. It was harmless with one account and wrong with two: a second user
+whose keywords differ would have their matches skipped here, reach their digest
+with desc_checked = FALSE — min_experience NULL, and unknown means KEEP — and be
+emailed a job on no evidence at all about its experience requirement. That is the
+Step 7c leak arriving through a door Phase 1 left open.
+
+The fix is not to enrich per user but to stop asking. A description is worth
+fetching if it is worth fetching for ANYBODY, so the pass runs over the UNION of
+every active account's filter (notify/store.load_active_preferences) and a job is
+a candidate the moment one filter would want it. That keeps the crawl's own
+shape: the reading is shared and user-blind — one fetch serves everyone who can
+see the job, exactly as one board fetch serves everyone watching the company —
+and all the narrowing still happens in the notify stage.
+
+Note what the union does NOT do: it does not widen what anybody is SENT. These
+two facts land on the job row, where the matcher was already reading them, and
+every per-user decision downstream is unchanged.
+
 What it must never do
 ---------------------
 Touch a lifecycle column. Enrichment writes min_experience, is_pm_role,
@@ -51,12 +74,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-from db.users import resolve_current_user_id
 from notify.description import enrich_candidates
 from notify.match import Preferences, is_match, title_stage_ok
-from notify.store import fetch_enrichment_targets, load_preferences
+from notify.store import fetch_enrichment_targets, load_active_preferences
 
 # How long a FAILED description read is believed before it is worth asking
 # again. Only failures are affected: a description that was read cleanly is
@@ -81,15 +103,22 @@ class EnrichmentPass:
 
 
 def _newly_hidden(
-    jobs: list[Mapping[str, Any]], prefs: Preferences
+    jobs: list[Mapping[str, Any]], filters: Sequence[Preferences]
 ) -> list[dict[str, Any]]:
-    """The enriched jobs that the description just disqualified.
+    """The enriched jobs that the description just disqualified — for EVERYONE.
 
-    Every job in `jobs` passed the title stage, so before enrichment each of
-    them was a match — min_experience NULL and is_pm_role FALSE both mean keep.
-    Anything that is not a match now was hidden by what its description said,
-    which makes this list the pass's actual product: the jobs that will stop
-    appearing on Home and stop being emailed.
+    Every job in `jobs` passed the title stage of at least one active filter, so
+    before enrichment each of them was a match for at least one person —
+    min_experience NULL and is_pm_role FALSE both mean keep. Anything that is now
+    a match for nobody was hidden by what its description said, which makes this
+    list the pass's actual product: the jobs that will stop appearing on Home and
+    stop being emailed.
+
+    "For nobody" is the honest reading of a report line printed once per crawl.
+    The two facts a description yields are the same for every reader — four years
+    is four years — but max_level and the exclusion list are not, so a job hidden
+    from one person can survive for another. Reporting it as hidden then would
+    describe somebody else's screen.
     """
     return [
         {
@@ -100,15 +129,14 @@ def _newly_hidden(
             "is_pm_role": bool(job.get("is_pm_role")),
         }
         for job in jobs
-        if not is_match(job, prefs)
+        if not any(is_match(job, prefs) for prefs in filters)
     ]
 
 
 async def enrich_matches(
     conn,
     *,
-    user_id=None,
-    prefs: Preferences | None = None,
+    filters: Sequence[Preferences] | None = None,
     fetcher=None,
     now: datetime | None = None,
 ) -> EnrichmentPass:
@@ -119,21 +147,25 @@ async def enrich_matches(
     a request and runs over what survived. Doing it in this order is what keeps
     the pass at a few dozen requests instead of 788.
 
-    `user_id`, `prefs`, `fetcher` and `now` are injection points for tests.
-    Production passes none of them: this is a crawl entrypoint, so it resolves
-    the current user once here and the lookup never repeats mid-pass. A caller
-    that already has `prefs` skips the resolution entirely — there is nothing
-    left to look a user up for.
+    A job earns a request if ANY active filter would want it. The alternative —
+    intersecting the filters — would read fewer descriptions and leave exactly the
+    jobs one person cares about unenriched, which is the failure this pass exists
+    to close rather than a cheaper version of closing it.
+
+    `filters`, `fetcher` and `now` are injection points for tests. Production
+    passes none of them: this is a crawl entrypoint, so it reads the active
+    filters once here and the query never repeats mid-pass. There is no user_id
+    parameter any more and no user to resolve — see the module docstring.
     """
-    if prefs is None:
-        if user_id is None:
-            user_id = await resolve_current_user_id(conn)
-        prefs = await load_preferences(conn, user_id)
+    if filters is None:
+        filters = await load_active_preferences(conn)
     now = now or datetime.now(timezone.utc)
     retry_before = now - RETRY_AFTER
 
     targets = await fetch_enrichment_targets(conn, retry_before)
-    candidates = [job for job in targets if title_stage_ok(job, prefs)]
+    candidates = [
+        job for job in targets if any(title_stage_ok(job, prefs) for prefs in filters)
+    ]
 
     report = await enrich_candidates(
         conn, candidates, fetcher=fetcher, retry_before=retry_before
@@ -147,5 +179,5 @@ async def enrich_matches(
     )
     # enrich_candidates updated the rows in place, so the verdict below is
     # against the facts it just learned rather than against a second SELECT.
-    result.hidden = _newly_hidden(candidates, prefs)
+    result.hidden = _newly_hidden(candidates, filters)
     return result

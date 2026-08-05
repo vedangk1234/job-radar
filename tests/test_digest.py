@@ -117,7 +117,7 @@ async def test_only_unsent_open_and_matching_jobs_are_selected(digest_conn):
     await digest_conn.add_job("no-keyword", title="Customer Success Associate")
 
     resend = FakeResend()
-    run = await run_digest(digest_conn, today=TODAY, sender=resend)
+    run = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=resend)
 
     # closed and already-sent never even reach the matcher
     assert run.candidates == 5
@@ -129,7 +129,7 @@ async def test_a_matching_but_already_sent_job_is_never_re_sent(digest_conn):
     """The exactly-once guarantee, stated directly — per user, since 1d/1e."""
     await digest_conn.add_sent_job("sent-yesterday", title="Backend Engineer")
 
-    run = await run_digest(digest_conn, today=TODAY, sender=FakeResend())
+    run = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend())
 
     assert run.candidates == 0
     assert run.matched == []
@@ -141,7 +141,7 @@ async def test_zero_matches_sends_nothing_at_all(digest_conn):
     await digest_conn.add_job("nope", title="Senior Sales Manager")
 
     resend = FakeResend()
-    run = await run_digest(digest_conn, today=TODAY, sender=resend)
+    run = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=resend)
 
     assert run.matched == []
     assert resend.calls == []      # the network was never touched
@@ -170,13 +170,13 @@ async def test_candidates_query_respects_the_queue_but_preview_can_ignore_it(dig
 async def test_preferences_are_read_from_the_database_not_hardcoded(digest_conn):
     """Edit the row, and the very next run obeys it. That is the Step 5 contract."""
     await digest_conn.add_job("berlin", title="Backend Engineer", location="Berlin, Germany")
-    assert await run_digest(digest_conn, today=TODAY, sender=FakeResend()) is not None
+    assert await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend()) is not None
     assert await queue_ids(digest_conn) == {"berlin"}  # dropped on city
 
     await digest_conn.set_preferences(
         cities=["blr", "other"], keywords=["backend"], exclusions=["senior"]
     )
-    run = await run_digest(digest_conn, today=TODAY, sender=FakeResend())
+    run = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend())
 
     assert [j["canonical_id"] for j in run.matched] == ["berlin"]
     assert await queue_ids(digest_conn) == set()
@@ -223,6 +223,15 @@ async def test_an_unowned_row_raises_instead_of_falling_back_to_defaults(digest_
         await load_preferences(digest_conn, TEST_USER_ID)
 
 
+# The four tests below cover db.users.resolve_current_user_id, which since Phase
+# 2b is NOT part of any digest run — run_digest is handed a user and the fan-out
+# reads its ids out of public.users. It survives for the operator scripts that
+# have no session (scripts/preview_digest.py and friends), so what these assert is
+# that the scripts' lookup is still strict: case-insensitive like the index,
+# loud about an unset variable, the placeholder, and an address nothing was
+# seeded for. tests/test_identity_bridge.py is what states where it may be called.
+
+
 async def test_the_current_user_bridge_resolves_my_email(digest_conn):
     assert await resolve_current_user_id(digest_conn) == TEST_USER_ID
 
@@ -252,18 +261,39 @@ async def test_the_current_user_bridge_refuses_an_unseeded_address(digest_conn, 
         await resolve_current_user_id(digest_conn)
 
 
-async def test_run_digest_resolves_the_user_when_none_is_injected(digest_conn):
-    """Production passes no user_id: the entrypoint resolves it from MY_EMAIL.
+async def test_run_digest_refuses_to_guess_whose_digest_it_is(digest_conn):
+    """Phase 2b: user_id is required, and the inversion is the point.
 
-    Proves the bridge is wired into the digest path rather than only importable
-    — and, because the seeded row is the one it finds, that the filter it ends
-    up applying is the row this user owns.
+    This test used to assert the opposite — that omitting user_id resolved the
+    MY_EMAIL user — and that was safe for exactly as long as the one caller who
+    omitted it and the one account that existed named the same person. A default
+    is a guess about whose filter, whose queue and whose inbox this is, and the
+    failure mode of guessing wrong is not an error: it is a correct digest,
+    computed properly, delivered to somebody it is not about, and recorded as
+    delivered against the wrong user. So the parameter has no default, and a
+    caller that has not decided cannot proceed.
+    """
+    await digest_conn.add_job("blr-backend", title="Backend Engineer")
+
+    with pytest.raises(TypeError, match="user_id"):
+        await run_digest(digest_conn, today=TODAY, sender=FakeResend())
+
+    assert await digest_conn.sent_log() == []
+
+
+async def test_run_digest_applies_the_filter_of_the_user_it_was_given(digest_conn):
+    """The other half: the id it is handed is the id it acts on.
+
+    The seeded row belongs to TEST_USER_ID, so a run for that user applies it —
+    and this is what makes the fan-out's per-user loop mean anything. See
+    tests/test_leakage.py for the same claim asserted between two accounts.
     """
     await digest_conn.set_preferences(cities=["blr"], keywords=["backend"])
     await digest_conn.add_job("blr-backend", title="Backend Engineer")
 
-    run = await run_digest(digest_conn, today=TODAY, sender=FakeResend())
+    run = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend())
 
+    assert run.user_id == TEST_USER_ID
     assert [j["canonical_id"] for j in run.matched] == ["blr-backend"]
 
 
@@ -276,7 +306,7 @@ async def test_successful_send_flips_exactly_the_emailed_jobs(digest_conn):
     await digest_conn.add_job("b", title="Platform Engineer")
     await digest_conn.add_job("skipped", title="Senior Backend Engineer")
 
-    run = await run_digest(digest_conn, today=TODAY, tag_suffix="manual", sender=FakeResend())
+    run = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, tag_suffix="manual", sender=FakeResend())
 
     assert run.emailed == 2
     # The per-user table is what records a send, so it is what gets asserted.
@@ -293,7 +323,7 @@ async def test_successful_send_writes_one_notifications_row_per_job(digest_conn)
     await digest_conn.add_job("a", title="Backend Engineer")
     await digest_conn.add_job("b", title="Python Engineer")
 
-    run = await run_digest(digest_conn, today=TODAY, tag_suffix="manual", sender=FakeResend())
+    run = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, tag_suffix="manual", sender=FakeResend())
     log = await digest_conn.sent_log()
 
     assert run.tag == "2026-07-26-manual"
@@ -306,9 +336,9 @@ async def test_a_second_run_after_a_successful_send_finds_nothing(digest_conn):
     """The exactly-once guarantee, proved by replay rather than by assertion."""
     await digest_conn.add_job("a", title="Backend Engineer")
 
-    first = await run_digest(digest_conn, today=TODAY, sender=FakeResend())
+    first = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend())
     second_resend = FakeResend()
-    second = await run_digest(digest_conn, today=TODAY, sender=second_resend)
+    second = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=second_resend)
 
     assert first.emailed == 1
     assert second.candidates == 0
@@ -345,7 +375,7 @@ async def test_a_failed_send_changes_absolutely_nothing(digest_conn, failure):
     before = await lifecycle(digest_conn)
 
     with pytest.raises(type(failure)):
-        await run_digest(digest_conn, today=TODAY, sender=FakeResend(fail=failure))
+        await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend(fail=failure))
 
     assert await lifecycle(digest_conn) == before
     assert await digest_conn.sent_log() == []
@@ -356,9 +386,9 @@ async def test_the_run_after_a_failure_retries_the_same_jobs(digest_conn):
     await digest_conn.add_job("a", title="Backend Engineer")
 
     with pytest.raises(DigestError):
-        await run_digest(digest_conn, today=TODAY, sender=FakeResend(fail=DigestError("503")))
+        await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend(fail=DigestError("503")))
 
-    run = await run_digest(digest_conn, today=TODAY, sender=FakeResend())
+    run = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend())
     assert run.emailed == 1
     assert [row["canonical_id"] for row in await digest_conn.sent_log()] == ["a"]
 
@@ -421,7 +451,7 @@ async def test_run_digest_refuses_a_foreign_recipient_without_sending(digest_con
     resend = FakeResend()
 
     with pytest.raises(DigestError, match="can only deliver to the address"):
-        await run_digest(digest_conn, to="attacker@elsewhere.test", sender=resend)
+        await run_digest(digest_conn, user_id=TEST_USER_ID, to="attacker@elsewhere.test", sender=resend)
 
     assert resend.calls == []
     assert await queue_ids(digest_conn) == {"a"}
@@ -504,7 +534,7 @@ async def test_the_sent_email_is_one_message_containing_both_bodies(digest_conn)
     await digest_conn.add_job("b", title="Platform Engineer", company_id=1)
 
     resend = FakeResend()
-    run = await run_digest(digest_conn, today=TODAY, sender=resend)
+    run = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=resend)
 
     assert len(resend.calls) == 1  # one batched digest, never one email per job
     call = resend.calls[0]

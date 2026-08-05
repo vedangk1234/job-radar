@@ -115,29 +115,82 @@ def test_next_auth_is_gone():
 
 
 def test_the_request_path_never_resolves_identity_from_MY_EMAIL():
-    """THE ONE THAT MATTERS MOST, and the reason 2b is a subtraction.
+    """THE ONE THAT MATTERS MOST, and what 2b turned it into.
 
-    lib/currentUser.currentUserId() resolves the OPERATOR from an environment
-    variable. Through Phase 1 that was the only answer available and every page
-    used it. From 2a the request path must take its user from the session
-    instead — because with sign-up open, a page that still called it would serve
-    the operator's filter, watch list and job history to whichever stranger
-    happened to be signed in. It would look completely normal to the operator.
+    currentUserId() resolves the OPERATOR from an environment variable. Through
+    Phase 1 that was the only answer available and every page used it. From 2a the
+    request path takes its user from the session instead — because with sign-up
+    open, a page that still called it would serve the operator's filter, watch
+    list and job history to whichever stranger happened to be signed in, and it
+    would look completely normal to the operator.
 
-    The file survives for dashboard/scripts/*.ts, which are headless and have no
-    session to ask. That exemption is enumerated here rather than assumed.
+    2a left the file in src/lib and exempted it here. 2b moved it to
+    dashboard/scripts/current-user.ts, where the things with no session live, so
+    this assertion has NO exemption any more: not one line under src/ may name
+    the function, because there is nothing under src/ that defines it.
     """
-    allowed = {SRC / "lib" / "currentUser.ts"}
     offenders = [
         f"{path.relative_to(PROJECT_ROOT)}: {line.strip()}"
         for path, text in sources(SRC).items()
-        if path not in allowed
         for line in code_lines(text)
         if "currentUserId" in line
     ]
     assert not offenders, (
         "the request path resolves identity from MY_EMAIL instead of the session:\n  "
         + "\n  ".join(offenders)
+    )
+
+
+def test_the_identity_bridge_is_not_importable_from_the_request_path():
+    """The file is gone from src/, which is the half a text search cannot state.
+
+    A rule saying "do not call this" is one careless import from being broken by
+    somebody who needs a user id in a hurry and finds a module in lib/ that
+    supplies one. A module that is not in lib/ cannot be found that way — and
+    `@/lib/...` is the only import alias the app has, so a page reaching into
+    dashboard/scripts/ would have to write a relative path out of src/ to do it.
+    """
+    assert not (SRC / "lib" / "currentUser.ts").exists(), (
+        "src/lib/currentUser.ts is back: the MY_EMAIL lookup belongs in "
+        "dashboard/scripts/current-user.ts, where the session-less checks live"
+    )
+    assert (SCRIPTS / "current-user.ts").exists(), (
+        "dashboard/scripts/current-user.ts is missing — badge-check and ui-check "
+        "have no way to name the operator's account"
+    )
+
+    reaching_out = [
+        f"{path.relative_to(PROJECT_ROOT)}: {line.strip()}"
+        for path, text in sources(SRC).items()
+        for line in code_lines(text)
+        if "current-user" in line or ("import" in line and "scripts/" in line)
+    ]
+    assert not reaching_out, (
+        "a module under src/ imports from dashboard/scripts/:\n  " + "\n  ".join(reaching_out)
+    )
+
+
+def test_MY_EMAIL_is_read_under_src_only_for_the_outbound_user_agent():
+    """MY_EMAIL survives in the app, but not as an answer to "who is this".
+
+    The variable was always two things wearing one name: a contact address for
+    the outbound User-Agent (lib/ats.ts, falling back to unknown@example.com
+    because an unset one only makes a probe impolite) and, from Phase 1b, the
+    identity the current user was resolved from. 2b removes the second reading
+    from this runtime entirely — including lib/env.myEmail(), whose only caller
+    was the lookup that moved out — and this enumerates what may still read the
+    variable so that a new reader has to argue with a test.
+    """
+    allowed = {SRC / "lib" / "ats.ts"}
+    offenders = [
+        f"{path.relative_to(PROJECT_ROOT)}: {line.strip()}"
+        for path, text in sources(SRC).items()
+        if path not in allowed
+        for line in code_lines(text)
+        if "MY_EMAIL" in line or "myEmail" in line
+    ]
+    assert not offenders, (
+        "MY_EMAIL is read under src/ outside the User-Agent path:\n  " + "\n  ".join(offenders)
     )
 
 

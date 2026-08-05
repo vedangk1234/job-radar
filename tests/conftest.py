@@ -641,11 +641,16 @@ def no_description_fetches(monkeypatch) -> None:
 def current_user_env(monkeypatch) -> None:
     """MY_EMAIL, for every test.
 
-    Autouse because MY_EMAIL is now the input to db.users.resolve_current_user_id
-    — the Phase-2 bridge every entrypoint calls to find out whose filter to
-    apply. Setting it here rather than per-test means the suite runs against a
-    developer's real .env without picking up their real address, and the value
-    matches the users row conftest seeds.
+    Autouse because the variable is still read in three unrelated places — the
+    outbound User-Agent, notify/digest.assert_self_send, and the operator scripts'
+    db.users.resolve_current_user_id — so setting it here rather than per-test
+    means the suite runs against a developer's real .env without picking up their
+    real address, and the value matches the users row conftest seeds.
+
+    It is no longer an input to anything the hourly cron runs. Phase 2b took the
+    crawl's enrichment pass and run_digest off it; tests/test_enrich.py deletes the
+    variable outright in one test, which is what proves that rather than assuming
+    it, and tests/test_identity_bridge.py states where the lookup may still live.
 
     load_env() reads .env with override=False, so a value already in the process
     environment wins — which is exactly what monkeypatch.setenv puts there.

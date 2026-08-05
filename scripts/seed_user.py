@@ -54,8 +54,8 @@ RETURNING id
 
 
 async def main() -> int:
-    # db.users.current_user_email is the one canonical validator, shared with
-    # the Phase-2 bridge that reads this row back. It used to live here as
+    # db.users.current_user_email is the one canonical validator, shared with the
+    # operator-script lookup that reads this row back. It used to live here as
     # seed_email(); a second copy is how the writer and the reader end up
     # disagreeing about whether MY_EMAIL is usable.
     email = current_user_email()

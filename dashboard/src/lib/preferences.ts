@@ -8,9 +8,10 @@ import { CITY_LABELS, type Preferences } from "./labels";
  * Keyed on the OWNER, not on the old fixed address. This used to say
  * `WHERE id = 1`, which was correct while db/schema.sql pinned the table to one
  * row and nothing in the database named a user; preferences.user_id replaced
- * that assumption with an owner. Callers still pass no id — the user is
- * resolved by lib/currentUser.ts, which is a Phase-2 bridge, so when auth lands
- * the change is confined to that file.
+ * that assumption with an owner. The owner arrives as an argument: 2a threaded
+ * the session's public.users id down from lib/guard.ts and 2b removed the
+ * ambient MY_EMAIL lookup that used to supply it, so whose row this is is now
+ * decided by the request rather than by the deployment's environment.
  *
  * Server-only — it imports the database. The constants and types live in
  * lib/labels.ts so the editor component can use them without dragging

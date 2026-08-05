@@ -54,17 +54,18 @@ config({ path: ".env.local" });
  * The app's data modules are imported LATE, and that is not a style choice.
  * src/lib/db.ts builds its pool at module scope, and static imports are hoisted
  * above the loadEnv() call above — so importing lib/db, lib/jobs, lib/companies,
- * lib/preferences or lib/currentUser at the top evaluates dashboardDbUrl()
- * against an empty process.env and throws `DASHBOARD_DB_URL is not set` before a
- * single assertion runs. scripts/badge-check.ts and scripts/config-roundtrip.ts
- * defer for the same reason and document it the same way.
+ * lib/preferences or scripts/current-user (which imports lib/db itself) at the
+ * top evaluates dashboardDbUrl() against an empty process.env and throws
+ * `DASHBOARD_DB_URL is not set` before a single assertion runs.
+ * scripts/badge-check.ts and scripts/config-roundtrip.ts defer for the same
+ * reason and document it the same way.
  *
  * JobLine stays a static import: it reaches lib/badges and lib/match, neither of
  * which touches the database, and its lib/jobs import is type-only and erased.
  */
 type Lib = {
   sql: typeof import("../src/lib/db").sql;
-  currentUserId: typeof import("../src/lib/currentUser").currentUserId;
+  currentUserId: typeof import("./current-user").currentUserId;
   matchingJobsForCompany: typeof import("../src/lib/jobs").matchingJobsForCompany;
   openJobsWithMatchFlag: typeof import("../src/lib/jobs").openJobsWithMatchFlag;
   listCompanyCards: typeof import("../src/lib/companies").listCompanyCards;
@@ -74,7 +75,7 @@ type Lib = {
 async function loadLib(): Promise<Lib> {
   const [db, currentUser, jobs, companies, preferences] = await Promise.all([
     import("../src/lib/db"),
-    import("../src/lib/currentUser"),
+    import("./current-user"),
     import("../src/lib/jobs"),
     import("../src/lib/companies"),
     import("../src/lib/preferences"),
@@ -201,10 +202,11 @@ async function main() {
 
   // --- live rows, through the same functions the server components call ----
   //
-  // currentUserId() is the retained MY_EMAIL bridge, and this is exactly what
+  // currentUserId() is the retained MY_EMAIL lookup, and this is exactly what
   // it is retained FOR: a headless script with no request and no session that
-  // still has to name a user in order to check anything about one. The request
-  // path resolves its user from the session instead — see lib/guard.ts.
+  // still has to name a user in order to check anything about one. It lives in
+  // scripts/ since 2b, so the request path cannot reach it even by accident; a
+  // page or route resolves its user from the session — see lib/guard.ts.
   lib = await loadLib();
   const { currentUserId, loadPreferences, listCompanyCards, matchingJobsForCompany, openJobsWithMatchFlag } = lib;
 

@@ -1,8 +1,10 @@
 """Everything the digest touches in the database, and nothing that decides anything.
 
-Five operations, and the split between them is the whole safety story:
+Six operations, and the split between them is the whole safety story:
 
-    load_preferences           read the filter
+    load_preferences           read ONE person's filter
+    load_active_preferences    read EVERY active person's filter — the union the
+                                                crawl's enrichment pass works from
     fetch_candidates           read the queue  (open, watched by THEM, not back
                                                 catalogue, not yet sent to THEM)
     fetch_enrichment_targets   read the jobs whose description is unread
@@ -75,6 +77,39 @@ PREFERENCES_SQL = (
 # Asked only when the statement above found nothing, and only to tell two very
 # different silences apart. See load_preferences.
 UNOWNED_PREFERENCES_SQL = "SELECT count(*) FROM preferences WHERE user_id IS NULL"
+
+# EVERY ACTIVE ACCOUNT'S FILTER, AND WHY THAT IS A DIFFERENT QUESTION FROM THE
+# ONE ABOVE. Phase 2b: crawler/enrich.py used to resolve "the current user" from
+# MY_EMAIL and enrich against that one person's filter, which was the last place
+# on the crawl path that had an opinion about who is running the script. With a
+# second account whose keywords differ, that user's matches reached their digest
+# with desc_checked = FALSE — min_experience NULL, and unknown means KEEP, which
+# is the Step 7c leak arriving by a new route.
+#
+# So enrichment reads the UNION of these instead: a description is worth
+# fetching if it is worth fetching for ANYBODY. That is the same shape as "crawl
+# once, fan out" — the reading is user-blind and shared (one description read
+# serves every user who can see the job), and only the sending narrows.
+#
+# JOINED TO public.users RATHER THAN READ ALONE, so the set of filters
+# enrichment works from and the set of people the fan-out sends to are the same
+# set by construction: is_active is the account-level off switch, and
+# db/users.DIGEST_USERS_SQL reads it for exactly the same reason. A deactivated
+# account is not owed a description fetch.
+#
+# Schema-qualified public.users, never a bare `users`: Supabase ships its own
+# auth.users, and db/connection.py sets no search_path. See db/schema.sql.
+#
+# ORDER BY u.id so a pass is deterministic. Nothing depends on the order — the
+# candidate test is an OR over all of them — but a run whose output moves between
+# invocations for no reason is harder to compare against yesterday's.
+ACTIVE_PREFERENCES_SQL = """
+SELECT p.cities, p.keywords, p.exclusions, p.max_level
+  FROM preferences p
+  JOIN public.users u ON u.id = p.user_id
+ WHERE u.is_active = TRUE
+ ORDER BY u.id
+"""
 
 # The queue, joined to its companies so the digest can group by employer without
 # a second round trip. Ordered by company then title so the rendered email is
@@ -230,9 +265,9 @@ async def load_preferences(conn, user_id) -> Preferences:
     """Read this user's preferences row.
 
     Keyed on the owner rather than on the old fixed address (`WHERE id = 1`).
-    `user_id` comes from db.users.resolve_current_user_id, which the entrypoints
-    call once per run and thread down — see that module on why the bridge is
-    temporary.
+    `user_id` is the caller's, and since Phase 2b there is no ambient answer to
+    fall back on: the fan-out threads an id per active account, and the dashboard
+    threads the one on the session. Nothing here reads the environment.
 
     A missing row falls back to the seeded defaults rather than raising, so a
     database that has not had the new schema applied yet still produces a
@@ -265,6 +300,48 @@ async def load_preferences(conn, user_id) -> Preferences:
     return Preferences.from_row(None)
 
 
+async def load_active_preferences(conn) -> list[Preferences]:
+    """Every active account's filter, deduplicated, for the enrichment union.
+
+    THE CRAWL'S ANSWER TO "WHOSE FILTER", AND IT IS DELIBERATELY NOT ONE PERSON'S.
+    Reading a description is user-blind work: the two facts it produces
+    (min_experience, is_pm_role) are properties of the posting, they are stored on
+    the job rather than against a person, and one read serves everybody who can
+    see the row. So the question the crawl has to answer is not "whose filter is
+    this" but "is this job worth a request to ANYONE", and that is an OR over
+    these rather than a lookup of a current user. See crawler/enrich.py.
+
+    DEDUPLICATED because Preferences is a frozen dataclass of tuples and therefore
+    hashable: an install where five accounts have never edited the seeded defaults
+    is one filter, not five, and the candidate test should cost accordingly.
+    dict.fromkeys rather than a set, so the order the statement chose survives.
+
+    THE SAME TWO SILENCES load_preferences TELLS APART, told apart the same way.
+    No rows can mean "no active account has a filter", which is a real answer on a
+    fresh install and resolves to the seeded defaults — enrichment then reads the
+    descriptions a default filter would want, which costs a few requests and can
+    mislead nobody, because this pass sends no email and writes no lifecycle
+    column. It can also mean db/schema.sql has been applied and
+    scripts/backfill_preferences_user.py has not, in which case a real tuned
+    filter is sitting there unowned and invisible to the JOIN. Falling back then
+    would quietly enrich against a filter nobody chose, so that one raises.
+    """
+    rows = await conn.fetch(ACTIVE_PREFERENCES_SQL)
+    if rows:
+        return list(dict.fromkeys(Preferences.from_row(row) for row in rows))
+
+    if await conn.fetchval(UNOWNED_PREFERENCES_SQL):
+        raise RuntimeError(
+            "preferences.user_id is unset on an existing row: db/schema.sql has "
+            "been applied but scripts/backfill_preferences_user.py has not run. "
+            "Run it before crawling — until then no filter is readable by owner, "
+            "and enriching against the defaults would silently ignore the one "
+            "somebody tuned."
+        )
+
+    return [Preferences.from_row(None)]
+
+
 async def fetch_candidates(
     conn, user_id: Any, *, ignore_notified: bool = False
 ) -> list[Mapping[str, Any]]:
@@ -282,8 +359,9 @@ async def fetch_candidates(
     `user_id` is required rather than defaulted, and that is deliberate: a
     default would be a guess about whose queue this is, and the failure mode of
     guessing wrong is silence — a digest computed for the wrong person looks
-    exactly like a quiet week. The entrypoints resolve it once and thread it
-    down (see db/users.py on why the bridge is temporary).
+    exactly like a quiet week. Since 2b run_digest makes the same demand of its
+    own caller, so the id comes from public.users by way of the fan-out and there
+    is no ambient answer left anywhere on this path.
 
     `ignore_notified` is for preview only. Nothing that can write ever sets it,
     and in that mode `user_id` is genuinely unused because the widened question

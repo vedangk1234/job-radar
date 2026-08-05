@@ -1,29 +1,47 @@
-"""Who "the current user" is — TEMPORARY, and deleted when Phase 2 lands.
+"""Who "the current user" is — NARROWED IN 2b to the scripts that have no session.
 
-THIS WHOLE MODULE IS A PHASE-2 BRIDGE
---------------------------------------
-Phase 1 gives rows an owner; Phase 2 gives the app a way to know who is asking.
-This module is the gap between the two, and it exists only because the second
-half is not built yet: magic-link auth will hand every request a real session,
-and at that point every caller of resolve_current_user_id() gets its user id
-from the session instead and this file goes away.
+WHAT THIS MODULE STOPPED BEING
+------------------------------
+Through Phase 1 this answered "whose filter, whose queue, whose dashboard" for
+the entire install, because nothing could ask a session. Phase 2a gave the
+dashboard a real one; Phase 2b took the two runtime paths off this module
+altogether:
 
-Until then the answer is derived from MY_EMAIL, which is not a new identity
-variable but the one the install already had — notify/digest.py sends the digest
-to it, fetchers/http.py puts it in the User-Agent, and scripts/seed_user.py
-created the users row from it. Deriving from that value rather than adding a
-DEFAULT_USER_ID is deliberate: two variables that must agree about who you are
-is two variables that can disagree, silently, with the failure showing up as an
-empty digest rather than as an error.
+    the CRAWL   — crawler/enrich.py used to enrich against the MY_EMAIL user's
+                  filter, which made the last stage of a user-blind crawl
+                  user-aware. It now reads the union of every active account's
+                  filter (notify/store.load_active_preferences) and resolves
+                  nobody.
+    the DIGEST  — notify/digest.run_digest used to default user_id to None and
+                  resolve it here. The parameter is required now; the fan-out
+                  reads its ids out of public.users and threads them down.
 
-NO CACHE HERE, ON PURPOSE — and note that dashboard/src/lib/currentUser.ts, the
-TypeScript half of this same bridge, does memoise. The asymmetry is real rather
-than an oversight: the Python side has entrypoints (run_digest, enrich_matches,
-each script's main) that resolve once and pass the id down, so "one lookup per
-run" is already structural. A module global would add hidden state that every
-test has to remember to reset in order to buy a query that is already only run
-once. The dashboard has no such entrypoint — every server component and route
-handler is its own — so memoising is the only place that guarantee can live.
+So no hourly cron step and no dashboard request reaches this file any more, and
+tests/test_identity_bridge.py asserts that rather than trusting it.
+
+WHAT IT STILL IS
+----------------
+The operator scripts' way of naming themselves. scripts/preview_digest.py,
+scripts/recheck_descriptions.py, scripts/seed_user.py and the two backfills run
+from a terminal with no request and no session, and each acts on the single
+install the .env belongs to — so MY_EMAIL is the honest answer to "which account
+is this laptop", and inventing a DEFAULT_USER_ID beside it would be two variables
+that must agree about who you are and can disagree silently.
+
+Note the one script that deliberately does NOT use this:
+scripts/track_companies.py takes --email, because it acts on a NAMED person and
+defaulting that to whoever the environment belongs to is how you quietly
+configure your own account. Anything that acts on somebody else belongs on that
+side of the line, not this one.
+
+dashboard/scripts/current-user.ts is the TypeScript half of exactly this narrowed
+use — headless checks, same variable, same lowercase comparison — and 2b moved it
+out of src/ so that no request-path module can reach it at all.
+
+NO CACHE HERE, ON PURPOSE. Each script has one main() that resolves once and
+threads the id down, so "one lookup per run" is already structural; a module
+global would add hidden state every test has to remember to reset in order to buy
+a query that runs once anyway.
 """
 
 from __future__ import annotations
@@ -144,10 +162,16 @@ async def digest_users(conn) -> list[tuple[Any, str]]:
 async def resolve_current_user_id(conn) -> Any:
     """The public.users id for MY_EMAIL. Raises rather than guessing.
 
+    FOR scripts/ ONLY, since 2b. If you are writing anything the hourly cron runs
+    — a crawl stage, a digest stage — the id you want is either not needed at all
+    (enrichment is user-blind) or comes from db.users.digest_users, which reads
+    the accounts that exist instead of the address this machine is configured
+    with. Calling this from there would scope everybody's crawl to one person.
+
     Every failure here is loud, and that is the whole design. The rows this id
-    selects are the filter that decides what reaches an inbox, so a lookup that
-    quietly returned None would not fail — it would produce a digest for nobody,
-    which reads exactly like a quiet week.
+    selects are the filter a preview or a backfill acts on, so a lookup that
+    quietly returned None would not fail — it would act on nobody, which reads
+    exactly like a quiet week.
     """
     email = current_user_email()
     user_id = await conn.fetchval(CURRENT_USER_SQL, email)

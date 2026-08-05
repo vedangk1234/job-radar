@@ -75,7 +75,7 @@ type Lib = {
   loadPreferences: typeof import("../src/lib/preferences").loadPreferences;
   homeBadge: typeof import("../src/lib/badges").homeBadge;
   isMatch: typeof import("../src/lib/match").isMatch;
-  currentUserId: typeof import("../src/lib/currentUser").currentUserId;
+  currentUserId: typeof import("./current-user").currentUserId;
 };
 
 async function loadLib(): Promise<Lib> {
@@ -85,7 +85,10 @@ async function loadLib(): Promise<Lib> {
     import("../src/lib/preferences"),
     import("../src/lib/badges"),
     import("../src/lib/match"),
-    import("../src/lib/currentUser"),
+    // Deferred with the rest, because it imports src/lib/db and would otherwise
+    // build the pool before loadEnv() above has run. It lives in scripts/ since
+    // 2b — src/ has no identity lookup left to import.
+    import("./current-user"),
   ]);
   return {
     sql: db.sql,
@@ -159,7 +162,7 @@ async function main() {
   const { sql, notifiedToUser, homeBadge, isMatch } = lib;
 
   const userId = await lib.currentUserId();
-  console.log(`\ncurrent user, resolved from MY_EMAIL by lib/currentUser.ts: ${userId}`);
+  console.log(`\ncurrent user, resolved from MY_EMAIL by scripts/current-user.ts: ${userId}`);
 
   const prefs = await lib.loadPreferences(userId);
 

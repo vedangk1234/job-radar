@@ -64,7 +64,7 @@ from typing import Any, Iterable, Mapping
 import httpx
 
 from db.connection import load_env
-from db.users import digest_users, email_for_user, resolve_current_user_id
+from db.users import digest_users, email_for_user
 
 from .description import enrich_candidates
 from .match import Preferences, select_matches, title_stage_ok
@@ -376,7 +376,7 @@ class DigestRun:
 async def run_digest(
     conn,
     *,
-    user_id=None,
+    user_id,
     to: str | None = None,
     today: date | None = None,
     tag_suffix: str = "manual",
@@ -386,15 +386,18 @@ async def run_digest(
     """Load, filter on titles, read descriptions, match, send, record.
 
     ONE USER'S DIGEST. run_fan_out below calls this once per active account; a
-    caller with a user in hand can call it directly, and scripts/preview_digest.py
-    still does for the one user MY_EMAIL names.
+    caller with a user in hand can call it directly.
 
-    `user_id` is whose filter, whose watch list, whose queue and whose inbox.
-    It defaults to None and is then resolved from MY_EMAIL exactly once here, at
-    the top of the run, rather than inside load_preferences — this is an
-    entrypoint, so this is where "once per run" is a structural fact instead of a
-    convention. See db/users.py: that bridge is Phase-2 scaffolding, but the
-    fan-out passes an explicit id and never touches it.
+    `user_id` is whose filter, whose watch list, whose queue and whose inbox, and
+    since Phase 2b it is REQUIRED. It used to default to None and resolve MY_EMAIL
+    through db/users.py, which was safe only because the one caller that omitted
+    it and the one account that existed named the same person. A default here is a
+    guess about whose digest this is, and the failure mode of guessing wrong is
+    silence: somebody else's matches, computed correctly, sent to the wrong inbox,
+    and recorded as delivered against the wrong user. So the parameter has no
+    default and the caller has to know — the fan-out reads the id out of
+    public.users, the dashboard would read it off a session, and neither asks the
+    environment.
 
     `to` defaults to THIS USER's own address, read from their row, and is checked
     against MY_EMAIL either way — the recipient is not a knob, it is an assertion
@@ -412,8 +415,6 @@ async def run_digest(
     top, so a description is fetched only for a job that has already earned one.
     """
     run = DigestRun()
-    if user_id is None:
-        user_id = await resolve_current_user_id(conn)
     run.user_id = user_id
     prefs = await load_preferences(conn, user_id)
 
