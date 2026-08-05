@@ -47,10 +47,10 @@ const MESSAGES: Record<string, string> = {
 export default async function SignIn({
   searchParams,
 }: {
-  searchParams: Promise<{ next?: string; error?: string }>;
+  searchParams: Promise<{ next?: string; error?: string; deleted?: string }>;
 }) {
   const user = await getAuthUser();
-  const { next, error } = await searchParams;
+  const { next, error, deleted } = await searchParams;
 
   if (user) {
     redirect(next && next.startsWith("/") && !next.startsWith("//") ? next : "/");
@@ -66,6 +66,22 @@ export default async function SignIn({
           Sign in with Google. If you have not been here before this creates your account —
           your own filter, your own watch list, your own digest.
         </p>
+
+        {/*
+          * The one page a just-deleted account can still be shown, because it is
+          * the one page that does not require a session. Saying it plainly here
+          * is the only confirmation erasure can ever give: there is no account
+          * left to send a receipt to, and no inbox this app is still allowed to
+          * write to. Silence would be indistinguishable from having been signed
+          * out by a timeout.
+          */}
+        {deleted ? (
+          <p className="msg ok">
+            Your account and everything attached to it have been deleted — your filter, your
+            watch list, your notification history and your sign-in identity. Nothing of yours
+            is left here. Signing in again would start a completely new account.
+          </p>
+        ) : null}
 
         {missing.length > 0 ? (
           <p className="msg bad">

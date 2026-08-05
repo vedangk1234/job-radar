@@ -70,15 +70,25 @@ type Lib = {
   openJobsWithMatchFlag: typeof import("../src/lib/jobs").openJobsWithMatchFlag;
   listCompanyCards: typeof import("../src/lib/companies").listCompanyCards;
   loadPreferences: typeof import("../src/lib/preferences").loadPreferences;
+  /**
+   * DEFERRED FOR THE SAME REASON AS THE REST, even though it is a component and
+   * JobLine above is a static import. JobLine reaches only lib/badges and
+   * lib/match, neither of which touches the database. DeleteAccount imports the
+   * server action, which imports lib/account, which imports lib/db — so a static
+   * import here would build the pool before loadEnv() and throw
+   * `DASHBOARD_DB_URL is not set` before the first assertion.
+   */
+  DeleteAccount: typeof import("../src/components/DeleteAccount").DeleteAccount;
 };
 
 async function loadLib(): Promise<Lib> {
-  const [db, currentUser, jobs, companies, preferences] = await Promise.all([
+  const [db, currentUser, jobs, companies, preferences, deleteAccount] = await Promise.all([
     import("../src/lib/db"),
     import("./current-user"),
     import("../src/lib/jobs"),
     import("../src/lib/companies"),
     import("../src/lib/preferences"),
+    import("../src/components/DeleteAccount"),
   ]);
   return {
     sql: db.sql,
@@ -87,6 +97,7 @@ async function loadLib(): Promise<Lib> {
     openJobsWithMatchFlag: jobs.openJobsWithMatchFlag,
     listCompanyCards: companies.listCompanyCards,
     loadPreferences: preferences.loadPreferences,
+    DeleteAccount: deleteAccount.DeleteAccount,
   };
 }
 
@@ -302,6 +313,54 @@ async function main() {
       "and the raw list carries user_notified too, so that text is per-user as well",
     );
   }
+
+  // --- PREFERENCES: the delete-account surface ----------------------------
+  //
+  // Phase 2c, and it is here for the reason this whole script exists: a control
+  // that is specified, agreed to and never rendered fails silently, and "the
+  // account can be deleted" is not a claim a type checker or a database query
+  // can settle. Rendered with synthetic props — no account is created and
+  // nothing is deleted; what is under test is the MARKUP, and the behaviour
+  // behind it is proved against real rows by `npm run delete-check`.
+  console.log("\nPreferences — the delete-account form");
+  const account = renderToStaticMarkup(
+    createElement(lib.DeleteAccount, {
+      email: "someone@example.test",
+      footprint: { companies: 50, notifications: 7708 },
+    }),
+  );
+  check(account.includes("<details"), "the destructive control is behind a disclosure");
+  check(account.includes('name="confirm"'), "and behind a typed confirmation field");
+  check(account.includes("required"), "which the browser will not let you skip");
+  check(account.includes("someone@example.test"), "the form names the address you must type");
+  check(account.includes("50") && account.includes("7,708"), "and says what is about to be lost");
+  check(
+    account.includes("<form") && account.includes('type="submit"'),
+    "it is a form with a submit button, not a button with a handler",
+  );
+  // WHAT THIS SECTION DELIBERATELY DOES NOT ASSERT, because it cannot see it.
+  // The markup above carries `action="javascript:throw ..."` and a trailing
+  // <script>: that is React's form-replay fallback, emitted because
+  // renderToStaticMarkup runs OUTSIDE Next's bundler and so has no way to
+  // serialise a server action reference. Next's own render emits a POST to the
+  // page with the action id instead, and that is the output the
+  // "works with JavaScript disabled" claim is about — so asserting "no <script>"
+  // here would be asserting something about this harness rather than about the
+  // page, and it would fail forever while the page was perfectly fine. The
+  // half that IS checkable statically — no "use client", no onClick, no
+  // window.confirm in the component — is asserted in
+  // tests/test_account_deletion.py.
+  const mismatch = renderToStaticMarkup(
+    createElement(lib.DeleteAccount, {
+      email: "someone@example.test",
+      footprint: { companies: 0, notifications: 0 },
+      notice: "mismatch",
+    }),
+  );
+  check(
+    mismatch.includes("did not match") && mismatch.includes("nothing was deleted"),
+    "a failed confirmation says so, and says nothing was deleted",
+  );
 
   // --- the ordering rule --------------------------------------------------
   console.log("\nHome — applied jobs sink to the bottom");

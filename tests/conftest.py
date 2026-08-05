@@ -180,13 +180,24 @@ CREATE UNIQUE INDEX preferences_one_per_user_idx
 # `public.users` by the production statements, which _SCHEMA strips — see the
 # note there. The UUID is TEXT because SQLite has no uuid type and nothing in
 # the code parses the value; it is passed through as an opaque key.
+#
+# auth_user_id mirrors the column Phase 2a added — the join to Supabase's
+# auth.users, NULL until an account has signed in once. No Python reads it: the
+# link is TypeScript, in dashboard/src/lib/link-user.ts. It is here because this
+# mirror has to track the live schema in BOTH directions (see the note on
+# JOBS_DDL), and because 2c made the column load bearing for something a test
+# can state — deleting an account means deleting the row this points AT as well,
+# and a mirror missing the column could not express that the two are different
+# ids. There is no UNIQUE clause because the production one is a partial index
+# (WHERE auth_user_id IS NOT NULL) and nothing in this suite writes a second.
 USERS_DDL = """
 CREATE TABLE users (
-  id          TEXT PRIMARY KEY,
-  email       TEXT NOT NULL UNIQUE,
-  created_at  TEXT,
-  plan        TEXT NOT NULL DEFAULT 'free',
-  is_active   INTEGER NOT NULL DEFAULT 1
+  id            TEXT PRIMARY KEY,
+  email         TEXT NOT NULL UNIQUE,
+  created_at    TEXT,
+  plan          TEXT NOT NULL DEFAULT 'free',
+  is_active     INTEGER NOT NULL DEFAULT 1,
+  auth_user_id  TEXT
 )
 """
 

@@ -34,7 +34,18 @@ import { getAuthUser } from "./supabase/server";
  * of being a permanent orphan.
  */
 
-export type Session = { userId: string; email: string };
+/**
+ * WHY THERE ARE TWO IDS HERE, ADDED IN 2c. `userId` is public.users.id — the
+ * key every foreign key in this project points at, and the only one any page or
+ * route needs. `authUserId` is auth.users.id, the Supabase identity, and exactly
+ * one thing reads it: lib/account.deleteAccount, which has to remove the auth
+ * row as well and cannot derive that id from this one. It cannot, because the
+ * two are equal for every account created since 2a and NOT equal for the
+ * Phase-1 account, whose id predates auth entirely. Carrying it on the session
+ * means the delete matches the identity that was actually verified rather than
+ * one looked up afterwards from a column that could have been written wrong.
+ */
+export type Session = { userId: string; email: string; authUserId: string };
 
 /**
  * The session for a route handler, or a response to return instead.
@@ -50,7 +61,7 @@ export async function requireSession(): Promise<
 
   try {
     const linked = await linkUser(user);
-    return { ok: true, session: { userId: linked.id, email: linked.email } };
+    return { ok: true, session: { userId: linked.id, email: linked.email, authUserId: user.id } };
   } catch (err) {
     // An unverified address is a 403 and not a 500: the request was understood,
     // authenticated, and refused. Anything else failed for an unknown reason and
@@ -79,7 +90,7 @@ export async function requirePage(): Promise<Session> {
 
   try {
     const linked = await linkUser(user);
-    return { userId: linked.id, email: linked.email };
+    return { userId: linked.id, email: linked.email, authUserId: user.id };
   } catch (err) {
     if (err instanceof UnverifiedEmailError) {
       console.error("[auth] refused unverified email", err.message);

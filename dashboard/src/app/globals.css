@@ -817,3 +817,55 @@ hr.rule {
   margin: 0 0 6px;
   font-size: 20px;
 }
+
+/* delete account
+ *
+ * The only destructive control in the app, so it is the only thing styled to
+ * look like one. It reads as a normal panel with a red edge rather than as a
+ * red block: the section is informational until the disclosure is opened, and
+ * painting the whole thing as an alarm would make the paragraph explaining what
+ * gets deleted the part people skip. The button inside is where the colour
+ * goes, because that is the click that cannot be taken back.
+ */
+
+.danger-zone {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--line));
+}
+
+.danger-zone h2 {
+  color: var(--danger);
+}
+
+.danger-disclose summary {
+  cursor: pointer;
+  font-size: 13.5px;
+  font-weight: 550;
+  color: var(--danger);
+  padding: 6px 0;
+  width: fit-content;
+}
+
+.danger-disclose summary:hover {
+  text-decoration: underline;
+}
+
+.danger-disclose form {
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--line));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--danger) 6%, transparent);
+  max-width: 460px;
+}
+
+button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--bg);
+  font-weight: 600;
+}
+
+button.danger:hover:not(:disabled) {
+  border-color: var(--danger);
+  filter: brightness(1.08);
+}
