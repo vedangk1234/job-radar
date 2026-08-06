@@ -276,6 +276,36 @@ CREATE TABLE user_job_notifications (
 )
 """
 
+# The resume reference — Phase 3 Slice 1. One row per person, pointing at an
+# object in a private Supabase Storage bucket.
+#
+# NO PYTHON READS OR WRITES THIS TABLE, and it is mirrored anyway, for the two
+# reasons USERS_DDL.auth_user_id is. First, this mirror tracks the live schema in
+# both directions: a table present in Postgres and absent here is a gap that
+# hides the next thing to arrive next to it. Second — and this is the one that
+# earns its place — the table exists to be CASCADED, and a cascade is exactly the
+# kind of claim a test can make and a comment cannot. tests/test_resume_cascade.py
+# deletes a user and asserts the row goes with them, under
+# FakeConn.enforce_foreign_keys().
+#
+# What it deliberately does NOT mirror is the object in the bucket. That is not a
+# row in any database, it does not cascade, and pretending otherwise here would
+# manufacture confidence in the one guarantee this schema cannot make — see the
+# storage note in db/schema.sql and the ordering argument in
+# dashboard/src/lib/account.ts.
+RESUMES_DDL = """
+CREATE TABLE resumes (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  bucket_path   TEXT NOT NULL,
+  filename      TEXT NOT NULL,
+  content_type  TEXT NOT NULL,
+  size_bytes    INTEGER NOT NULL,
+  uploaded_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (user_id)
+)
+"""
+
 # The address every test resolves the current user from. A .test domain, which
 # scripts/githooks/pre-commit allows (RFC 2606/6761) — see test-guard.sh.
 TEST_EMAIL = "me@example.test"
@@ -338,6 +368,7 @@ class FakeConn:
             DISCOVERED_DDL,
             USER_COMPANIES_DDL,
             USER_JOB_NOTIFICATIONS_DDL,
+            RESUMES_DDL,
             PREFERENCES_ONE_PER_USER_DDL,
         ):
             self._db.execute(ddl)
@@ -556,6 +587,29 @@ class FakeConn:
             canonical_id,
             self.clock.tick(),
         )
+
+    async def add_resume_for(self, user_id: str, auth_user_id: str | None = None) -> str:
+        """One resumes row, inserted directly. Returns the bucket_path.
+
+        The path is built the way dashboard/src/lib/resume.ts builds it — folder
+        = the AUTH uid, not this table's user_id — because the difference between
+        the two is the whole reason the storage policy works for the Phase-1
+        account, and a fixture that used the wrong one would let a test agree
+        with a mistake. Defaults to user_id for the ordinary case where they are
+        equal; pass auth_user_id to arrange the asymmetric one.
+        """
+        path = f"{auth_user_id or user_id}/resume.pdf"
+        await self.execute(
+            "INSERT INTO resumes (user_id, bucket_path, filename, content_type, "
+            "size_bytes, uploaded_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            user_id,
+            path,
+            "resume.pdf",
+            "application/pdf",
+            120_000,
+            self.clock.tick(),
+        )
+        return path
 
     async def notification_pairs(self) -> set[tuple[str, str]]:
         """Every (user_id, canonical_id) currently in user_job_notifications.

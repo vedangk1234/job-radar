@@ -26,7 +26,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from scripts.check_rls import evaluate, granting_roles
+from scripts.check_rls import evaluate, evaluate_storage, granting_roles
+from scripts.init_db import split_manual_block, storage_statements_outside_the_fence
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA = (PROJECT_ROOT / "db" / "schema.sql").read_text(encoding="utf-8")
@@ -110,10 +111,14 @@ def test_schema_creates_the_sequences_we_think_it_does():
     sequences = sequences_this_schema_creates()
     assert "preferences_id_seq" in sequences, "the hand-written CREATE SEQUENCE was missed"
     assert "companies_id_seq" in sequences, "a plain SERIAL was missed"
+    assert "resumes_id_seq" in sequences, "the Slice 1 table's SERIAL was missed"
     assert not any(s.startswith(("users_", "jobs_")) for s in sequences), (
         f"users and jobs have no sequence, so something is over-matching: {sorted(sequences)}"
     )
-    assert len(sequences) == 6, f"expected 6 sequences, derived {sorted(sequences)}"
+    # Six through Phase 2; seven since Phase 3 Slice 1 added `resumes`. The count
+    # is asserted rather than the membership so that a table added without a
+    # thought about its sequence fails here first.
+    assert len(sequences) == 7, f"expected 7 sequences, derived {sorted(sequences)}"
 
 
 def test_schema_creates_the_tables_we_think_it_does():
@@ -126,7 +131,10 @@ def test_schema_creates_the_tables_we_think_it_does():
     tables = tables_this_schema_creates()
     assert "users" in tables, "public.users must be discoverable — the identity table"
     assert "jobs" in tables
-    assert len(tables) >= 8, f"expected at least the 8 Phase-1 tables, found {sorted(tables)}"
+    assert "resumes" in tables, "the Slice 1 table must be swept like every other"
+    assert len(tables) >= 9, (
+        f"expected at least the 8 Phase-1 tables plus resumes, found {sorted(tables)}"
+    )
 
 
 def test_every_table_enables_row_level_security():
@@ -231,19 +239,227 @@ def test_default_privileges_are_not_scoped_to_another_role():
     )
 
 
-def test_no_policy_is_defined_anywhere():
-    """Deny-all is the whole design, and a policy is the only way to widen it.
+# Every CREATE POLICY in the file, as (name, table). The table decides which of
+# the two rules below judges it; the name is what the file itself declares.
+POLICIES = re.findall(r"CREATE POLICY\s+(\w+)\s+ON\s+([\w.]+)", STATEMENTS)
 
-    RLS with zero policies denies every role that does not bypass it. The moment
-    a CREATE POLICY appears, some role can read something, and that is a
-    decision that has to be argued rather than inherited from a tutorial. This
-    test failing is not necessarily a bug — it is a prompt to write down why.
+# What the Slice 1 storage block is supposed to declare.
+#
+# NAMES ARE ASSERTED HERE AND NOWHERE ELSE, and the asymmetry is deliberate. This
+# is a test about db/schema.sql, which is the source of truth for a fresh install
+# and writes clean names — so it can and should say what those names are.
+# scripts/check_rls.py asks the LIVE database, where two of the policies carry a
+# suffix the Supabase UI appended, and matches on properties instead: operation,
+# role, owner predicate. A name is a fact about this file; it is not a fact about
+# whether a resume is reachable.
+EXPECTED_STORAGE_POLICIES = {
+    "resumes_owner_select": "SELECT",
+    "resumes_owner_insert": "INSERT",
+    "resumes_owner_update": "UPDATE",
+    "resumes_owner_delete": "DELETE",
+}
+
+
+def test_no_policy_is_defined_on_any_public_table():
+    """Deny-all is still the whole design in `public`, and a policy would widen it.
+
+    THIS TEST USED TO FORBID CREATE POLICY OUTRIGHT, and its own docstring said
+    that failing it was "a prompt to write down why" rather than necessarily a
+    bug. Phase 3 Slice 1 is that prompt being taken up: it adds four policies, all
+    of them on storage.objects, none on any table in `public`.
+
+    The rule therefore narrowed rather than relaxed. In `public`, RLS with zero
+    policies denies every role that does not bypass it, both runtimes connect as
+    postgres and bypass it, and nothing needs a policy — so a policy there is
+    still somebody widening deny-all and still has to be argued for. In `storage`
+    the situation is inverted (see test_the_storage_lock_creates_four_scoped_policies),
+    which is exactly why the two are judged by two rules instead of one.
     """
-    policies = re.findall(r"CREATE POLICY\s+(\w+)", STATEMENTS)
-    assert not policies, (
-        "db/schema.sql now defines policies, which widens deny-all: "
-        f"{', '.join(policies)}. If that is intended, say so here and in the "
-        "schema comment; if it is not, the anon key can now read something."
+    public_policies = [
+        name for name, table in POLICIES if not table.startswith("storage.")
+    ]
+    assert not public_policies, (
+        "db/schema.sql now defines policies on tables in public, which widens "
+        f"deny-all: {', '.join(public_policies)}. If that is intended, say so here "
+        "and in the schema comment; if it is not, the anon key can now read something."
+    )
+
+
+def test_the_storage_lock_creates_four_scoped_policies():
+    """The inverse rule: in `storage`, the policies ARE the security boundary.
+
+    This app has no service-role key, so every read and write of a resume travels
+    on the signed-in person's own JWT. There is no privileged path behind these
+    policies to fall back on — a missing one is not a smaller permission, it is a
+    person unable to reach their own file, and a wrong one is everybody reaching
+    everybody's.
+
+    Four things are asserted per policy, and each has a distinct failure:
+      - it exists and covers the verb its name claims
+      - TO authenticated, and never anon (the anon key is published)
+      - the predicate mentions auth.uid(), which is the isolation itself — a
+        policy that lost that clause would still be four correctly-named policies
+        and would let every signed-in user read every resume
+      - UPDATE additionally carries WITH CHECK, without which an owner can rename
+        their object into someone else's folder
+
+    Statement-text only, like everything in this file. scripts/check_rls.py asks
+    the live database the same four questions.
+    """
+    storage_policies = {name: table for name, table in POLICIES if table.startswith("storage.")}
+
+    missing = sorted(set(EXPECTED_STORAGE_POLICIES) - set(storage_policies))
+    assert not missing, (
+        f"the storage lock in db/schema.sql does not create: {', '.join(missing)} — "
+        "resume upload or download is denied even to the person who owns the file"
+    )
+    wrong_table = {n: t for n, t in storage_policies.items() if t != "storage.objects"}
+    assert not wrong_table, f"storage policies must be on storage.objects: {wrong_table}"
+
+    for name, cmd in sorted(EXPECTED_STORAGE_POLICIES.items()):
+        # The policy body: from its CREATE up to the terminating semicolon.
+        body = re.search(rf"CREATE POLICY\s+{name}\s+ON\s+storage\.objects(.*?);", STATEMENTS, re.S)
+        assert body, f"could not read the body of policy {name}"
+        text = body.group(1)
+
+        assert re.search(rf"\bFOR\s+{cmd}\b", text), (
+            f"policy {name} does not say FOR {cmd}, so it covers the wrong verb"
+        )
+        assert re.search(r"\bTO\s+authenticated\b", text), (
+            f"policy {name} is not scoped TO authenticated"
+        )
+        assert not re.search(r"\bTO\s+[\w\s,]*\banon\b", text), (
+            f"policy {name} is scoped to anon — the key in the browser bundle can use it"
+        )
+        assert "auth.uid()" in text, (
+            f"policy {name} does not mention auth.uid(), so it scopes nothing to an "
+            f"owner and every authenticated user can reach every resume"
+        )
+        assert "bucket_id = 'resumes'" in text, (
+            f"policy {name} does not restrict itself to the resumes bucket"
+        )
+        if cmd == "UPDATE":
+            assert "WITH CHECK" in text, (
+                "resumes_owner_update has no WITH CHECK: USING decides which rows may "
+                "be updated, WITH CHECK decides what they may become, and without it an "
+                "owner can rename their object into another person's folder"
+            )
+
+
+# --- the fence: what init_db.py is allowed to execute ----------------------
+#
+# db/schema.sql describes the whole database, including a storage section this
+# project's role cannot apply — storage.objects is owned by
+# supabase_storage_admin, and on 2026-08-06 attempting it raised 42501 and, because
+# asyncpg sends the file as one transaction, rolled back the `resumes` table with
+# it. The statements stay in the file as the source of truth and are fenced off
+# so the apply path skips them.
+#
+# These tests are about that fence, and they read the RAW file rather than
+# STATEMENTS: the markers are `--` comments, so the comment-stripping helper the
+# rest of this file uses would erase the very thing under test.
+
+
+def test_the_manual_block_is_well_formed():
+    """One fence, opened and closed, with the storage statements inside it."""
+    executable, manual = split_manual_block(SCHEMA)
+
+    assert "CREATE POLICY" in manual, "the storage policies are not inside the fence"
+    assert "storage.buckets" in manual, "the bucket INSERT is not inside the fence"
+    assert "ALTER TABLE storage.objects" in manual, (
+        "the storage.objects RLS statement is not inside the fence"
+    )
+    # And the part that DOES get applied still carries the ordinary schema.
+    assert "CREATE TABLE IF NOT EXISTS resumes" in executable, (
+        "the resumes TABLE has been fenced off along with the storage DDL. It is an "
+        "ordinary table in `public` that this project owns and must still be applied."
+    )
+    assert "ALTER TABLE public.resumes ENABLE ROW LEVEL SECURITY" in executable
+    assert "REVOKE ALL PRIVILEGES ON public.resumes" in executable
+
+
+def test_no_storage_statement_escapes_the_fence():
+    """THE GUARD, ASSERTED RATHER THAN TRUSTED.
+
+    The fence only protects anything while everything privileged is inside it,
+    and the natural way to add a fifth policy next year is to type it next to the
+    fourth — outside the markers, because markers are easy to miss. init_db.py
+    refuses to apply the file in that case; this proves the refusal is currently
+    not needed, and would catch the day it becomes needed.
+    """
+    executable, _ = split_manual_block(SCHEMA)
+    stray = storage_statements_outside_the_fence(executable)
+    assert not stray, (
+        "these statements touch Supabase's `storage` schema but sit outside the "
+        "MANUAL-ONLY fence, so init_db.py would send them and get 42501 — which "
+        "rolls back the whole migration:\n  " + "\n  ".join(stray)
+    )
+
+
+def test_the_guard_actually_fires_on_a_stray_statement():
+    """The mutation, because a guard that cannot fail is not a guard.
+
+    test_no_storage_statement_escapes_the_fence passes on an empty result, and it
+    would pass just as happily if the detector were broken. This hands it the
+    shape it exists to catch.
+    """
+    stray = storage_statements_outside_the_fence(
+        "CREATE TABLE fine (id INT);\nALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;"
+    )
+    assert stray == ["ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;"], stray
+
+    # And it reads statements rather than prose: this file's own commentary says
+    # "storage." constantly, and a guard that matched comments would make the
+    # schema fail for explaining itself.
+    assert storage_statements_outside_the_fence(
+        "-- we cannot touch storage.objects here, see the note\nCREATE TABLE fine (id INT);"
+    ) == []
+
+
+def test_a_malformed_fence_is_refused_rather_than_guessed_at():
+    """A missing END marker would silently swallow the rest of the file.
+
+    On this path that means silently not creating tables, and reporting success —
+    so the splitter raises instead of returning something plausible.
+    """
+    import pytest
+
+    with pytest.raises(ValueError, match="never closes it"):
+        split_manual_block("CREATE TABLE a (id INT);\n-- >>> MANUAL-ONLY (storage)\nDROP TABLE a;")
+
+    with pytest.raises(ValueError, match="no .* marker"):
+        split_manual_block("CREATE TABLE a (id INT);")
+
+    with pytest.raises(ValueError, match="more than one"):
+        split_manual_block(
+            "-- >>> MANUAL-ONLY (storage)\nA;\n-- <<< END MANUAL-ONLY\n"
+            "-- >>> MANUAL-ONLY (storage)\nB;\n-- <<< END MANUAL-ONLY\n"
+        )
+
+
+def test_the_resume_bucket_is_created_private():
+    """A public bucket makes all four policies decorative, so it is asserted here too.
+
+    storage.buckets.public = TRUE serves every object over a permanent URL with
+    no policy consulted at all. That failure leaves every other assertion in this
+    file green, which is precisely why it gets its own line.
+    """
+    assert re.search(r"INSERT INTO storage\.buckets", STATEMENTS), (
+        "db/schema.sql does not create the resumes bucket"
+    )
+    insert = re.search(r"INSERT INTO storage\.buckets(.*?);", STATEMENTS, re.S)
+    assert insert, "could not read the bucket INSERT"
+    text = insert.group(1)
+    assert "'resumes'" in text
+    assert re.search(r"\bFALSE\b", text), "the bucket must be created private (public = FALSE)"
+    # The re-apply path matters as much as the create: flipping the bucket public
+    # in the Supabase console is one click and nothing in this project would fail.
+    assert re.search(r"ON CONFLICT\s*\(\s*id\s*\)\s*DO UPDATE", text), (
+        "the bucket INSERT must DO UPDATE, so re-applying the schema closes a bucket "
+        "somebody made public in the console. DO NOTHING would leave it open."
+    )
+    assert re.search(r"SET\s+public\s*=\s*FALSE", text), (
+        "the DO UPDATE must set public = FALSE — that is the whole point of it"
     )
 
 
@@ -283,10 +499,10 @@ def test_the_block_does_not_use_all_tables_in_schema():
 # the criterion bites is to hand it that shape directly.
 
 
-# The live shape as measured on 2026-08-04, after the migration.
+# The live shape as measured on 2026-08-04, plus `resumes` from Phase 3 Slice 1.
 LIVE_TABLES = [
     "companies", "discovered_companies", "jobs", "notifications",
-    "preferences", "user_companies", "user_job_notifications", "users",
+    "preferences", "resumes", "user_companies", "user_job_notifications", "users",
 ]
 
 
@@ -309,7 +525,8 @@ def _facts(**overrides):
         "sequence_rows": [
             {"name": f"{t}_id_seq", "acl": ["postgres=rwU/postgres"]}
             for t in ("companies", "discovered_companies", "notifications",
-                      "preferences", "user_companies", "user_job_notifications")
+                      "preferences", "resumes", "user_companies",
+                      "user_job_notifications")
         ],
         "default_acls": [
             # ours, cleared by the migration
@@ -438,6 +655,225 @@ def test_a_non_bypassrls_connection_fails_loudly():
     """If the connecting role does not bypass RLS, we locked ourselves out."""
     failures, _ = evaluate(**_facts(bypassrls=False, connecting_role="some_other_role"))
     assert any("NOT bypassrls" in f for f in failures), failures
+
+
+# --- property 6, the storage half ------------------------------------------
+#
+# evaluate_storage() judges a PRESENCE where the five above judge an absence, so
+# the mutations are the other way round too: the failures worth staging are a
+# policy that went MISSING or that got WIDER, not one that appeared.
+
+
+def _bucket(**overrides):
+    """The intended live shape of the bucket: exists, private, RLS on."""
+    row = {"exists": True, "is_public": False, "objects_rls": True}
+    row.update(overrides)
+    return row
+
+
+# The owner predicate, spelled the way pg_policies DEPARSES it rather than the
+# way db/schema.sql writes it — `bucket_id = 'resumes'` comes back as
+# `(bucket_id = 'resumes'::text)` and `auth.uid()::text` as `((auth.uid())::text)`.
+# That rewritten form is what evaluate_storage actually reads, so a fixture using
+# the source spelling would be testing against text the database never produces.
+OWNER_QUAL = (
+    "((bucket_id = 'resumes'::text) AND "
+    "((storage.foldername(name))[1] = (auth.uid())::text))"
+)
+
+
+def _named_policies():
+    """The four policies as db/schema.sql describes them, keyed by operation."""
+    return {
+        "select": {
+            "policyname": "resumes_owner_select", "cmd": "SELECT",
+            "roles": "{authenticated}", "qual": OWNER_QUAL, "with_check": None,
+        },
+        "insert": {
+            "policyname": "resumes_owner_insert", "cmd": "INSERT",
+            "roles": "{authenticated}", "qual": None, "with_check": OWNER_QUAL,
+        },
+        "update": {
+            "policyname": "resumes_owner_update", "cmd": "UPDATE",
+            "roles": "{authenticated}", "qual": OWNER_QUAL, "with_check": OWNER_QUAL,
+        },
+        "delete": {
+            "policyname": "resumes_owner_delete", "cmd": "DELETE",
+            "roles": "{authenticated}", "qual": OWNER_QUAL, "with_check": None,
+        },
+    }
+
+
+def _storage_policies(**overrides):
+    """The live rows evaluate_storage sees. Override by operation; None removes."""
+    rows = _named_policies()
+    rows.update(overrides)
+    return [rows[k] for k in sorted(rows) if rows[k] is not None]
+
+
+def test_the_intended_storage_shape_passes():
+    """The bucket and policies this schema describes are green."""
+    failures, notes = evaluate_storage(_bucket(), _storage_policies())
+    assert failures == [], f"the intended storage shape should pass, got: {failures}"
+    # The names are REPORTED — that is how the suffixed live ones stay visible
+    # without deciding anything.
+    assert any("matched by property" in n for n in notes), notes
+
+
+def test_a_ui_suffixed_policy_name_still_passes():
+    """THE REGRESSION THIS PROPERTY MATCHING EXISTS FOR.
+
+    Two of the live policies were created through the Supabase UI, which appends
+    a suffix — `resumes_owner_select i5g8va_0`. The first version of this check
+    keyed on the name and went red against a database that was completely
+    correct, which is the failure a security check can least afford: one that
+    cries wolf gets switched off, and this is the check standing between a resume
+    and the internet.
+    """
+    renamed = {}
+    for key, policy in _named_policies().items():
+        renamed[key] = {**policy, "policyname": f"{policy['policyname']} i5g8va_0"}
+
+    failures, _ = evaluate_storage(_bucket(), _storage_policies(**renamed))
+    assert failures == [], f"a suffixed policy name must not fail anything, got: {failures}"
+
+
+def test_policies_named_anything_at_all_still_pass():
+    """The name is not merely tolerated with a suffix — it is not read.
+
+    Stated separately from the suffix case so the rule is unambiguous: what makes
+    a policy this project's is that it governs the resumes bucket, and what makes
+    it correct is its predicate. A future UI that renames differently, or a
+    hand-written policy called something sensible, must not need a code change.
+    """
+    odd = {}
+    for i, (key, policy) in enumerate(_named_policies().items()):
+        odd[key] = {**policy, "policyname": f"xyzzy_{i}"}
+
+    failures, _ = evaluate_storage(_bucket(), _storage_policies(**odd))
+    assert failures == [], f"policy names must not decide anything, got: {failures}"
+
+
+def test_a_missing_bucket_fails():
+    """The migration never ran, or rolled back on the 42501 the schema warns about."""
+    failures, _ = evaluate_storage(_bucket(exists=False), [])
+    assert any("no row with id = 'resumes'" in f for f in failures), failures
+
+
+def test_a_public_bucket_fails():
+    """The one failure that leaves every other check green.
+
+    A public bucket serves objects over a permanent URL without consulting a
+    policy, so all four policies can be perfect and every resume still readable.
+    """
+    failures, _ = evaluate_storage(_bucket(is_public=True), _storage_policies())
+    assert any("PUBLIC" in f for f in failures), failures
+
+
+def test_rls_off_on_storage_objects_fails():
+    """Policies on a table with RLS off are inert — every object is readable."""
+    failures, _ = evaluate_storage(_bucket(objects_rls=False), _storage_policies())
+    assert any("RLS is OFF on storage.objects" in f for f in failures), failures
+
+
+def test_no_policy_at_all_fails():
+    """The manual block was never pasted. Nobody can reach their own resume."""
+    failures, _ = evaluate_storage(_bucket(), [])
+    assert any("no policy on storage.objects governs" in f for f in failures), failures
+
+
+def test_a_missing_policy_fails():
+    """Each verb is a separate capability, so each absence is a separate failure."""
+    for operation, verb in (("select", "SELECT"), ("insert", "INSERT"),
+                            ("update", "UPDATE"), ("delete", "DELETE")):
+        failures, _ = evaluate_storage(_bucket(), _storage_policies(**{operation: None}))
+        assert any(f"no {verb} policy governs" in f for f in failures), (operation, failures)
+
+
+def test_a_policy_without_the_owner_predicate_fails():
+    """THE MUTATION THAT MATTERS MOST, AND THE ONE A NAME CHECK COULD NEVER SEE.
+
+    This policy is called `resumes_owner_select`, covers SELECT, is scoped to
+    authenticated, and sits on a private bucket. Everything a name-and-count
+    check would look at is perfect. It has simply lost the folder comparison —
+    so every signed-in user can read every resume in the bucket.
+
+    That is the whole argument for matching on properties: the old version of
+    this check would have passed this input.
+    """
+    widened = {
+        "policyname": "resumes_owner_select", "cmd": "SELECT",
+        "roles": "{authenticated}",
+        "qual": "(bucket_id = 'resumes'::text)",  # the folder check, gone
+        "with_check": None,
+    }
+    failures, _ = evaluate_storage(_bucket(), _storage_policies(select=widened))
+    assert any("does not scope objects to their owner" in f for f in failures), failures
+
+
+def test_an_update_policy_without_with_check_fails():
+    """USING says which rows you may update; WITH CHECK says what they may become.
+
+    Without it an owner can rename their own object into another person's folder,
+    which passes USING on the way in and lands somewhere they cannot be stopped
+    from reading.
+    """
+    no_check = {**_named_policies()["update"], "with_check": None}
+    failures, _ = evaluate_storage(_bucket(), _storage_policies(update=no_check))
+    assert any("no WITH CHECK" in f for f in failures), failures
+
+
+def test_an_anon_scoped_policy_fails():
+    """The published key acts as anon. No policy on this bucket may name it."""
+    anon = {**_named_policies()["select"], "roles": "{anon,authenticated}"}
+    failures, _ = evaluate_storage(_bucket(), _storage_policies(select=anon))
+    assert any("scoped to anon" in f for f in failures), failures
+
+
+def test_a_policy_not_scoped_to_authenticated_fails():
+    """A policy for PUBLIC covers anon too, without ever naming it.
+
+    `TO public` is the Postgres default when no role is given, and it reads as
+    harmless. It is not: `public` includes every role, so the anon key gets the
+    policy by inheritance rather than by being mentioned — which is why the role
+    is asserted positively instead of only checking that anon is absent.
+    """
+    everyone = {**_named_policies()["select"], "roles": "{public}"}
+    failures, _ = evaluate_storage(_bucket(), _storage_policies(select=everyone))
+    assert any("not scoped TO authenticated" in f for f in failures), failures
+
+
+def test_two_policies_for_one_operation_fail():
+    """Policies are OR-ed, so a second one can only widen the first.
+
+    The realistic shape is a debugging policy added to unblock something and
+    never removed: the strict one is still there, still correct, and no longer
+    deciding anything.
+    """
+    extra = _storage_policies() + [{
+        "policyname": "temp_debug_read", "cmd": "SELECT",
+        "roles": "{authenticated}",
+        "qual": "(bucket_id = 'resumes'::text)",
+        "with_check": None,
+    }]
+    failures, _ = evaluate_storage(_bucket(), extra)
+    assert any("policies cover SELECT" in f for f in failures), failures
+
+
+def test_an_unrelated_storage_policy_is_reported_not_failed():
+    """A policy for some other bucket is somebody else's decision, and visible.
+
+    It is identified as somebody else's by naming a different bucket, not by
+    being named differently — which is the same rule that lets the suffixed
+    resume policies count as ours.
+    """
+    extra = _storage_policies() + [{
+        "policyname": "avatars_public_read", "cmd": "SELECT",
+        "roles": "{anon}", "qual": "(bucket_id = 'avatars'::text)", "with_check": None,
+    }]
+    failures, notes = evaluate_storage(_bucket(), extra)
+    assert failures == [], f"an unrelated bucket's policy is not a failure: {failures}"
+    assert any("avatars_public_read" in n for n in notes), notes
 
 
 def test_granting_roles_ignores_roles_that_grant_nothing():

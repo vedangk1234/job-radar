@@ -72,6 +72,24 @@ JOB_COLUMNS = [
 
 NEW_COLUMNS = [name for name, *_ in PREFERENCE_COLUMNS] + [name for name, _ in JOB_COLUMNS]
 
+# THE COLUMNS SLICE 1 WIRED UP, and why this list exists rather than the sweep
+# below simply being deleted.
+#
+# Step 0 created twelve columns with no readers and asserted that none of them
+# had one. That assertion was never meant to hold forever — it holds until the
+# FEATURE step for a given column arrives, which is the step that owns the
+# migration proof for it. Phase 3 Slice 1 is that step for exactly one:
+# onboarding_completed, which lib/preferences.savePreferences now sets when a
+# person saves their own filter for the first time.
+#
+# So the guard narrows by one name and goes on protecting the other eleven. The
+# alternative — dropping the test now that it has fired once — would retire the
+# whole guarantee on the day the first column was wired, which is the day it
+# starts being worth something.
+WIRED_UP = {"onboarding_completed"}
+
+STILL_UNWIRED = [c for c in NEW_COLUMNS if c not in WIRED_UP]
+
 # Every module that loads the filter, decides a match, writes a job, or creates a
 # preferences row. If a Phase-3 column is ever going to change behaviour, it does
 # so by appearing in one of these — which is the whole reason the list is
@@ -137,6 +155,11 @@ def _step_zero_statements() -> str:
     # Drop the remainder of the header's own line — the split lands mid-comment,
     # so what follows the marker is prose that no longer starts with its `--`.
     _, _, body = parts[1].partition("\n")
+    # BOUNDED AT THE NEXT SECTION, which it did not need to be while Step 0 was
+    # the last thing in the file. Phase 3 Slice 1 appended a block that genuinely
+    # does CREATE TABLE, and an unbounded read would attribute it to Step 0 and
+    # fail the assertion below for something Step 0 did not do.
+    body = body.split("PHASE 3 SLICE 1", 1)[0]
     return "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("--"))
 
 
@@ -170,21 +193,24 @@ def test_step_zero_creates_no_table_and_no_index() -> None:
 
 
 @pytest.mark.parametrize("relative_path", DECIDING_FILES)
-def test_no_decider_names_a_new_column(relative_path: str) -> None:
+def test_no_decider_names_a_still_unwired_column(relative_path: str) -> None:
     """The load-bearing assertion: nothing that decides anything reads these yet.
 
     Word-boundary matching, not substring, for the reason notify/match.py spends
     a docstring on: `work_mode` is inside `work_modes`, so a substring search
     would report the preferences column as a hit on the jobs one and the failure
     would name the wrong column.
+
+    Eleven columns rather than twelve since Phase 3 Slice 1 — see WIRED_UP.
     """
     source = (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
-    found = [c for c in NEW_COLUMNS if re.search(rf"\b{re.escape(c)}\b", source)]
+    found = [c for c in STILL_UNWIRED if re.search(rf"\b{re.escape(c)}\b", source)]
     assert not found, (
-        f"{relative_path} names Phase-3 Step-0 column(s) {', '.join(found)}. This step "
+        f"{relative_path} names Phase-3 Step-0 column(s) {', '.join(found)}. Step 0 "
         f"creates the columns and nothing else — wiring one in is its own feature step, "
-        f"with its own migration proof."
+        f"with its own migration proof, and it adds the name to WIRED_UP here."
     )
+
 
 
 def test_the_job_write_paths_name_none_of_the_new_job_columns() -> None:

@@ -9,7 +9,7 @@ question urgent — NEXT_PUBLIC_SUPABASE_ANON_KEY goes into the browser bundle, 
 from then on "what can the anon role do" is a question about the internet rather
 than about a role nobody assumes.
 
-FIVE PROPERTIES, asked separately because they fail apart:
+SIX PROPERTIES, asked separately because they fail apart:
 
   1. Every base table in `public` has RLS enabled. With no policies defined that
      is deny-all — anon matches nothing.
@@ -21,6 +21,23 @@ FIVE PROPERTIES, asked separately because they fail apart:
      next object this project creates arrives closed rather than open.
   5. No table in `public` is owned by some OTHER role whose default privileges
      do grant them — which is the only way a foreign default ACL can ever bite.
+  6. The `resumes` bucket is private, RLS is on for storage.objects, and the four
+     policies governing that bucket are scoped to `authenticated`, carry an
+     auth.uid() folder predicate, and none of them names `anon`.
+
+PROPERTY 6 IS A DIFFERENT SHAPE FROM THE OTHER FIVE, and Phase 3 Slice 1 is what
+added it. Those five all assert an ABSENCE: nobody can reach anything, and the
+two runtimes work because they connect as postgres and bypass RLS. Storage cannot
+be answered that way. This app holds no service-role key, so every upload and
+download travels on the signed-in person's own JWT — the policies are not a
+second opinion behind a server-side check, they ARE the check, and "there are no
+policies" would mean nobody can read their own resume. So property 6 asserts a
+PRESENCE (four policies, correctly scoped) alongside the absence that matters
+(none of them reachable by anon, and a bucket that is not public).
+
+A public bucket is the failure worth naming twice: it serves every object over a
+permanent URL without consulting a policy at all, so it would leave properties
+1-5 green, all four policies present, and every resume readable by anyone.
 
 WHY 4 AND 5 ARE TWO QUESTIONS AND NOT ONE, which is the correction this script
 had to be rewritten for. A default ACL governs only objects created BY the role
@@ -149,12 +166,86 @@ SELECT d.defaclobjtype::text AS objtype,
 
 # A policy is not a failure — it is a deliberate act. But an unnoticed one turns
 # deny-all into something narrower, so they are reported rather than judged.
+#
+# `public` ONLY, deliberately, even though Slice 1 added four policies one schema
+# over. Deny-all is the design in `public` and any policy there widens it; in
+# `storage` a policy is the mechanism itself, so the two are asked by two queries
+# and judged by two different rules. A single sweep would have to report the four
+# storage policies as anomalies in the same breath as it demands they exist.
 POLICIES_SQL = """
 SELECT tablename, policyname, cmd, roles::text AS roles
   FROM pg_policies
  WHERE schemaname = 'public'
  ORDER BY tablename, policyname
 """
+
+# Property 6. The bucket's own row: `public` is the column that can make every
+# policy below it decorative.
+#
+# LEFT JOIN-shaped as a scalar subquery rather than an inner join, so a MISSING
+# bucket comes back as a row of NULLs rather than as no row at all — "the
+# migration never ran" and "the bucket is fine" must not both look like an empty
+# result set.
+BUCKET_SQL = """
+SELECT (SELECT b.public FROM storage.buckets b WHERE b.id = 'resumes') AS is_public,
+       EXISTS (SELECT 1 FROM storage.buckets b WHERE b.id = 'resumes') AS exists,
+       (SELECT c.relrowsecurity
+          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'storage' AND c.relname = 'objects') AS objects_rls
+"""
+
+# Every policy on storage.objects, with the roles each is granted to. `roles`
+# renders as a Postgres array literal — '{authenticated}' — so an anon-scoped
+# policy is visible as text rather than needing a second query.
+STORAGE_POLICIES_SQL = """
+SELECT policyname, cmd, roles::text AS roles, qual, with_check
+  FROM pg_policies
+ WHERE schemaname = 'storage' AND tablename = 'objects'
+ ORDER BY policyname
+"""
+
+# The four operations a resume policy set has to cover.
+EXPECTED_STORAGE_COMMANDS = ("SELECT", "INSERT", "UPDATE", "DELETE")
+
+# WHY THIS IS MATCHED BY PROPERTY AND NEVER BY NAME.
+#
+# The first version of this check keyed on policyname and expected exactly
+# `resumes_owner_select` and friends. Two of the live policies were created
+# through the Supabase UI, which appends a suffix — `resumes_owner_select
+# i5g8va_0` — so the check went red against a database that was completely
+# correct. That is the failure mode a security check can least afford: one that
+# cries wolf gets switched off, and this is the check standing between a resume
+# and the internet.
+#
+# The deeper problem is that the name was never the thing worth asserting. A
+# policy called `resumes_owner_select` that had lost its auth.uid() predicate
+# would have passed a name check while letting every signed-in user read every
+# resume; a policy called `xyzzy` with the right predicate is perfectly safe. So
+# a policy is identified by WHAT IT GOVERNS — it mentions the resumes bucket —
+# and then judged on what it actually says.
+#
+# The strings below are matched against pg_policies' deparsed output, which
+# normalises `bucket_id = 'resumes'` to `(bucket_id = 'resumes'::text)` and
+# `auth.uid()::text` to `((auth.uid())::text)`. Each probe is chosen to survive
+# that rewriting rather than to look like the source.
+BUCKET_PREDICATE = "bucket_id = 'resumes'"
+OWNER_PREDICATES = ("auth.uid()", "storage.foldername(name)")
+
+
+def policy_clauses(policy) -> str:
+    """A policy's USING and WITH CHECK expressions as one searchable string.
+
+    Both, because which one carries the predicate depends on the operation: an
+    INSERT policy has only WITH CHECK, a SELECT or DELETE policy has only USING,
+    and UPDATE should have both. Reading one of them would silently exempt
+    whichever policies keep their rule in the other.
+    """
+    return " ".join(filter(None, (policy["qual"], policy["with_check"])))
+
+
+def resume_policies(storage_policies) -> list:
+    """The policies that govern the resumes bucket, whatever they are called."""
+    return [p for p in storage_policies if BUCKET_PREDICATE in policy_clauses(p)]
 
 # If this is not BYPASSRLS the locks would apply to US, which is the one way
 # this change could break the crawler — so it is checked rather than assumed.
@@ -181,6 +272,145 @@ def granting_roles(default_acls) -> dict[str, list[str]]:
     return out
 
 
+def evaluate_storage(bucket, storage_policies) -> tuple[list[str], list[str]]:
+    """Property 6, kept separate because it judges a PRESENCE. Pure.
+
+    Split out rather than folded into evaluate() for the reason the module
+    docstring gives: every other property here asserts that nobody can reach
+    anything, and this one asserts that exactly one person can. Two rules that
+    read the same way would be two rules a maintainer conflates.
+
+    The checks, in the order a failure would actually hurt:
+
+      - the bucket exists at all (the manual block was applied)
+      - it is PRIVATE (a public bucket ignores every policy below)
+      - storage.objects enforces RLS (policies on a table with RLS off are inert)
+      - one policy per operation governs the bucket, each scoped to
+        `authenticated`, each carrying the auth.uid() folder predicate, and none
+        of them naming `anon` — which is what makes the published key a no-op
+
+    MATCHED BY PROPERTY, NEVER BY NAME. See the note on BUCKET_PREDICATE above:
+    two of the live policies carry a UI-appended suffix, and a name was never the
+    thing worth asserting anyway.
+    """
+    failures: list[str] = []
+    notes: list[str] = []
+
+    if not bucket or not bucket["exists"]:
+        failures.append(
+            "storage.buckets has no row with id = 'resumes' — the storage lock at "
+            "the end of db/schema.sql has not been applied, so resume upload has "
+            "nowhere to write"
+        )
+        return failures, notes
+
+    if bucket["is_public"]:
+        failures.append(
+            "the 'resumes' bucket is PUBLIC. Every object in it is served over a "
+            "permanent URL with no policy consulted, so the four policies below "
+            "decide nothing and every resume is readable by anyone"
+        )
+
+    if not bucket["objects_rls"]:
+        failures.append(
+            "RLS is OFF on storage.objects, so the resumes_owner_* policies are "
+            "inert and every authenticated user can read every object"
+        )
+
+    ours = resume_policies(storage_policies)
+
+    if not ours:
+        failures.append(
+            "no policy on storage.objects governs the 'resumes' bucket. The MANUAL-ONLY "
+            "block at the end of db/schema.sql has not been applied, so nobody — "
+            "including the owner — can reach a resume"
+        )
+        return failures, notes
+
+    by_command: dict[str, list] = {}
+    for policy in ours:
+        by_command.setdefault(policy["cmd"], []).append(policy)
+
+    for cmd in EXPECTED_STORAGE_COMMANDS:
+        matching = by_command.get(cmd, [])
+        if not matching:
+            failures.append(
+                f"no {cmd} policy governs the resumes bucket — {cmd} on a resume is "
+                f"denied even to the person who owns it"
+            )
+            continue
+        if len(matching) > 1:
+            # Two policies for one operation are OR-ed, so the broader one wins
+            # and the stricter one is decoration. A failure rather than a note:
+            # it is how a temporary debugging policy quietly becomes the rule.
+            failures.append(
+                f"{len(matching)} policies cover {cmd} on the resumes bucket "
+                f"({', '.join(repr(p['policyname']) for p in matching)}). Policies are "
+                f"OR-ed together, so the most permissive one decides"
+            )
+
+        for policy in matching:
+            name = policy["policyname"]
+            clauses = policy_clauses(policy)
+
+            if "authenticated" not in (policy["roles"] or ""):
+                failures.append(
+                    f"storage policy {name!r} ({cmd}) is not scoped TO authenticated "
+                    f"(roles = {policy['roles']})"
+                )
+
+            # The owner predicate IS the isolation. A policy that kept its name,
+            # its operation and its bucket check but lost this would let every
+            # signed-in user read every resume — and would pass any check that
+            # asked only whether four correctly-named policies existed.
+            missing = [p for p in OWNER_PREDICATES if p not in clauses]
+            if missing:
+                failures.append(
+                    f"storage policy {name!r} ({cmd}) does not scope objects to their "
+                    f"owner — no {', '.join(missing)} in its predicate: "
+                    f"{clauses or '(none)'}"
+                )
+
+            if cmd == "UPDATE" and not policy["with_check"]:
+                failures.append(
+                    f"storage policy {name!r} has no WITH CHECK. USING decides which "
+                    f"rows may be updated, WITH CHECK decides what they may become — "
+                    f"without it an owner can rename their object into another "
+                    f"person's folder"
+                )
+
+    # The published key acts as `anon`. No policy touching this bucket may name
+    # it, whatever that policy happens to be called.
+    anon_scoped = sorted(p["policyname"] for p in ours if "anon" in (p["roles"] or ""))
+    if anon_scoped:
+        failures.append(
+            f"policy/policies {', '.join(repr(n) for n in anon_scoped)} on the resumes "
+            f"bucket are scoped to anon — the published "
+            f"NEXT_PUBLIC_SUPABASE_ANON_KEY can exercise them"
+        )
+
+    # Policies governing some OTHER bucket are somebody else's decision about a
+    # table this project now depends on. Reported, not failed: Supabase ships
+    # none by default, and a bucket added later for an unrelated feature is not
+    # this check's business — but it should be visible.
+    others = [p for p in storage_policies if p not in ours]
+    if others:
+        notes.append(
+            f"storage.objects carries {len(others)} policy/policies for other buckets: "
+            + ", ".join(f"{p['policyname']!r} ({p['cmd']})" for p in others)
+            + " — they do not name the resumes bucket"
+        )
+
+    # Names are REPORTED and decide nothing. Two of the live ones carry a suffix
+    # the Supabase UI appended; that is cosmetic and deliberately left alone.
+    notes.append(
+        "resume policies, matched by property rather than by name: "
+        + ", ".join(f"{p['policyname']!r} {p['cmd']}" for p in ours)
+    )
+
+    return failures, notes
+
+
 def evaluate(
     *,
     connecting_role: str,
@@ -191,12 +421,12 @@ def evaluate(
     default_acls,
     table_owners,
 ) -> tuple[list[str], list[str]]:
-    """(failures, notes) for the five properties. No database, no clock.
+    """(failures, notes) for properties 1-5. No database, no clock.
 
     Pure so the criteria can be mutation-tested against inputs that do not exist
     on the real database — above all a supabase_admin-owned table in `public`,
     which is the condition property 5 is FOR and which cannot be created here to
-    test against.
+    test against. Property 6 is evaluate_storage(), above.
     """
     failures: list[str] = []
     notes: list[str] = []
@@ -292,6 +522,8 @@ async def main() -> int:
         table_owners = await conn.fetch(TABLE_OWNERS_SQL)
         default_acls = await conn.fetch(DEFAULT_ACL_SQL)
         policy_rows = await conn.fetch(POLICIES_SQL)
+        bucket = await conn.fetchrow(BUCKET_SQL)
+        storage_policies = await conn.fetch(STORAGE_POLICIES_SQL)
     finally:
         await conn.close()
 
@@ -344,6 +576,16 @@ async def main() -> int:
     if not policy_rows:
         print("  (none — RLS with no policy is deny-all, which is the intent here)")
 
+    print("\nstorage (Phase 3 Slice 1 — the resume bucket):")
+    if bucket and bucket["exists"]:
+        print(f"  bucket 'resumes'   public={bucket['is_public']}  (must be False)")
+        print(f"  storage.objects    RLS={bucket['objects_rls']}")
+    else:
+        print("  bucket 'resumes'   MISSING")
+    print(f"  policies on storage.objects: {len(storage_policies)}")
+    for row in storage_policies:
+        print(f"    {row['policyname']} {row['cmd']} roles={row['roles']}")
+
     failures, notes = evaluate(
         connecting_role=connecting_role,
         bypassrls=bool(role["bypassrls"]),
@@ -353,6 +595,10 @@ async def main() -> int:
         default_acls=default_acls,
         table_owners=table_owners,
     )
+
+    storage_failures, storage_notes = evaluate_storage(bucket, storage_policies)
+    failures += storage_failures
+    notes += storage_notes
 
     if notes:
         print("\nREPORTED (not failures):")
@@ -374,8 +620,10 @@ async def main() -> int:
         f"\nSUCCESS: RLS is on for all {len(rls_rows)} tables in public; {roles_label} "
         f"hold no privileges on any table this schema owns or on any of the "
         f"{len(sequence_rows)} sequences; {connecting_role!r}'s default privileges grant "
-        f"them nothing, so the next object this project creates arrives closed; and no "
-        f"table here is owned by a role whose defaults would open one."
+        f"them nothing, so the next object this project creates arrives closed; no "
+        f"table here is owned by a role whose defaults would open one; and the "
+        f"'resumes' bucket is private with all four owner-scoped policies in place "
+        f"and none of them reachable by anon."
     )
     return 0
 

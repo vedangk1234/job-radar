@@ -737,12 +737,18 @@ CREATE INDEX IF NOT EXISTS user_job_notifications_job_idx
 -- implying that the one table holding account identity was somehow exempt.
 --
 -- SCOPE, stated so the gaps are chosen rather than missed. Schema `public`
--- only. Supabase's own `storage`, `graphql` and `graphql_public` schemas carry
--- the identical default grants and are deliberately untouched — they are not
--- this project's to configure, and `storage` is empty here. FUNCTIONS are
--- included in lock 3 although `public` currently holds none, because a function
--- is how PostgREST exposes RPC and the cost of covering it in advance is one
--- line.
+-- only. Supabase's own `graphql` and `graphql_public` schemas carry the
+-- identical default grants and are deliberately untouched — they are not this
+-- project's to configure. FUNCTIONS are included in lock 3 although `public`
+-- currently holds none, because a function is how PostgREST exposes RPC and the
+-- cost of covering it in advance is one line.
+--
+-- `storage` USED TO BE ON THAT UNTOUCHED LIST, AND IS NOT ANY MORE. This block
+-- said "`storage` is empty here", which was true until Phase 3 Slice 1 put a
+-- person's resume in it. The storage lock is at the END of this file, with the
+-- table that references it, and it is a DIFFERENT SHAPE from the three locks
+-- below — deny-all cannot work there, because the whole point is that one
+-- specific person can reach one specific object. See PHASE 3 SLICE 1.
 --
 -- EVERY STATEMENT BELOW IS A NO-OP ON RE-RUN. ENABLE ROW LEVEL SECURITY on an
 -- RLS-enabled table does nothing; REVOKE of a privilege nobody holds does
@@ -998,3 +1004,278 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_max NUMERIC;  -- normalised to 
 -- (table, column) pairs asserted against information_schema after the apply, so
 -- "the migration landed" is something the script reports rather than something a
 -- person infers from the absence of an error.
+
+
+-- ===========================================================================
+-- PHASE 3 SLICE 1 — the resume: one row here, one object in a private bucket
+-- ===========================================================================
+--
+-- A person uploads a resume, we read it once to suggest keywords, and we keep
+-- the file. That is the first personal data this project has ever stored beyond
+-- an email address, and it arrives with three obligations the rest of the schema
+-- did not have: it must be reachable by exactly one person, it must be erasable,
+-- and both of those must be true of the FILE and not merely of the row naming it.
+--
+-- WHY THE FILE IS NOT IN POSTGRES. A bytea column would inherit every guarantee
+-- this schema already makes — the RLS block, the ON DELETE CASCADE, the single
+-- delete transaction — and it is still the wrong answer. Supabase's free tier
+-- counts database storage against a much smaller number than object storage,
+-- resumes are 50 KB to 5 MB each, and every SELECT that touched the row would
+-- drag the blob across the pooler. The same argument the `jobs` table makes about
+-- descriptions: there is nowhere to put the bytes, on purpose.
+--
+-- SO THERE ARE TWO HALVES, AND ONLY ONE OF THEM CASCADES. This table is the row;
+-- storage.objects holds the file. A FK cannot span them usefully (storage.objects
+-- is Supabase's table, migrated on their schedule — the same argument
+-- public.users.auth_user_id makes for declining a reference into auth.users), so
+-- "delete the account, lose the resume" is NOT a property of this schema. It is a
+-- property of dashboard/src/lib/account.ts, which removes the object BEFORE it
+-- opens the delete transaction, and refuses to delete the account at all if the
+-- object survives. See that file for why the order is the whole decision.
+
+
+-- resumes: one per user, replaced in place, referenced not embedded.
+--
+-- WHY A TABLE RATHER THAN FOUR COLUMNS ON `preferences`. `preferences` is THE
+-- FILTER — the row notify/store.PREFERENCES_SQL and both matchers load to decide
+-- what reaches an inbox. A resume is not an input to that decision; it is an
+-- artefact with its own lifecycle (uploaded, replaced, erased). Putting it there
+-- would be one row carrying two unrelated facts, which is what jobs.notified was
+-- and what four hundred lines above this one are the record of. It has a smaller
+-- and more immediate cost too: replacing a resume would bump preferences.
+-- updated_at, the "last saved" timestamp the preferences screen shows, so
+-- uploading a file would read on screen as having edited a filter.
+--
+-- UNIQUE (user_id), plain rather than partial, because user_id is NOT NULL here —
+-- unlike preferences.user_id, which had to arrive nullable in 1b and therefore
+-- needed preferences_one_per_user_idx to be a partial index. One resume per
+-- person is the product decision; ON CONFLICT (user_id) DO UPDATE is what makes
+-- "replace" a single statement rather than a delete and an insert that can fail
+-- between them.
+--
+-- WHAT IS AND IS NOT IN HERE. bucket_path, filename, content_type, size_bytes,
+-- uploaded_at — enough to render "resume.pdf, uploaded 6 August" and to find the
+-- object again. NOT the extracted text and NOT the extracted keywords. The text
+-- is parsed in the request that receives the file and thrown away in the same
+-- request, exactly as a job description is; the keywords the parse suggests are
+-- not stored here either, because a person edits them before they mean anything
+-- and the edited list belongs in preferences.keywords, where the matchers
+-- already read it. A resume row therefore records that a file exists and where —
+-- nothing about what it said.
+--
+-- bucket_path IS STORED EVEN THOUGH IT IS DERIVABLE from the auth uid and the
+-- content type. Derivable is not the same as derived: the erasure path lists the
+-- folder rather than trusting this column precisely because a half-failed replace
+-- could leave an object this column does not name, and having the column makes
+-- the ordinary read one lookup instead of a convention re-implemented at three
+-- call sites. It is keyed on auth.users.id and NOT on public.users.id — see the
+-- storage lock below, where that distinction is load-bearing.
+CREATE TABLE IF NOT EXISTS resumes (
+  id            SERIAL PRIMARY KEY,
+  user_id       UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  bucket_path   TEXT NOT NULL,           -- '{auth.users.id}/resume.pdf' — see the storage lock
+  filename      TEXT NOT NULL,           -- as the person's own filesystem had it
+  content_type  TEXT NOT NULL,           -- application/pdf | ...wordprocessingml.document
+  size_bytes    INT  NOT NULL,
+  uploaded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id)
+);
+
+-- The same two locks the eight tables above get. They are stated HERE rather than
+-- in the enumerated block for one boring reason: that block runs before this
+-- table exists, and ALTER TABLE on a table that is not there yet fails. The block
+-- is still the place to look for the argument; this is the place the statement
+-- can legally go. tests/test_rls.py derives its table list from this file, so a
+-- new table with these two lines missing is a red test rather than a hole.
+ALTER TABLE public.resumes ENABLE ROW LEVEL SECURITY;
+REVOKE ALL PRIVILEGES ON public.resumes FROM anon, authenticated;
+REVOKE ALL PRIVILEGES ON SEQUENCE public.resumes_id_seq FROM anon, authenticated;
+
+
+-- ---------------------------------------------------------------------------
+-- The storage lock — the one place in this project where deny-all is wrong
+-- ---------------------------------------------------------------------------
+--
+-- Every other lock in this file is deny-all: RLS on, no policy, nobody reaches
+-- anything, and both runtimes work because they connect as `postgres`, which
+-- bypasses RLS. That cannot be the answer here, and the reason is a constraint
+-- this app chose deliberately several phases ago: THERE IS NO SERVICE-ROLE KEY.
+-- dashboard/src/lib/env.ts and lib/supabase/server.ts both say so, and
+-- lib/account.ts argues at length for why adding one would be a downgrade. So
+-- there is no credential anywhere in the deployed app that can read or write an
+-- object while bypassing storage's RLS. Every upload, download and delete goes
+-- through the SIGNED-IN PERSON'S OWN JWT.
+--
+-- Which makes the policy the entire security boundary, rather than a second
+-- opinion behind some server-side check. A person reaches their resume because
+-- Postgres says the folder is theirs, and reaches nobody else's because Postgres
+-- says it is not. No TypeScript decides it, so no TypeScript can get it wrong.
+--
+-- THE FOLDER IS THE AUTH UID, NOT public.users.id, AND THIS IS THE 2c LESSON
+-- REPEATING. auth.uid() is the only identity a storage policy can see. For every
+-- account created since 2a the two ids are equal; for the Phase-1 account they
+-- are NOT — its id came from gen_random_uuid() in 1a and its auth_user_id was
+-- filled in later by link-user branch 2. Key the path on public.users.id and that
+-- one person uploads a file into a folder their own policy can never match: a 403
+-- on their own resume, which reads as a broken bucket rather than as a mismatched
+-- id. lib/guard.Session carries both values for exactly this reason, and it
+-- carries them because lib/account.ts needed the same distinction first.
+--
+-- FOUR POLICIES, NOT ONE "FOR ALL", and the split is not ceremony:
+--
+--   SELECT  — download, and minting a signed URL, which is a read
+--   INSERT  — the first upload
+--   UPDATE  — replacing an existing object (the client upserts)
+--   DELETE  — replacing across a type change, and erasure
+--
+-- FOR ALL would collapse them into a single USING clause and quietly lose the
+-- WITH CHECK on UPDATE, which is the one that matters most: USING says which
+-- rows you may update, WITH CHECK says what they may become. Without it, a
+-- person could UPDATE their own object's `name` to a path inside somebody else's
+-- folder — passing USING on the way in and landing somewhere they can no longer
+-- be stopped from reaching. Reading a policy per verb also means the answer to
+-- "can anon do this" is four separate no's rather than one.
+--
+-- TO authenticated, AND THERE IS NO anon POLICY AT ALL. That absence is the
+-- deny for the published key: NEXT_PUBLIC_SUPABASE_ANON_KEY acts as `anon`, RLS
+-- is on for storage.objects, and a role with no policy matches no row. It is the
+-- same deny-all the eight public tables get, reached by saying nothing rather
+-- than by saying no.
+--
+-- OWNERSHIP: THIS PROJECT CANNOT RUN THE STATEMENTS BELOW, AND THAT IS MEASURED
+-- RATHER THAN ASSUMED. An earlier version of this paragraph said `postgres` is a
+-- member of supabase_storage_admin "on this project, which is why the Supabase
+-- SQL editor can create storage policies at all". THAT WAS WRONG, and it is
+-- corrected here rather than deleted because the mistake is the reason this
+-- section is shaped the way it is. What actually happened on 2026-08-06:
+--
+--     python scripts/init_db.py
+--     -> InsufficientPrivilegeError: must be owner of table objects
+--
+-- storage.objects belongs to supabase_storage_admin, and on this project neither
+-- the pooler role NOR the SQL editor can ALTER it or create a policy on it. The
+-- SQL-editor-can-do-it assumption is true of many Supabase projects and was not
+-- true of this one, which is exactly the kind of thing that has to be run before
+-- it is believed.
+--
+-- THE FAILURE WAS NOT LOCAL TO THIS SECTION, WHICH IS THE PART THAT MATTERED.
+-- scripts/init_db.py sends this file to asyncpg as ONE multi-statement execute,
+-- so it runs in one implicit transaction: a 42501 here rolled back the whole
+-- apply, including `resumes` two hundred lines up. The migration did not
+-- half-land — it did not land at all, and the error named a storage table while
+-- the missing thing was an ordinary public one.
+--
+-- SO THE STATEMENTS BELOW ARE FENCED OFF AND APPLIED BY HAND. They stay here, as
+-- real pasteable SQL, because this file is the source of truth for what the
+-- database should look like and a schema that omits its own security boundary is
+-- worse than one that cannot execute part of itself. What changed is who runs
+-- them:
+--
+--     scripts/init_db.py  SLICES THE BLOCK OUT and never executes it, then
+--                         ASSERTS the result — bucket present and private, four
+--                         owner-scoped policies on storage.objects. A missing
+--                         piece is a named failure that prints this block for
+--                         pasting, not a raw privilege error.
+--     scripts/check_rls.py  asks the same question on every audit run.
+--
+-- init_db.py also refuses to apply this file at all if any `storage.` statement
+-- appears OUTSIDE the fence, so the 42501 above cannot come back by someone
+-- adding a fifth policy in the wrong place.
+--
+-- THE ONE THING THE FENCE COSTS. The bucket INSERT used to be executable, and
+-- re-applying the schema would therefore close a bucket somebody had flipped to
+-- public in the console. It cannot do that any more. Detection replaces
+-- correction: check_rls.py asserts `public = false` on every run and goes red.
+-- That is worse than self-healing and it is the honest price of an apply path
+-- that runs on this project.
+--
+-- WHY THE BUCKET INSERT IS INSIDE THE FENCE AT ALL, since it is DML and might
+-- well be permitted: the bucket and its policies are one unit — a bucket with no
+-- policy is unreachable, a policy with no bucket is inert — and this section has
+-- already cost one rolled-back migration to a privilege guess. It is not worth
+-- guessing twice.
+--
+-- RE-RUNNABLE, in the only shape Postgres offers: there is no CREATE POLICY IF
+-- NOT EXISTS, so each is dropped and recreated. DROP POLICY IF EXISTS on an
+-- absent policy is a no-op, and recreating an identical policy changes nothing —
+-- so pasting this block again is safe.
+--
+-- THE LIVE POLICY NAMES DO NOT ALL MATCH THE ONES BELOW, deliberately left
+-- alone. Two were created through the Supabase UI, which appends a suffix
+-- ("resumes_owner_select i5g8va_0"). Nothing reads a policy name to decide
+-- anything: check_rls.py matches on PROPERTIES — operation, TO authenticated,
+-- an auth.uid() folder predicate, no anon — precisely so a cosmetic name cannot
+-- pass or fail a security check. The names here are what a fresh install would
+-- get; the names there are what this database has.
+
+-- >>> MANUAL-ONLY (storage)
+--
+-- EVERYTHING BETWEEN THIS MARKER AND THE MATCHING "<<< END MANUAL-ONLY" IS
+-- SLICED OUT BY scripts/init_db.py AND IS NEVER EXECUTED BY IT. It requires
+-- ownership of storage.objects (supabase_storage_admin), which the pooler role
+-- does not have on this project — see the OWNERSHIP note above for what happened
+-- when it tried.
+--
+-- TO APPLY: paste this block into the Supabase SQL editor. It is already applied
+-- on this database. init_db.py asserts the result and prints this block if any
+-- of it is missing.
+--
+-- The markers are load-bearing, not decoration: init_db.py finds the fence by
+-- these exact strings, and refuses to run at all if a `storage.` statement
+-- appears outside it. Do not reword them without changing that function.
+
+-- The bucket. private (public = FALSE) is the load-bearing column: a public
+-- bucket serves every object over an unguessable-but-permanent URL with no
+-- policy consulted at all, which would make every policy below decorative.
+--
+-- ON CONFLICT DO UPDATE rather than DO NOTHING, and only for this table in this
+-- file. Everywhere else re-running must not overwrite what somebody set by hand
+-- (crawler/discover.TRACK_SQL is DO NOTHING for exactly that reason). Here the
+-- hand-set value is the danger: flipping this bucket to public in the Supabase
+-- console is one click, it exposes every resume, and nothing in this project
+-- would fail. Pasting this block again closes it.
+--
+-- The size and MIME limits are enforced by Supabase on the object itself, so
+-- they hold even if a caller reaches storage without going through this app's
+-- upload route. The route checks both as well, and checks the magic bytes rather
+-- than the declared type — see lib/resume-text.ts.
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES ('resumes', 'resumes', FALSE, 5242880,
+        ARRAY['application/pdf',
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document'])
+ON CONFLICT (id) DO UPDATE
+   SET public             = FALSE,
+       file_size_limit    = EXCLUDED.file_size_limit,
+       allowed_mime_types = EXCLUDED.allowed_mime_types;
+
+-- RLS on storage.objects is Supabase's own default and is stated here anyway,
+-- for the reason public.users is named in lock 1 despite already having it: a
+-- file that lists four policies and never says the table enforces them invites
+-- the reader to assume it does.
+ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS resumes_owner_select ON storage.objects;
+DROP POLICY IF EXISTS resumes_owner_insert ON storage.objects;
+DROP POLICY IF EXISTS resumes_owner_update ON storage.objects;
+DROP POLICY IF EXISTS resumes_owner_delete ON storage.objects;
+
+CREATE POLICY resumes_owner_select ON storage.objects
+    FOR SELECT TO authenticated
+    USING (bucket_id = 'resumes' AND (storage.foldername(name))[1] = auth.uid()::text);
+
+CREATE POLICY resumes_owner_insert ON storage.objects
+    FOR INSERT TO authenticated
+    WITH CHECK (bucket_id = 'resumes' AND (storage.foldername(name))[1] = auth.uid()::text);
+
+-- Both clauses, and the WITH CHECK is the one that stops a rename out of your own
+-- folder. See the four-policies note above.
+CREATE POLICY resumes_owner_update ON storage.objects
+    FOR UPDATE TO authenticated
+    USING      (bucket_id = 'resumes' AND (storage.foldername(name))[1] = auth.uid()::text)
+    WITH CHECK (bucket_id = 'resumes' AND (storage.foldername(name))[1] = auth.uid()::text);
+
+CREATE POLICY resumes_owner_delete ON storage.objects
+    FOR DELETE TO authenticated
+    USING (bucket_id = 'resumes' AND (storage.foldername(name))[1] = auth.uid()::text);
+
+-- <<< END MANUAL-ONLY

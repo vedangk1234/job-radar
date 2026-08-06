@@ -90,11 +90,17 @@ def body(*parts: str) -> str:
 
 # --- the schema: what a deleted account takes with it ---------------------
 
-# The three tables that hang off public.users. Named by hand rather than
-# discovered, so a fourth per-user table added next month fails this list and
-# has to be considered — which is the moment to decide whether it holds personal
-# data, not the moment somebody asks for their data back.
-PER_USER_TABLES = ["preferences", "user_companies", "user_job_notifications"]
+# The tables that hang off public.users. Named by hand rather than discovered,
+# so a per-user table added next month fails this list and has to be considered —
+# which is the moment to decide whether it holds personal data, not the moment
+# somebody asks for their data back.
+#
+# `resumes` arrived in Phase 3 Slice 1 and is the first entry here whose deletion
+# is NOT fully described by this list. The row cascades like the other three; the
+# FILE it names is an object in a Supabase Storage bucket, which no foreign key
+# reaches. That half is dashboard/src/lib/account.ts's job and is asserted
+# separately below — see the storage-erasure tests.
+PER_USER_TABLES = ["preferences", "resumes", "user_companies", "user_job_notifications"]
 
 
 _CREATE = re.compile(r"^\s*CREATE TABLE(?:\s+IF NOT EXISTS)?\s+(?:public\.)?(\w+)", re.IGNORECASE)
@@ -180,12 +186,13 @@ def test_the_shared_catalogue_does_not_hang_off_the_account():
 # --- the mirror: the cascade, executed ------------------------------------
 
 
-async def test_deleting_the_account_row_removes_all_three_per_user_tables(conn):
+async def test_deleting_the_account_row_removes_every_per_user_table(conn):
     """Zero rows left for that user, in every table that had some.
 
     The arrangement gives the account one of everything — a filter, a watch list,
-    a notification history — because "the cascade works" is three separate claims
-    and a test that only had preferences would pass while user_companies leaked.
+    a notification history, a resume reference — because "the cascade works" is
+    one claim per table and a test that only had preferences would pass while
+    user_companies leaked.
     """
     conn.enforce_foreign_keys()
     await conn.add_company(1, "Company 1")
@@ -197,9 +204,11 @@ async def test_deleting_the_account_row_removes_all_three_per_user_tables(conn):
     await conn.track_company(user, 1)
     await conn.notify_user(user, "c1-a")
     await conn.notify_user(user, "c1-b")
+    await conn.add_resume_for(user)
 
     assert await conn.fetchval("SELECT count(*) FROM preferences WHERE user_id = $1", user) == 1
     assert await conn.fetchval("SELECT count(*) FROM user_companies WHERE user_id = $1", user) == 1
+    assert await conn.fetchval("SELECT count(*) FROM resumes WHERE user_id = $1", user) == 1
     assert (
         await conn.fetchval(
             "SELECT count(*) FROM user_job_notifications WHERE user_id = $1", user
@@ -232,12 +241,17 @@ async def test_deleting_one_account_leaves_the_other_untouched(conn):
         await conn.add_preferences_for(user)
         await conn.track_company(user, 1)
         await conn.notify_user(user, "c1-a")
+        await conn.add_resume_for(user)
 
     await conn.execute("DELETE FROM users WHERE id = $1", a)
 
     assert await conn.tracking_rows() == {(b, 1)}
     assert await conn.notification_pairs() == {(b, "c1-a")}
     assert await conn.fetchval("SELECT count(*) FROM preferences WHERE user_id = $1", b) == 1
+    # B's resume reference is not a casualty of A leaving, and neither is the
+    # object it points at — nothing here names B's bucket path but A's delete.
+    assert await conn.fetchval("SELECT count(*) FROM resumes WHERE user_id = $1", b) == 1
+    assert await conn.fetchval("SELECT count(*) FROM resumes WHERE user_id = $1", a) == 0
     # and the shared catalogue is not a casualty of somebody leaving
     assert await conn.fetchval("SELECT count(*) FROM companies") == 1
     assert await conn.fetchval("SELECT count(*) FROM jobs") == 1
@@ -366,7 +380,7 @@ def test_nothing_in_the_delete_path_takes_a_user_id_from_the_request():
 
     # And the call itself is made with the session's values, not with anything
     # reconstructed alongside them.
-    assert "deleteAccount(userId, authUserId)" in actions, (
+    assert "deleteAccount(userId, authUserId" in actions, (
         "deleteAccount() is not being called with the ids destructured from "
         "requirePage()"
     )
@@ -469,7 +483,7 @@ def test_the_delete_form_signs_out_and_leaves_no_session_behind():
     out, told nothing, and still in the database.
     """
     actions = body("app", "actions.ts")
-    delete_at = actions.index("deleteAccount(userId, authUserId)")
+    delete_at = actions.index("deleteAccount(userId, authUserId")
     signout_at = actions.index("auth.signOut()", delete_at)
     redirect_at = actions.index('redirect("/signin?deleted=1")')
     assert delete_at < signout_at < redirect_at, (
