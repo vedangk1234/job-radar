@@ -59,7 +59,10 @@ export async function GET(request: Request) {
     ? `${forwardedProto ?? "https"}://${forwardedHost}`
     : url.origin;
 
-  const supabase = await createClient();
+  // "load-bearing": this is the one call that MINTS the PKCE verifier, so a
+  // failed cookie write here has to be loud. A page render asks for the default
+  // and swallows it — see lib/supabase/server.ts.
+  const supabase = await createClient({ cookieWrites: "load-bearing" });
   const { data, error } = await supabase.auth.signInWithOAuth({
     provider: "google",
     options: {

@@ -21,11 +21,16 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   const user = await getAuthUser();
   const email = user?.email ?? null;
 
+  // Signed out there is exactly one page — the landing page at /signin — and it
+  // is full-bleed by design: the hero artwork runs edge to edge. So the shell's
+  // gutters and 1080px cap are dropped rather than fought with a viewport-width
+  // breakout, which is the trick that leaves a horizontal scrollbar on Windows.
+  // The chrome already branches on the session; this is the same branch.
   return (
     <html lang="en">
       <body>
         {email ? <Nav email={email} /> : null}
-        <main className="shell">{children}</main>
+        <main className={email ? "shell" : "shell-bleed"}>{children}</main>
       </body>
     </html>
   );

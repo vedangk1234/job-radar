@@ -59,13 +59,22 @@ export const config = {
      *   auth/callback — Supabase's code exchange, which must work while signed out
      *   signin        — the page you are sent to when this gate closes
      *   _next/*       — build output
-     *   favicon.ico, *.svg/png/ico — static files
+     *   favicon.ico, *.svg/png/ico/webp/jpg/jpeg — static files
+     *
+     * THE IMAGE EXTENSIONS ARE NOT DECORATION. Until the landing page's hero
+     * arrived they were svg/png/ico, and public/hero/ ships .webp and .jpg — so
+     * every request for the backdrop matched this gate, found no session and was
+     * answered with a 307 to /signin. The browser asked for a picture and was
+     * handed the sign-in page's HTML, which renders as a blank black hero and
+     * nothing in a server log that looks like an error. Extensions, not paths:
+     * an allowlisted directory is where an unguarded route would eventually
+     * appear, and every page and API route re-checks for itself in any case.
      *
      * The two auth/* holes are the whole of the sign-in flow and nothing else:
      * one issues the redirect to Google, one redeems the code it comes back
      * with. Neither reads this project's own data — see lib/guard.ts for the
      * gate that does.
      */
-    "/((?!auth/signin|auth/callback|signin|_next/static|_next/image|favicon\\.ico|.*\\.(?:svg|png|ico)$).*)",
+    "/((?!auth/signin|auth/callback|signin|_next/static|_next/image|favicon\\.ico|.*\\.(?:svg|png|ico|webp|jpg|jpeg)$).*)",
   ],
 };

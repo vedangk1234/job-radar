@@ -795,27 +795,18 @@ hr.rule {
   margin: 20px 0;
 }
 
-/* sign-in */
+/* signed out
+ *
+ * The one page reachable without a session is the landing page, and it paints
+ * its own full-bleed surfaces from app/landing.css — so the shell gets out of
+ * its way entirely rather than boxing it into the dashboard's column. The old
+ * `.signin` card rules lived here until that page became a landing page; they
+ * are gone rather than left behind, because dead CSS reads as CSS in use. */
 
-.signin {
-  min-height: 78vh;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-}
-
-.signin .card {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 28px;
-  max-width: 420px;
-  width: 100%;
-}
-
-.signin h1 {
-  margin: 0 0 6px;
-  font-size: 20px;
+.shell-bleed {
+  max-width: none;
+  margin: 0;
+  padding: 0;
 }
 
 /* delete account

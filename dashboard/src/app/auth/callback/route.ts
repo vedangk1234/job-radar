@@ -64,7 +64,9 @@ export async function GET(request: Request) {
     return NextResponse.redirect(new URL("/signin?error=no_code", url.origin));
   }
 
-  const supabase = await createClient();
+  // "load-bearing": the exchange REDEEMS the verifier and writes the session, so
+  // a dropped cookie here is a sign-in that silently did not happen.
+  const supabase = await createClient({ cookieWrites: "load-bearing" });
   const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(code);
 
   if (exchangeError) {

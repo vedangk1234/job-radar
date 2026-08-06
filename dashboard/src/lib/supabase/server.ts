@@ -18,8 +18,17 @@ import { supabaseAnonKey, supabaseUrl } from "@/lib/env";
  * anywhere in this app and why the anon key can be published: it opens
  * /auth/v1 and, since the RLS block in db/schema.sql, nothing else. See
  * scripts/check_rls.py.
+ *
+ * `cookieWrites` says whether this caller can actually write cookies, and the
+ * default is the safe half of that answer. A page or a layout renders in a
+ * context where Next refuses the write, so "best-effort" means a failed write is
+ * logged and swallowed. Only a Route Handler minting or redeeming a PKCE flow
+ * passes "load-bearing", which restores the re-throw for the code verifier. See
+ * the long note in setAll for the outage that made the distinction necessary.
  */
-export async function createClient() {
+export async function createClient({
+  cookieWrites = "best-effort",
+}: { cookieWrites?: "best-effort" | "load-bearing" } = {}) {
   const cookieStore = await cookies();
 
   return createServerClient(supabaseUrl(), supabaseAnonKey(), {
@@ -45,21 +54,38 @@ export async function createClient() {
             //
             // IT IS NOT HARMLESS FOR THE PKCE CODE VERIFIER, and conflating the
             // two is what cost a whole debugging session. The verifier is
-            // written once, by the sign-in action, and is the only thing that
+            // written once, by the sign-in route, and is the only thing that
             // can redeem the code Google sends back. If that write is dropped
             // the flow does not fail here — it fails minutes later at
             // /auth/callback with a code and nothing to exchange it with, and
             // the swallow meant there was no line anywhere saying so.
             //
-            // So: everything is logged, and a lost verifier is re-thrown. A
-            // failure the caller can see is worth more than a flow that limps.
+            // So: everything is logged, and a lost verifier is re-thrown —
+            // WHERE A VERIFIER IS ACTUALLY BEING WRITTEN. That qualifier is the
+            // whole of `cookieWrites`, and it cost a production outage to learn.
+            //
+            // Re-throwing unconditionally took /signin down with a
+            // FUNCTION_INVOCATION_TIMEOUT. getUser() on a page with an expiring
+            // token refreshes, and the refresh path calls _removeSession, which
+            // CLEARS the auth cookies — the code-verifier among them. So a
+            // render that was only ever reading a session hit the fatal branch
+            // on a cookie it was deleting, not minting, and the throw escaped
+            // mid-getUser() inside the page's own render. Nothing above it
+            // catches that: the render never settles and Vercel kills the
+            // invocation. A verifier the refresh is discarding cannot be lost,
+            // because nothing is waiting to redeem it.
+            //
+            // Renders and Server Actions therefore log and carry on; the two
+            // auth Route Handlers, where a dropped verifier really does strand
+            // a sign-in, ask for "load-bearing" and keep the loud failure.
             const fatal = name.includes("code-verifier");
+            const loud = fatal && cookieWrites === "load-bearing";
             console.error(
               `[supabase/cookies] could not set "${name}"` +
-                (fatal ? " — THIS IS THE PKCE CODE VERIFIER; the sign-in cannot complete without it" : ""),
+                (loud ? " — THIS IS THE PKCE CODE VERIFIER; the sign-in cannot complete without it" : ""),
               err instanceof Error ? err.message : err,
             );
-            if (fatal) throw err;
+            if (loud) throw err;
           }
         }
       },
