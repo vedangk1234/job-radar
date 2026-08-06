@@ -1,7 +1,13 @@
 import { NextResponse } from "next/server";
 
 import { badRequest, requireSession, serverError } from "@/lib/guard";
-import { CITY_LABELS, cleanList, loadPreferences, savePreferences } from "@/lib/preferences";
+import {
+  CITY_LABELS,
+  cleanList,
+  KEYWORD_CAP,
+  loadPreferences,
+  savePreferences,
+} from "@/lib/preferences";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -34,6 +40,14 @@ export async function GET() {
  *     typo that costs a week of empty digests before anyone notices.
  *
  * Exclusions may be empty — that is a real, meaningful choice.
+ *
+ * SINCE SLICE 1 THIS IS ALSO THE KEYWORD CAP, and it is here rather than only in
+ * the editor because the editor is a convenience and this is the rule. It is
+ * also the only writer of onboarding_completed — see lib/preferences.savePreferences.
+ * There is deliberately no second route for saving keywords: the resume upload
+ * SUGGESTS them and this is what stores them, so there is exactly one statement
+ * in the app that can write preferences.keywords and exactly one place the cap
+ * can be enforced.
  */
 export async function PUT(request: Request) {
   const gate = await requireSession();
@@ -47,8 +61,16 @@ export async function PUT(request: Request) {
   }
 
   const cities = cleanList(body.cities, { max: 20 });
-  const keywords = cleanList(body.keywords, { max: 300 });
   const exclusions = cleanList(body.exclusions, { max: 300 });
+
+  // NOT cleanList's `max`, and the difference is the whole point. That parameter
+  // TRUNCATES — it stops copying at the limit and returns a shorter list, which
+  // here would mean silently discarding the keywords past the twenty-fifth and
+  // reporting success. A filter quietly rewritten is precisely the failure this
+  // project's guards exist to prevent, so the list is cleaned in full and the
+  // request is REFUSED if what survives is over the cap. Nothing is dropped on
+  // anybody's behalf.
+  const keywords = cleanList(body.keywords, { max: 300 });
 
   if (!cities.length) {
     return badRequest("cities cannot be empty — an empty city list matches no job at all");
@@ -62,6 +84,13 @@ export async function PUT(request: Request) {
   }
   if (!keywords.length) {
     return badRequest("keywords cannot be empty — a title must match at least one to be sent");
+  }
+  if (keywords.length > KEYWORD_CAP) {
+    return badRequest(
+      `${keywords.length} keywords is over the limit of ${KEYWORD_CAP}. Remove ` +
+        `${keywords.length - KEYWORD_CAP} and save again — nothing has been changed, ` +
+        `and your current filter is still running.`,
+    );
   }
 
   const maxLevel = Number(body.max_level);

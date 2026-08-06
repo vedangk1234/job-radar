@@ -2,8 +2,9 @@
 
 import { redirect } from "next/navigation";
 
-import { deleteAccount } from "@/lib/account";
+import { deleteAccount, ResumeErasureFailedError } from "@/lib/account";
 import { requirePage } from "@/lib/guard";
+import { resumeStorage } from "@/lib/resume";
 import { createClient } from "@/lib/supabase/server";
 
 /**
@@ -67,6 +68,16 @@ export async function signOutEverywhere() {
  * catching it here would turn a completed deletion into a 500 on a page whose
  * account no longer exists. Only the sign-out is guarded, and only because it is
  * the one call expected to fail.
+ *
+ * SINCE SLICE 1 THERE IS ONE MORE THING THAT CAN STOP THE DELETE, and it stops
+ * it completely rather than partially. deleteAccount() removes the resume FILE
+ * before it opens the transaction, and refuses to go on if the file survives —
+ * because after the transaction the JWT this request holds is dead and no
+ * credential in this app can reach that object again. So a
+ * ResumeErasureFailedError means nothing at all was deleted, and it is reported
+ * on the preferences page with the account still there. The one thing this
+ * action may never do is send somebody to "your account is gone" over a file
+ * that is still stored.
  */
 export async function deleteAccountAction(formData: FormData) {
   const { userId, authUserId, email } = await requirePage();
@@ -80,11 +91,31 @@ export async function deleteAccountAction(formData: FormData) {
     redirect("/preferences?delete=mismatch");
   }
 
-  const receipt = await deleteAccount(userId, authUserId);
+  // The storage adapter is built HERE and passed down, so lib/account.ts stays a
+  // database module that imports no Supabase and no next/headers. It carries
+  // this session's own JWT, which is the only credential in the app that can
+  // delete this person's resume — see the ordering argument in lib/account.ts.
+  const storage = resumeStorage(await createClient());
+
+  let receipt;
+  try {
+    receipt = await deleteAccount(userId, authUserId, storage);
+  } catch (err) {
+    if (err instanceof ResumeErasureFailedError) {
+      // NOT a 500 and emphatically not a redirect to "your account is gone".
+      // Nothing was deleted, the person is still signed in, and the page they
+      // came from is where the explanation belongs.
+      console.error("[account/delete] refused: the resume file could not be erased", err);
+      redirect("/preferences?delete=resume");
+    }
+    throw err;
+  }
+
   console.log(
     `[account/delete] erased public.users ${userId} (auth ${authUserId}): ` +
       `preferences=${receipt.preferences} user_companies=${receipt.userCompanies} ` +
-      `user_job_notifications=${receipt.userJobNotifications} auth.users=${receipt.authUsers}`,
+      `user_job_notifications=${receipt.userJobNotifications} resumes=${receipt.resumes} ` +
+      `storage_objects=${receipt.storageObjects} auth.users=${receipt.authUsers}`,
   );
 
   try {

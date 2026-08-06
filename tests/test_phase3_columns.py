@@ -282,3 +282,38 @@ async def test_a_row_with_the_new_columns_loads_and_matches_identically(conn) ->
     )
     assert is_match({"city": "blr", "title": "Backend Engineer"}, prefs)
     assert not is_match({"city": "other", "title": "Backend Engineer"}, prefs)
+
+
+def test_the_wired_column_has_exactly_one_writer() -> None:
+    """onboarding_completed is written in one statement, and it is an UPDATE.
+
+    The exemption above removes a column from the sweep, so this replaces the
+    guarantee rather than merely dropping it. Two things are asserted, and they
+    fail for different reasons.
+
+    ONE WRITER: preferences.savePreferences is it. A second place setting this
+    would be a second answer to "has this person configured their filter", and
+    they would disagree the first time one of them changed.
+
+    NOT ON THE INSERT: lib/link-user.ts creates a new account's preferences row,
+    and that row must arrive with onboarding_completed at its schema default of
+    FALSE. A signup that marked itself onboarded would make the flag mean "an
+    account exists", which is a fact the users table already carries.
+    """
+    src = PROJECT_ROOT / "dashboard" / "src"
+    writers = [
+        path.relative_to(PROJECT_ROOT).as_posix()
+        for path in sorted(src.rglob("*.ts"))
+        if re.search(r"onboarding_completed\s*=\s*TRUE", path.read_text(encoding="utf-8"))
+    ]
+    assert writers == ["dashboard/src/lib/preferences.ts"], (
+        f"onboarding_completed is set to TRUE in {writers or 'nowhere'}; it must be "
+        f"written by lib/preferences.savePreferences and by nothing else"
+    )
+
+    link_user = (src / "lib" / "link-user.ts").read_text(encoding="utf-8")
+    assert "onboarding_completed" not in link_user, (
+        "lib/link-user.ts names onboarding_completed. A brand-new account's row must "
+        "take the schema default of FALSE — marking it TRUE at signup would make the "
+        "column mean 'this account exists' rather than 'this person chose a filter'."
+    )

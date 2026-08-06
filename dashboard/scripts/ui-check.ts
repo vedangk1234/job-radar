@@ -326,7 +326,7 @@ async function main() {
   const account = renderToStaticMarkup(
     createElement(lib.DeleteAccount, {
       email: "someone@example.test",
-      footprint: { companies: 50, notifications: 7708 },
+      footprint: { companies: 50, notifications: 7708, hasResume: true },
     }),
   );
   check(account.includes("<details"), "the destructive control is behind a disclosure");
@@ -334,6 +334,24 @@ async function main() {
   check(account.includes("required"), "which the browser will not let you skip");
   check(account.includes("someone@example.test"), "the form names the address you must type");
   check(account.includes("50") && account.includes("7,708"), "and says what is about to be lost");
+  // Slice 1: the resume is personal data and the confirmation has to name it,
+  // for the same reason the counts are there — informed consent to erasure means
+  // knowing what goes. Only when there is one: an account with no resume must
+  // not be told it is losing a file it never uploaded.
+  check(
+    account.includes("resume"),
+    "an account WITH a resume is told the resume goes too",
+  );
+  const noResume = renderToStaticMarkup(
+    createElement(lib.DeleteAccount, {
+      email: "someone@example.test",
+      footprint: { companies: 3, notifications: 9, hasResume: false },
+    }),
+  );
+  check(
+    !noResume.includes("resume"),
+    "an account WITHOUT one is not told it is losing a file it never uploaded",
+  );
   check(
     account.includes("<form") && account.includes('type="submit"'),
     "it is a form with a submit button, not a button with a handler",
@@ -353,13 +371,28 @@ async function main() {
   const mismatch = renderToStaticMarkup(
     createElement(lib.DeleteAccount, {
       email: "someone@example.test",
-      footprint: { companies: 0, notifications: 0 },
+      footprint: { companies: 0, notifications: 0, hasResume: false },
       notice: "mismatch",
     }),
   );
   check(
     mismatch.includes("did not match") && mismatch.includes("nothing was deleted"),
     "a failed confirmation says so, and says nothing was deleted",
+  );
+
+  // The Slice 1 refusal. It must lead with the fact that NOTHING was deleted:
+  // an error on a delete screen reads as "partly done" unless it says otherwise,
+  // and the whole point of the file-first ordering is that there is no partly.
+  const resumeStuck = renderToStaticMarkup(
+    createElement(lib.DeleteAccount, {
+      email: "someone@example.test",
+      footprint: { companies: 1, notifications: 1, hasResume: true },
+      notice: "resume",
+    }),
+  );
+  check(
+    resumeStuck.includes("Nothing was deleted"),
+    "a failed resume erasure says NOTHING was deleted, first",
   );
 
   // --- the ordering rule --------------------------------------------------

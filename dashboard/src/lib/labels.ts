@@ -15,6 +15,46 @@ export type Preferences = {
   exclusions: string[];
   max_level: number;
   updated_at: string;
+  onboarding_completed: boolean;
+};
+
+/**
+ * The most keywords one account may save. Enforced in the browser AND in
+ * PUT /api/preferences, because a cap that only exists in the editor is not a
+ * cap — it is a suggestion to anyone holding curl.
+ *
+ * WHY THERE IS A CAP AT ALL. keywords is an OR-list matched against every open
+ * job title, so each entry only ever widens the digest. Twenty-five is around
+ * the point where a filter stops describing a person and starts describing
+ * "engineering", and a resume-driven flow makes that easy to blow past without
+ * noticing — extraction can offer far more than twenty-five plausible skills.
+ * The cap is what makes choosing among them the point of the screen.
+ *
+ * IT COLLIDES WITH DEFAULT_PREFERENCES.keywords, WHICH IS 43, AND THAT IS
+ * DELIBERATE RATHER THAN OVERLOOKED. Every account seeded before this cap
+ * existed — including the operator's — loads over the limit and cannot save
+ * until it is trimmed. The editor says so in those words and refuses the save;
+ * it does NOT silently drop the extra eighteen, because a filter quietly
+ * rewritten is the failure this project spends its guards on. Nothing about an
+ * existing filter changes until somebody presses Save: the digest goes on
+ * reading all 43 from the database in the meantime.
+ */
+export const KEYWORD_CAP = 25;
+
+/**
+ * The stored resume, as the profile screen shows it.
+ *
+ * Here rather than in lib/resume.ts for the reason this whole file exists: the
+ * upload panel is a client component, and lib/resume.ts imports postgres.js. A
+ * type would be safe to import from anywhere — types are erased — but keeping
+ * the shape beside the other client-facing types means the component never
+ * reaches into a server module at all, by habit rather than by luck.
+ */
+export type StoredResume = {
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  uploaded_at: string;
 };
 
 /**

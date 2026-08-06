@@ -43,7 +43,8 @@ export function DeleteAccount({
     <section className="panel danger-zone">
       <h2>Delete account</h2>
       <p className="hint">
-        This erases your account and everything attached to it: your filter, your{" "}
+        This erases your account and everything attached to it: your filter,{" "}
+        {footprint.hasResume ? "your uploaded resume, " : ""}your{" "}
         <strong>{footprint.companies}</strong> tracked{" "}
         {footprint.companies === 1 ? "company" : "companies"}, your{" "}
         <strong>{footprint.notifications.toLocaleString()}</strong> notification{" "}
@@ -56,6 +57,21 @@ export function DeleteAccount({
         <p className="msg bad">
           That did not match your email address, so nothing was deleted. Type{" "}
           <span className="mono">{email}</span> exactly to confirm.
+        </p>
+      ) : null}
+
+      {/*
+        * The resume-erasure refusal. It says NOTHING WAS DELETED first, because
+        * that is the fact a person needs and the one they will not assume: an
+        * error on a delete screen reads as "partly done" unless it says
+        * otherwise. See lib/account.ts for why the file has to go first.
+        */}
+      {notice === "resume" ? (
+        <p className="msg bad">
+          Nothing was deleted. Your resume file could not be removed from storage, and your
+          account is only deleted once it has been — otherwise the file would be left behind
+          with no way to reach it. Your account and all your data are still here. Please try
+          again.
         </p>
       ) : null}
 

@@ -18,7 +18,7 @@ import { CITY_LABELS, type Preferences } from "./labels";
  * postgres.js into the browser bundle.
  */
 
-export { CITY_LABELS, LEVEL_LABELS, type Preferences } from "./labels";
+export { CITY_LABELS, KEYWORD_CAP, LEVEL_LABELS, type Preferences } from "./labels";
 
 /**
  * The two ways this can find nothing, and why they must not share a message.
@@ -51,7 +51,7 @@ async function explainMissingRow(): Promise<never> {
 
 export async function loadPreferences(userId: string): Promise<Preferences> {
   const [row] = await sql<Preferences[]>`
-    SELECT cities, keywords, exclusions, max_level, updated_at
+    SELECT cities, keywords, exclusions, max_level, updated_at, onboarding_completed
       FROM preferences
      WHERE user_id = ${userId}
   `;
@@ -65,6 +65,19 @@ export async function loadPreferences(userId: string): Promise<Preferences> {
  * The UPDATE is scoped by user_id, so it can only ever touch the caller's own
  * filter — under the old `WHERE id = 1` that was true by there being only one
  * row, which is a property of the schema rather than of this statement.
+ *
+ * WHY THIS SETS onboarding_completed = TRUE AND NEVER READS IT. The column
+ * arrived empty in Phase 3 Step 0 with no writer, and this is the writer. It
+ * means "this person has chosen their own filter", and saving from this screen
+ * is exactly that act — there is no separate ceremony to complete, and a
+ * one-way flag needs no branch to set it. It is written unconditionally rather
+ * than only when FALSE: an idempotent assignment has no state to get wrong, and
+ * a guarded one would leave the column looking like it recorded WHEN somebody
+ * onboarded, which it does not.
+ *
+ * The column list on the RETURNING is explicit, as it has been since Step 0
+ * warned that a SELECT * over this table would drag eight unread onboarding
+ * columns into a type that describes a filter.
  */
 export async function savePreferences(
   userId: string,
@@ -77,13 +90,14 @@ export async function savePreferences(
 ): Promise<Preferences> {
   const [row] = await sql<Preferences[]>`
     UPDATE preferences
-       SET cities     = ${next.cities}::text[],
-           keywords   = ${next.keywords}::text[],
-           exclusions = ${next.exclusions}::text[],
-           max_level  = ${next.max_level},
-           updated_at = now()
+       SET cities               = ${next.cities}::text[],
+           keywords             = ${next.keywords}::text[],
+           exclusions           = ${next.exclusions}::text[],
+           max_level            = ${next.max_level},
+           onboarding_completed = TRUE,
+           updated_at           = now()
      WHERE user_id = ${userId}
-    RETURNING cities, keywords, exclusions, max_level, updated_at
+    RETURNING cities, keywords, exclusions, max_level, updated_at, onboarding_completed
   `;
   if (!row) return explainMissingRow();
   return row;

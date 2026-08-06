@@ -96,16 +96,60 @@ function check(ok: boolean, label: string, detail = "") {
   if (!ok) failures += 1;
 }
 
-type Counts = { preferences: number; companies: number; notifications: number };
+type Counts = {
+  preferences: number;
+  companies: number;
+  notifications: number;
+  resumes: number;
+};
 
 async function countsFor(sql: Lib["sql"], userId: string): Promise<Counts> {
   const [row] = await sql<Counts[]>`
     SELECT
       (SELECT count(*)::int FROM preferences            WHERE user_id = ${userId}) AS preferences,
       (SELECT count(*)::int FROM user_companies         WHERE user_id = ${userId}) AS companies,
-      (SELECT count(*)::int FROM user_job_notifications WHERE user_id = ${userId}) AS notifications
+      (SELECT count(*)::int FROM user_job_notifications WHERE user_id = ${userId}) AS notifications,
+      (SELECT count(*)::int FROM resumes                WHERE user_id = ${userId}) AS resumes
   `;
   return row;
+}
+
+/**
+ * A stand-in for the bucket, so this file can test the ORDER without a session.
+ *
+ * WHAT IT DOES AND DOES NOT PROVE, stated plainly because the difference is the
+ * reason scripts/resume-check.ts exists. Every account here is created by SQL
+ * and has no JWT, so nothing in this file can reach real storage — a real
+ * ResumeStorage would be refused by the very policies that make the feature
+ * safe. What IS testable here is the sequencing, which is where the interesting
+ * failure lives: that a folder which will not empty ABORTS the delete before the
+ * transaction opens, leaving every row intact.
+ *
+ * The real bucket, with real signed-in users, is proven by
+ * `npm run resume-check`. The two fail apart: this one catches a reordering of
+ * deleteAccount, that one catches a policy that does not isolate.
+ */
+function fakeStorage(options: { objects?: string[]; failOn?: "list" | "remove" | "linger" } = {}) {
+  let objects = [...(options.objects ?? [])];
+  const calls: string[] = [];
+  return {
+    calls,
+    storage: {
+      async list(authUserId: string) {
+        calls.push("list");
+        if (options.failOn === "list") throw new Error("storage unreachable");
+        return objects.filter((p) => p.startsWith(`${authUserId}/`));
+      },
+      async remove(paths: string[]) {
+        calls.push("remove");
+        if (options.failOn === "remove") return "permission denied";
+        // "linger" is the nastiest shape: remove() reports success and the
+        // objects are still there. It is the case the re-list exists for.
+        if (options.failOn !== "linger") objects = objects.filter((p) => !paths.includes(p));
+        return null;
+      },
+    },
+  };
 }
 
 async function accountExists(sql: Lib["sql"], userId: string): Promise<boolean> {
@@ -161,6 +205,14 @@ async function seed(
     INSERT INTO user_job_notifications (user_id, canonical_id)
     VALUES (${who.accountId}, ${canonicalId})
   `;
+  // The resume REFERENCE only — there is no object behind it, because this
+  // account has no session to upload one with. bucket_path is built from the
+  // AUTH id, as lib/resume.resumePath builds it, so the fake storage above is
+  // asked the same question the real one would be.
+  await sql`
+    INSERT INTO resumes (user_id, bucket_path, filename, content_type, size_bytes)
+    VALUES (${who.accountId}, ${`${who.authId}/resume.pdf`}, 'resume.pdf', 'application/pdf', 120000)
+  `;
 }
 
 async function main() {
@@ -187,7 +239,8 @@ async function main() {
       before.set(row.id, counts);
       console.log(
         `        ${row.id}  preferences=${counts.preferences} ` +
-          `companies=${counts.companies} notifications=${counts.notifications}` +
+          `companies=${counts.companies} notifications=${counts.notifications} ` +
+          `resumes=${counts.resumes}` +
           (row.auth_user_id && row.auth_user_id !== row.id ? "  (id ≠ auth_user_id)" : ""),
       );
     }
@@ -211,8 +264,9 @@ async function main() {
           (await authUserExists(sql, who.authId)) &&
           counts.preferences === 1 &&
           counts.companies === 1 &&
-          counts.notifications === 1,
-        `${who.email}: seeded in both tables with a filter, a watch list and a receipt`,
+          counts.notifications === 1 &&
+          counts.resumes === 1,
+        `${who.email}: seeded in both tables with a filter, a watch list, a receipt and a resume`,
         JSON.stringify(counts),
       );
     }
@@ -220,7 +274,7 @@ async function main() {
     // The footprint the confirmation screen shows, read for a real account shape.
     const footprint = await accountFootprint(A.accountId);
     check(
-      footprint.companies === 1 && footprint.notifications === 1,
+      footprint.companies === 1 && footprint.notifications === 1 && footprint.hasResume,
       "accountFootprint() reports what the account actually holds",
       JSON.stringify(footprint),
     );
@@ -232,7 +286,7 @@ async function main() {
     // so a broken predicate destroys nothing that matters. See the header.
     let refused = false;
     try {
-      await deleteAccount(A.accountId, B.authId);
+      await deleteAccount(A.accountId, B.authId, fakeStorage().storage);
     } catch (err) {
       refused = err instanceof Error && err.name === "AccountNotFoundError";
       if (!refused) throw err;
@@ -250,14 +304,66 @@ async function main() {
     );
 
     // ---------------------------------------------------------------------
+    console.log("\n§3b a resume that will not delete ABORTS the whole erasure");
+    // The property: after the transaction there is no credential left that could
+    // remove the object, so a delete that proceeded past a failed erasure would
+    // strand somebody's CV permanently. Three shapes, because they fail apart —
+    // storage unreachable, remove refused, and remove reporting success while
+    // the file is still there. The third is why lib/account re-lists.
+    for (const failOn of ["list", "remove", "linger"] as const) {
+      const fake = fakeStorage({ objects: [`${A.authId}/resume.pdf`], failOn });
+      let aborted = false;
+      try {
+        await deleteAccount(A.accountId, A.authId, fake.storage);
+      } catch (err) {
+        aborted = err instanceof Error && err.name === "ResumeErasureFailedError";
+        if (!aborted) throw err;
+      }
+      check(aborted, `storage failure "${failOn}" raises ResumeErasureFailedError`);
+      check(
+        await accountExists(sql, A.accountId),
+        `  ...and A's account is still there — nothing was deleted`,
+      );
+      const held = await countsFor(sql, A.accountId);
+      check(
+        held.preferences === 1 &&
+          held.companies === 1 &&
+          held.notifications === 1 &&
+          held.resumes === 1,
+        `  ...and every one of A's rows survived`,
+        JSON.stringify(held),
+      );
+      check(
+        !fake.calls.includes("remove") || fake.calls.indexOf("list") < fake.calls.indexOf("remove"),
+        `  ...and the folder was listed before anything was removed`,
+        fake.calls.join(" -> "),
+      );
+    }
+
+    // ---------------------------------------------------------------------
     console.log("\n§4  the real delete, committed");
-    const receipt = await deleteAccount(A.accountId, A.authId);
+    const objects = [`${A.authId}/resume.pdf`];
+    const aStorage = fakeStorage({ objects });
+    const receipt = await deleteAccount(A.accountId, A.authId, aStorage.storage);
     console.log(`        receipt: ${JSON.stringify(receipt)}`);
     check(receipt.publicUsers === 1, "one public.users row deleted");
     check(receipt.authUsers === 1, "one auth.users identity deleted");
     check(
-      receipt.preferences === 1 && receipt.userCompanies === 1 && receipt.userJobNotifications === 1,
+      receipt.preferences === 1 &&
+        receipt.userCompanies === 1 &&
+        receipt.userJobNotifications === 1 &&
+        receipt.resumes === 1,
       "the receipt names the per-user rows that went with it",
+    );
+    check(
+      receipt.storageObjects === 1,
+      "the receipt names the storage object that was removed first",
+      JSON.stringify(receipt),
+    );
+    check(
+      aStorage.calls[0] === "list" && aStorage.calls.includes("remove"),
+      "the file was erased before the transaction, not after",
+      aStorage.calls.join(" -> "),
     );
 
     check(!(await accountExists(sql, A.accountId)), "public.users row is gone");
@@ -267,6 +373,7 @@ async function main() {
     check(after.preferences === 0, "preferences cascaded to 0", JSON.stringify(after));
     check(after.companies === 0, "user_companies cascaded to 0", JSON.stringify(after));
     check(after.notifications === 0, "user_job_notifications cascaded to 0", JSON.stringify(after));
+    check(after.resumes === 0, "resumes cascaded to 0", JSON.stringify(after));
 
     // Deleting the account did not delete the shared catalogue it pointed at.
     const [catalogueAfter] = await sql<{ companies: number; jobs: number }[]>`
@@ -284,11 +391,18 @@ async function main() {
     check(await accountExists(sql, B.accountId), "B survived A's deletion entirely");
     const bCounts = await countsFor(sql, B.accountId);
     check(
-      bCounts.preferences === 1 && bCounts.companies === 1 && bCounts.notifications === 1,
+      bCounts.preferences === 1 &&
+        bCounts.companies === 1 &&
+        bCounts.notifications === 1 &&
+        bCounts.resumes === 1,
       "B kept every one of its rows while A was erased",
       JSON.stringify(bCounts),
     );
-    const bReceipt = await deleteAccount(B.accountId, B.authId);
+    const bReceipt = await deleteAccount(
+      B.accountId,
+      B.authId,
+      fakeStorage({ objects: [`${B.authId}/resume.pdf`] }).storage,
+    );
     check(bReceipt.publicUsers === 1 && bReceipt.authUsers === 1, "B deletes cleanly in turn");
     check(!(await accountExists(sql, B.accountId)), "B's account row is gone");
     check(!(await authUserExists(sql, B.authId)), "B's identity is gone");
@@ -307,6 +421,7 @@ async function main() {
       "B: user_job_notifications cascaded to 0",
       JSON.stringify(bAfter),
     );
+    check(bAfter.resumes === 0, "B: resumes cascaded to 0", JSON.stringify(bAfter));
 
     // ---------------------------------------------------------------------
     console.log("\n§6  the real accounts, unchanged");
@@ -320,9 +435,11 @@ async function main() {
       check(
         now.preferences === was.preferences &&
           now.companies === was.companies &&
-          now.notifications === was.notifications,
+          now.notifications === was.notifications &&
+          now.resumes === was.resumes,
         `${row.id}: every count identical to §1 ` +
-          `(preferences=${was.preferences} companies=${was.companies} notifications=${was.notifications})`,
+          `(preferences=${was.preferences} companies=${was.companies} ` +
+          `notifications=${was.notifications} resumes=${was.resumes})`,
         `now ${JSON.stringify(now)}`,
       );
       if (row.auth_user_id) {

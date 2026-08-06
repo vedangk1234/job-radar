@@ -13,23 +13,29 @@
     "match-parity": "tsx scripts/match-parity.ts",
     "badge-check": "tsx scripts/badge-check.ts",
     "delete-check": "tsx scripts/delete-check.ts",
+    "resume-check": "tsx scripts/resume-check.ts",
+    "skills-check": "tsx scripts/skills-check.ts",
     "ui-check": "tsx --tsconfig tsconfig.scripts.json scripts/ui-check.ts",
     "config-roundtrip": "tsx scripts/config-roundtrip.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.4",
     "@supabase/supabase-js": "^2.109.0",
+    "mammoth": "^1.12.0",
     "next": "^15.5.22",
     "postgres": "3.4.5",
     "react": "19.0.0",
-    "react-dom": "19.0.0"
+    "react-dom": "19.0.0",
+    "unpdf": "^1.7.0"
   },
   "devDependencies": {
     "@types/node": "22.10.7",
     "@types/react": "19.0.7",
     "@types/react-dom": "19.0.3",
+    "@types/ws": "^8.5.13",
     "dotenv": "16.4.7",
     "tsx": "4.19.2",
-    "typescript": "5.7.3"
+    "typescript": "5.7.3",
+    "ws": "^8.18.0"
   }
 }

@@ -4,7 +4,15 @@ import { useState } from "react";
 
 // From lib/labels, never lib/preferences: the latter imports postgres.js, and
 // importing a VALUE from it here would pull the driver into the client bundle.
-import { CITY_LABELS, LEVEL_LABELS, type Preferences } from "@/lib/labels";
+import {
+  CITY_LABELS,
+  KEYWORD_CAP,
+  LEVEL_LABELS,
+  type Preferences,
+  type StoredResume,
+} from "@/lib/labels";
+import { KeywordChips } from "./KeywordChips";
+import { ResumePanel } from "./ResumePanel";
 
 /**
  * Editor for the one preferences row. Replaces editing the filter by hand in
@@ -14,8 +22,27 @@ import { CITY_LABELS, LEVEL_LABELS, type Preferences } from "@/lib/labels";
  * being its own PUT. With a single row that means the thing on screen is always
  * a coherent filter: you can drop a keyword and add its replacement without the
  * digest briefly running against the half-edited version in between.
+ *
+ * THE RESUME IS THE ONE THING THAT DOES NOT WAIT FOR SAVE, and the asymmetry is
+ * honest rather than accidental. Uploading a file IS the act of storing it —
+ * there is no version of "staged locally" for a 300 KB PDF that has to reach a
+ * bucket. What the upload produces here is a list of SUGGESTED keywords, and
+ * those are staged like everything else: they land in the chips, a person edits
+ * them, and Save writes them. So the screen has two commitments with two
+ * different moments, and each says which it is.
+ *
+ * KEYWORDS MOVED OUT OF THE GENERIC ChipList IN SLICE 1. There is exactly one
+ * keyword editor on this page, because two controls writing preferences.keywords
+ * with different caps is a split-brain waiting to be discovered by whichever one
+ * saves second.
  */
-export function PreferencesEditor({ initial }: { initial: Preferences }) {
+export function PreferencesEditor({
+  initial,
+  resume,
+}: {
+  initial: Preferences;
+  resume: StoredResume | null;
+}) {
   const [cities, setCities] = useState<string[]>(initial.cities);
   const [keywords, setKeywords] = useState<string[]>(initial.keywords);
   const [exclusions, setExclusions] = useState<string[]>(initial.exclusions);
@@ -28,6 +55,35 @@ export function PreferencesEditor({ initial }: { initial: Preferences }) {
   const dirty =
     JSON.stringify([cities, keywords, exclusions, maxLevel]) !==
     JSON.stringify([initial.cities, initial.keywords, initial.exclusions, initial.max_level]);
+
+  const overCap = keywords.length > KEYWORD_CAP;
+
+  /**
+   * Fold a resume's suggestions into the list already on screen.
+   *
+   * MERGE, NOT REPLACE, and the existing chips win the ties. Somebody who typed
+   * six keywords by hand and then uploaded a resume has not asked for those six
+   * to be thrown away — and replacing would do exactly that, silently, in
+   * response to an action about a file. So the current list keeps its order and
+   * its place, and suggestions fill whatever room is left.
+   *
+   * STOPS AT THE CAP RATHER THAN GOING OVER IT. Suggestions are the one source
+   * that can produce more than a person asked for, so this is the one place
+   * where dropping the excess is right: nothing a human chose is lost, and the
+   * count says how many were left out. That is the opposite of the rule on the
+   * server, where truncating a list somebody submitted would be rewriting their
+   * filter — see the note in api/preferences/route.ts.
+   */
+  function mergeSuggestions(suggested: string[]) {
+    setKeywords((current) => {
+      const merged = [...current];
+      for (const term of suggested) {
+        if (merged.length >= KEYWORD_CAP) break;
+        if (!merged.includes(term)) merged.push(term);
+      }
+      return merged;
+    });
+  }
 
   async function save() {
     setBusy(true);
@@ -55,6 +111,10 @@ export function PreferencesEditor({ initial }: { initial: Preferences }) {
 
   return (
     <>
+      <ResumePanel initial={resume} onKeywords={mergeSuggestions} />
+
+      <KeywordChips values={keywords} onChange={setKeywords} />
+
       <div className="panel">
         <h2>Cities</h2>
         <p className="hint">
@@ -90,16 +150,6 @@ export function PreferencesEditor({ initial }: { initial: Preferences }) {
       </div>
 
       <ChipList
-        title="Keywords"
-        hint="A title must match at least ONE of these to be sent. Matching is on the normalised title, so entries are stored lowercase."
-        values={keywords}
-        onChange={setKeywords}
-        placeholder="e.g. backend engineer"
-        emptyIsError
-        emptyMessage="An empty keyword list matches nothing — every digest would be silent."
-      />
-
-      <ChipList
         title="Exclusions"
         hint="A title matching ANY of these is dropped, even if a keyword matched. Empty is allowed and means nothing is excluded by title."
         values={exclusions}
@@ -130,8 +180,23 @@ export function PreferencesEditor({ initial }: { initial: Preferences }) {
         className="panel"
         style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap" }}
       >
-        <button className="primary" onClick={save} disabled={busy || !dirty}>
-          {busy ? "Saving…" : dirty ? "Save preferences" : "No changes"}
+        {/*
+          * Disabled over the cap as well as when clean. The server refuses it
+          * anyway — that is where the rule lives — so this is about telling
+          * somebody why the button is not working before they press it, rather
+          * than about enforcement. The label says the number, because a greyed
+          * button with no reason is the thing people file bugs about.
+          */}
+        <button className="primary" onClick={save} disabled={busy || !dirty || overCap}>
+          {busy
+            ? "Saving…"
+            : overCap
+              ? `Remove ${keywords.length - KEYWORD_CAP} keyword${
+                  keywords.length - KEYWORD_CAP === 1 ? "" : "s"
+                } to save`
+              : dirty
+                ? "Save preferences"
+                : "No changes"}
         </button>
         <span className="muted small">
           Last saved {new Date(updatedAt).toLocaleString()}

@@ -1,6 +1,7 @@
 import { requirePage } from "@/lib/guard";
 import { accountFootprint } from "@/lib/account";
 import { loadPreferences } from "@/lib/preferences";
+import { loadResume } from "@/lib/resume";
 import { DeleteAccount } from "@/components/DeleteAccount";
 import { PreferencesEditor } from "@/components/PreferencesEditor";
 
@@ -27,8 +28,13 @@ export default async function PreferencesPage({
   // the belt-and-braces rule in lib/guard.ts exists for. It also now needs the
   // user id, so the omission could not survive the sub-phase in any event.
   const { userId, email } = await requirePage();
-  const [preferences, footprint, params] = await Promise.all([
+  const [preferences, resume, footprint, params] = await Promise.all([
     loadPreferences(userId),
+    // The row only — the file itself is never read here. A page render must not
+    // depend on a storage round-trip, and the panel needs a name and a date
+    // rather than bytes; opening the file is a deliberate click that mints its
+    // own short-lived URL. See api/resume/download.
+    loadResume(userId),
     accountFootprint(userId),
     searchParams,
   ]);
@@ -41,7 +47,7 @@ export default async function PreferencesPage({
         every city, unfiltered; this is the only thing that narrows it. The crawler reads it on
         every digest, so a save here is live on the next run — no redeploy, no commit.
       </p>
-      <PreferencesEditor initial={preferences} />
+      <PreferencesEditor initial={preferences} resume={resume} />
 
       <hr className="rule" />
 

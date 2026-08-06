@@ -1,7 +1,9 @@
 import { sql } from "./db";
+import type { ResumeStorage } from "./resume";
 
 /**
- * Erasure. Both records for one person, in one transaction.
+ * Erasure. Both records for one person, in one transaction — and, since Phase 3
+ * Slice 1, one file that is in neither of them.
  *
  * WHY THERE ARE TWO RECORDS AND WHY DELETING ONE IS WORSE THAN DELETING NEITHER
  * ----------------------------------------------------------------------------
@@ -46,6 +48,40 @@ import { sql } from "./db";
  * NOTHING HERE TAKES AN ID FROM A REQUEST. Both arguments come from lib/guard,
  * which reads them off a JWT verified against the auth server. See
  * app/actions.ts.
+ *
+ * THE THIRD THING, AND THE ONLY ONE NO TRANSACTION CAN HOLD. Slice 1 stores a
+ * resume as an object in a private Supabase Storage bucket. `resumes` is an
+ * ordinary table and cascades off public.users like the other three; the FILE
+ * does not, and no foreign key can make it. So erasure grew a step, and the
+ * ORDER of that step is the entire decision:
+ *
+ *     1. list the person's storage folder, remove everything in it, list AGAIN
+ *        to confirm it is empty. If anything survives -> throw, and RETURN
+ *        BEFORE THE TRANSACTION OPENS. Nothing is deleted. The account is intact
+ *        and the person is told.
+ *     2. only then, the transaction below, unchanged except that `resumes` joins
+ *        the cascade verification.
+ *
+ * WHY THE FILE GOES FIRST, WHICH IS THE OPPOSITE OF THE OBVIOUS ORDER. The
+ * obvious order is to delete the rows and then tidy up the object. Do that and
+ * the tidy-up runs after auth.users is gone — which means after the JWT this
+ * request is holding has become worthless. There is no service-role key in this
+ * app, so at that moment NOTHING IN THE SYSTEM CAN DELETE THAT OBJECT ANY MORE:
+ * the only credential that ever could was the identity we just erased. A
+ * failure there is a person's CV sitting in a bucket permanently, with the
+ * account that could have reached it deleted, and a success page on screen.
+ *
+ * File-first inverts which failure is possible. The worst case becomes: the
+ * resume is gone, the account is not, and an error says so — recoverable by
+ * uploading again, and honest. That is a strictly better bad day, and it is the
+ * only ordering under which "we told you it was erased" is never a lie.
+ *
+ * IT LISTS THE FOLDER RATHER THAN READING resumes.bucket_path. The column names
+ * the CURRENT object; a replace that changed file type and then half-failed
+ * could have left an earlier one beside it. Erasure is the wrong place to trust
+ * a pointer when the directory itself can be enumerated — and the storage policy
+ * scopes that listing to the person's own folder, so it cannot enumerate anybody
+ * else's.
  */
 
 /** What was actually removed. Logged, and asserted by scripts/delete-check.ts. */
@@ -53,6 +89,10 @@ export type DeletionReceipt = {
   preferences: number;
   userCompanies: number;
   userJobNotifications: number;
+  /** The `resumes` row: 1 if they had uploaded one. */
+  resumes: number;
+  /** Objects removed from the bucket, counted before the transaction opened. */
+  storageObjects: number;
   /** 1 normally. 0 is impossible — the function throws first. */
   publicUsers: number;
   /** 1 normally; 0 if the identity was already gone. See below. */
@@ -63,6 +103,8 @@ export type DeletionReceipt = {
 export type AccountFootprint = {
   companies: number;
   notifications: number;
+  /** Whether there is a file as well as rows. A boolean, because "1 resume" is not a count. */
+  hasResume: boolean;
 };
 
 export class AccountNotFoundError extends Error {
@@ -72,6 +114,28 @@ export class AccountNotFoundError extends Error {
         `on this session; nothing was deleted`,
     );
     this.name = "AccountNotFoundError";
+  }
+}
+
+/**
+ * The file survived, so the account stays.
+ *
+ * Deliberately NOT a warning logged beside a successful deletion. Erasure is a
+ * legal promise as much as a technical one, and a half-erasure that reports
+ * success is the one outcome this function may never produce — so this is thrown
+ * before anything is deleted, and app/actions.ts turns it into a message on the
+ * preferences page rather than a redirect to "your account is gone".
+ */
+export class ResumeErasureFailedError extends Error {
+  constructor(detail: string) {
+    super(
+      `your account has NOT been deleted, because your resume file could not be ` +
+        `removed first (${detail}). Nothing was erased. This is deliberate: the ` +
+        `file can only be deleted while you are signed in, so deleting the ` +
+        `account first would leave it stored with no way to remove it. Please try ` +
+        `again.`,
+    );
+    this.name = "ResumeErasureFailedError";
   }
 }
 
@@ -94,27 +158,45 @@ export class CascadeFailedError extends Error {
  * Act the person consenting to erasure is entitled to know what is going.
  */
 export async function accountFootprint(userId: string): Promise<AccountFootprint> {
-  const [row] = await sql<{ companies: number; notifications: number }[]>`
+  const [row] = await sql<{ companies: number; notifications: number; resumes: number }[]>`
     SELECT
       (SELECT count(*)::int FROM user_companies         WHERE user_id = ${userId}) AS companies,
-      (SELECT count(*)::int FROM user_job_notifications WHERE user_id = ${userId}) AS notifications
+      (SELECT count(*)::int FROM user_job_notifications WHERE user_id = ${userId}) AS notifications,
+      (SELECT count(*)::int FROM resumes                WHERE user_id = ${userId}) AS resumes
   `;
-  return { companies: row?.companies ?? 0, notifications: row?.notifications ?? 0 };
+  return {
+    companies: row?.companies ?? 0,
+    notifications: row?.notifications ?? 0,
+    hasResume: (row?.resumes ?? 0) > 0,
+  };
 }
 
-export async function deleteAccount(userId: string, authUserId: string): Promise<DeletionReceipt> {
+export async function deleteAccount(
+  userId: string,
+  authUserId: string,
+  storage: ResumeStorage,
+): Promise<DeletionReceipt> {
+  // --- the file, first and outside the transaction ------------------------
+  //
+  // Outside because it is not a database operation and cannot be rolled back by
+  // one — wrapping it in sql.begin() would only make the transaction longer
+  // while buying no atomicity at all. First because after the transaction the
+  // credential that can delete it no longer exists. See the header.
+  const storageObjects = await eraseResumeObjects(authUserId, storage);
+
   return sql.begin(async (tx) => {
     // Counted BEFORE, because ON DELETE CASCADE reports nothing. A cascade is
     // silent by design: the DELETE below returns one row whether it took three
     // other rows with it or seven thousand, so the only way this function can
     // say what it removed is to look first.
     const [before] = await tx<
-      { preferences: number; companies: number; notifications: number }[]
+      { preferences: number; companies: number; notifications: number; resumes: number }[]
     >`
       SELECT
         (SELECT count(*)::int FROM preferences             WHERE user_id = ${userId}) AS preferences,
         (SELECT count(*)::int FROM user_companies          WHERE user_id = ${userId}) AS companies,
-        (SELECT count(*)::int FROM user_job_notifications  WHERE user_id = ${userId}) AS notifications
+        (SELECT count(*)::int FROM user_job_notifications  WHERE user_id = ${userId}) AS notifications,
+        (SELECT count(*)::int FROM resumes                 WHERE user_id = ${userId}) AS resumes
     `;
 
     // BOTH COLUMNS IN THE PREDICATE, and the second one is the security clause
@@ -139,12 +221,13 @@ export async function deleteAccount(userId: string, authUserId: string): Promise
     // deleted account with no symptom anywhere. Reading the counts back costs one
     // statement and converts that silent outcome into a rollback and an error.
     const [after] = await tx<
-      { preferences: number; companies: number; notifications: number }[]
+      { preferences: number; companies: number; notifications: number; resumes: number }[]
     >`
       SELECT
         (SELECT count(*)::int FROM preferences             WHERE user_id = ${userId}) AS preferences,
         (SELECT count(*)::int FROM user_companies          WHERE user_id = ${userId}) AS companies,
-        (SELECT count(*)::int FROM user_job_notifications  WHERE user_id = ${userId}) AS notifications
+        (SELECT count(*)::int FROM user_job_notifications  WHERE user_id = ${userId}) AS notifications,
+        (SELECT count(*)::int FROM resumes                 WHERE user_id = ${userId}) AS resumes
     `;
     const survivors = Object.entries(after ?? {}).filter(([, n]) => n > 0);
     if (survivors.length > 0) {
@@ -177,8 +260,69 @@ export async function deleteAccount(userId: string, authUserId: string): Promise
       preferences: before?.preferences ?? 0,
       userCompanies: before?.companies ?? 0,
       userJobNotifications: before?.notifications ?? 0,
+      resumes: before?.resumes ?? 0,
+      storageObjects,
       publicUsers: deleted.length,
       authUsers: authDeleted.length,
     };
   });
+}
+
+/**
+ * Remove every object in this person's storage folder, and prove it is empty.
+ *
+ * RE-LISTED RATHER THAN TRUSTED, which is the same argument the cascade check
+ * inside the transaction makes one layer down. Supabase's remove() reports an
+ * error when the call fails; it does not promise that a call which returned no
+ * error removed everything the caller asked for. Listing again costs one request
+ * and converts "the API did not complain" into "the folder is empty", and those
+ * are different claims — only the second is the one being made to a person
+ * exercising a right to erasure.
+ *
+ * AN EMPTY FOLDER IS A NORMAL, SILENT SUCCESS. Most accounts have no resume, so
+ * this is usually one list call returning nothing and no removal at all. It is
+ * NOT an error and must never be: refusing to delete an account because it had
+ * no file to delete would be the erasure right defeated by a missing optional
+ * feature.
+ *
+ * A FAILURE TO LIST IS A FAILURE, not a shrug. If storage cannot be reached we
+ * do not know whether there is a file, and "we could not check" is not a basis
+ * for telling somebody their data is gone. It throws, and the account survives.
+ */
+async function eraseResumeObjects(
+  authUserId: string,
+  storage: ResumeStorage,
+): Promise<number> {
+  let paths: string[];
+  try {
+    paths = await storage.list(authUserId);
+  } catch (err) {
+    throw new ResumeErasureFailedError(
+      `the storage folder could not be read, so it is not known whether a file is ` +
+        `there: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  if (paths.length === 0) return 0;
+
+  const failure = await storage.remove(paths);
+  if (failure) throw new ResumeErasureFailedError(failure);
+
+  const remaining = await storage.list(authUserId).catch(() => {
+    // The removal reported success and the confirmation could not run. That is
+    // not good enough to proceed on: the whole reason for re-listing is that the
+    // first answer is not evidence.
+    throw new ResumeErasureFailedError(
+      "the files were removed but the folder could not be re-read to confirm it",
+    );
+  });
+
+  if (remaining.length > 0) {
+    throw new ResumeErasureFailedError(
+      `${remaining.length} file(s) are still in the folder after being removed: ` +
+        remaining.join(", "),
+    );
+  }
+
+  return paths.length;
 }

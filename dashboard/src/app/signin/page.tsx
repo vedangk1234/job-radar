@@ -244,9 +244,10 @@ export default async function Landing({
             */}
           {deleted ? (
             <p className="ss-msg ss-msg-ok">
-              Your account and everything attached to it have been deleted — your filter, your watch
-              list, your notification history and your sign-in identity. Nothing of yours is left
-              here. Signing in again would start a completely new account.
+              Your account and everything attached to it have been deleted — your filter, your
+              resume, your watch list, your notification history and your sign-in identity.
+              Nothing of yours is left here. Signing in again would start a completely new
+              account.
             </p>
           ) : null}
 
@@ -288,8 +289,8 @@ export default async function Landing({
                 <div className="ss-step-num">01</div>
                 <h3>Set up your profile</h3>
                 <p>
-                  Tell us your experience level, the kind of roles you want, and the companies
-                  you&rsquo;d like to watch.
+                  Upload your resume and we suggest your skills from it. Tell us the kind of roles
+                  you want and the companies you&rsquo;d like to watch.
                 </p>
               </div>
               <div className="ss-step">
@@ -352,7 +353,10 @@ export default async function Landing({
               </div>
               <div className="ss-card">
                 <h3>Ad-free &amp; privacy-first</h3>
-                <p>No ads, no reselling your data. You&rsquo;re the user here, not the product.</p>
+                <p>
+                  No ads. Your resume and your data are never shared or sold, and both are
+                  deleted with your account. You&rsquo;re the user here, not the product.
+                </p>
               </div>
             </div>
           </section>
@@ -430,8 +434,9 @@ export default async function Landing({
                 about jobs first.
               </h2>
               <p className="ss-signin-blurb">
-                Sign in with Google and set up your first watch list in under a minute. No card, no
-                resume upload, no spam.
+                Sign in with Google and set up your first watch list in under a minute. You upload
+                your resume, we read it once to suggest your skills, and it is stored in your
+                private profile where only you can see it. No card, no spam.
               </p>
             </div>
 
@@ -446,8 +451,9 @@ export default async function Landing({
                     <span>✓ Delete anytime</span>
                   </div>
                   <p className="ss-signin-fine">
-                    One click signs you in or creates your account. We only ever see your email — no
-                    passwords, no ads.
+                    One click signs you in or creates your account. We see your email and the
+                    resume you choose to upload — no passwords, no ads. Your resume is never
+                    shared or sold, and it is deleted when you delete your account.
                   </p>
                 </>
               ) : (

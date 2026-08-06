@@ -436,6 +436,111 @@ def test_erasure_needs_no_service_role_key():
     )
 
 
+# --- the storage half of erasure ------------------------------------------
+#
+# The `resumes` ROW cascades off public.users like every other per-user table,
+# and the tests above cover it. The FILE does not — it is an object in a Supabase
+# Storage bucket that no foreign key reaches — so these are about
+# dashboard/src/lib/account.ts, which is the only thing that removes it.
+#
+# Textual, with the same caveat as every source test in this file: they prove the
+# shapes that make the guarantee possible to reason about. What proves the object
+# is actually gone from a real bucket is `npm run resume-check`, which uploads one
+# as a real signed-in user and deletes the account.
+
+
+def test_the_resume_file_is_erased_before_the_transaction_opens():
+    """THE ORDERING, WHICH IS THE WHOLE OF THIS DESIGN.
+
+    After the transaction commits, auth.users is gone and the JWT the request is
+    holding is worthless — and this app has no service-role key, so at that
+    moment NOTHING can delete that object any more. A delete that tidied the file
+    up afterwards would, on failure, leave a person's CV in a bucket permanently
+    with the account that could reach it erased, and a success page on screen.
+
+    So the erasure call has to come before sql.begin(), and this asserts the
+    order in the source rather than trusting the comment above it.
+    """
+    account = body("lib", "account.ts")
+    erase_at = account.index("eraseResumeObjects(authUserId, storage)")
+    begin_at = account.index("sql.begin")
+    assert erase_at < begin_at, (
+        "the resume objects are erased AFTER the delete transaction opens. By the "
+        "time it commits there is no credential left that can remove them — see "
+        "the header of lib/account.ts."
+    )
+
+
+def test_a_failed_resume_erasure_stops_the_delete_entirely():
+    """Half an erasure must never be reported as a whole one.
+
+    The failure is a thrown error, not a logged warning beside a success: erasure
+    is a legal promise as much as a technical one, and the one outcome forbidden
+    here is telling somebody their data is gone while a file of theirs is still
+    stored.
+    """
+    account = body("lib", "account.ts")
+    assert "ResumeErasureFailedError" in account, (
+        "nothing raises when the resume file survives, so the account would be "
+        "deleted anyway and the file stranded"
+    )
+
+    actions = body("app", "actions.ts")
+    assert "ResumeErasureFailedError" in actions, (
+        "the delete action does not handle a failed resume erasure, so it would "
+        "surface as an unhandled 500 rather than as a message saying nothing was "
+        "deleted"
+    )
+    # And it must NOT land on the "your account is gone" page.
+    resume_branch = actions.index("ResumeErasureFailedError")
+    deleted_redirect = actions.index('redirect("/signin?deleted=1")')
+    assert resume_branch < deleted_redirect, (
+        "the resume-failure branch must be reached before the success redirect"
+    )
+    assert 'redirect("/preferences?delete=resume")' in actions, (
+        "a failed resume erasure must return the person to the preferences page "
+        "with an explanation, not to the deletion confirmation"
+    )
+
+
+def test_the_erasure_lists_the_folder_rather_than_trusting_the_column():
+    """resumes.bucket_path names the CURRENT object, which may not be the only one.
+
+    A replace that changed file type and then half-failed can leave an earlier
+    object beside the current one. Erasure is the wrong place to trust a pointer
+    when the directory can be enumerated — and the storage policy scopes that
+    listing to the person's own folder, so it cannot enumerate anybody else's.
+    """
+    account = body("lib", "account.ts")
+    erase = re.search(
+        r"async function eraseResumeObjects\(.*?\n\}", account, re.DOTALL
+    )
+    assert erase, "eraseResumeObjects is gone"
+    assert "storage.list(authUserId)" in erase.group(0), (
+        "the erasure does not list the folder"
+    )
+    assert "bucket_path" not in erase.group(0), (
+        "the erasure reads resumes.bucket_path, so an object left by a failed "
+        "replace would outlive the account"
+    )
+
+
+def test_the_erasure_confirms_the_folder_is_empty_afterwards():
+    """remove() returning no error is not the same claim as "the folder is empty".
+
+    The same argument CascadeFailedError makes one layer down: reading the state
+    back costs one call and converts "the API did not complain" into evidence.
+    """
+    account = body("lib", "account.ts")
+    erase = re.search(r"async function eraseResumeObjects\(.*?\n\}", account, re.DOTALL)
+    assert erase, "eraseResumeObjects is gone"
+    listed = erase.group(0).count("storage.list(authUserId)")
+    assert listed >= 2, (
+        f"the folder is listed {listed} time(s); it must be listed again after the "
+        f"removal, or a remove() that silently did nothing reads as success"
+    )
+
+
 # --- sign-out -------------------------------------------------------------
 
 
