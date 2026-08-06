@@ -65,6 +65,15 @@ _SCHEMA = re.compile(r"\bpublic\.", re.IGNORECASE)
 # has to track the live schema in both directions: a column here that production
 # does not have would let a test arrange a state the database cannot hold, and
 # pass while asserting something untrue of anything.
+#
+# work_mode / salary_min / salary_max are the Phase-3 Step-0 columns, mirrored
+# for the OTHER direction of that same rule. Nothing reads or writes them yet —
+# their parsers are a later step — so no test needs them today; they are here
+# because a production column missing from this mirror is a state the database
+# CAN hold and a test cannot arrange, which is how the first parser test would
+# have failed for a reason that had nothing to do with the parser. REAL rather
+# than NUMERIC, and nullable with no default, matching db/schema.sql: NULL is
+# what "not yet parsed" is spelled as on both sides.
 JOBS_DDL = """
 CREATE TABLE jobs (
   canonical_id     TEXT PRIMARY KEY,
@@ -85,7 +94,10 @@ CREATE TABLE jobs (
   desc_fetch_failed INTEGER NOT NULL DEFAULT 0,
   desc_checked_at   TEXT,
   applied           INTEGER NOT NULL DEFAULT 0,
-  applied_at        TEXT
+  applied_at        TEXT,
+  work_mode         TEXT,
+  salary_min        REAL,
+  salary_max        REAL
 )
 """
 
@@ -156,6 +168,15 @@ CREATE TABLE notifications (
 # FILTER, not just a second user — two users sharing one filter would not test
 # isolation at all. One row per USER is still the rule and is still enforced by
 # preferences_one_per_user_idx, mirrored below.
+#
+# The nine Phase-3 Step-0 columns are mirrored for the reason the jobs ones are,
+# and with one extra thing to get right: their DEFAULTS are the whole point of
+# the migration, so a mirror that omitted them would let a test assert a
+# behaviour that only holds because the column is absent. The TEXT[] columns
+# become TEXT holding JSON like cities/keywords/exclusions above, so their
+# Postgres DEFAULT '{}' is spelled '[]' here — the same divergence
+# Preferences._as_tuple already absorbs. Nothing reads any of them yet;
+# tests/test_phase3_columns.py is what asserts that.
 PREFERENCES_DDL = """
 CREATE TABLE preferences (
   id          INTEGER PRIMARY KEY,
@@ -164,7 +185,16 @@ CREATE TABLE preferences (
   exclusions  TEXT NOT NULL,
   max_level   INTEGER NOT NULL DEFAULT 2,
   updated_at  TEXT,
-  user_id     TEXT REFERENCES users(id) ON DELETE CASCADE
+  user_id     TEXT REFERENCES users(id) ON DELETE CASCADE,
+  exp_range_low            INTEGER,
+  exp_range_high           INTEGER,
+  years_of_experience_held INTEGER,
+  show_no_experience_jobs  INTEGER NOT NULL DEFAULT 0,
+  selected_cities          TEXT NOT NULL DEFAULT '[]',
+  all_india                INTEGER NOT NULL DEFAULT 0,
+  work_modes               TEXT NOT NULL DEFAULT '[]',
+  salary_bands             TEXT NOT NULL DEFAULT '[]',
+  onboarding_completed     INTEGER NOT NULL DEFAULT 0
 )
 """
 

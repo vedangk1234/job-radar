@@ -877,3 +877,124 @@ CREATE UNIQUE INDEX IF NOT EXISTS users_auth_user_id_idx
 -- already covered: branch 1 of the link only ever writes an id that GoTrue just
 -- authenticated, and a stale auth_user_id pointing at a deleted auth user
 -- simply falls through to branch 2 and re-links by email.
+
+
+-- ===========================================================================
+-- PHASE 3 STEP 0 — the columns the onboarding/filter spec needs. EMPTY ONES.
+-- ===========================================================================
+--
+-- THIS MIGRATION CHANGES NO BEHAVIOUR, AND THAT IS A PROPERTY OF THE EXISTING
+-- STATEMENTS RATHER THAN A PROMISE MADE HERE. Every reader that decides anything
+-- binds an explicit column list:
+--
+--   notify/store.PREFERENCES_SQL     SELECT cities, keywords, exclusions, max_level
+--   dashboard/src/lib/preferences.ts the same four plus updated_at, on the load
+--                                    AND on savePreferences' RETURNING
+--   dashboard/src/lib/link-user.ts   INSERT INTO preferences (user_id, cities,
+--                                    keywords, exclusions, max_level)
+--   notify/store.CANDIDATES_SQL      the queue's four clauses, none of them here
+--
+-- There is no SELECT * against preferences or jobs anywhere in either runtime.
+-- So a column added below is not merely unread, it is unreachable by anything
+-- that decides what a match is or what reaches an inbox — and
+-- tests/test_phase3_columns.py asserts exactly that, textually, over every
+-- module that loads the filter or writes a job.
+--
+-- The parsers that populate the jobs columns, the onboarding screen that writes
+-- the preferences ones, and the match rule that eventually reads both are all
+-- LATER FEATURE STEPS. This one creates the storage and stops. A column with no
+-- writer is the safe half of expand-then-contract; the previous phases in this
+-- file are the record of what happens when the two halves are done at once.
+--
+-- WHY selected_cities AND NOT cities. `cities` is taken, and it is not a spare
+-- name — it is the city gate notify/match.city_ok reads on every job, in both
+-- languages. Widening it to hold the onboarding city selection would silently
+-- re-point the live filter the moment the selection was saved, which is the one
+-- thing this step is forbidden to do. The 3->25 city vocabulary rewrite is a
+-- later step and it owns the question of whether these two ever merge; until
+-- then `cities` is the label gate and `selected_cities` is what a person picked.
+--
+-- WHY all_india IS A COLUMN AND NOT A SENTINEL INSIDE selected_cities. A
+-- sentinel would make one column carry two facts — "which cities" and "no city
+-- restriction at all" — which is precisely what jobs.notified was, and the block
+-- above its DROP is four hundred lines of why that ends badly. The array form
+-- has a sharper version of the same failure: the query a reader writes without
+-- thinking is `j.city = ANY(p.selected_cities)`, that can never match a sentinel
+-- string, and the all-India user would get an empty digest with nothing raising
+-- anywhere. A separate boolean can be forgotten, but it cannot be mistaken for a
+-- city. It also keeps dashboard/src/lib/labels.CITY_LABELS honest — that list
+-- rejects any city outside the known set precisely because a typo there matches
+-- nothing silently forever, and a sentinel would have to be admitted into it.
+--
+-- WHY THE INTS ARE NULLABLE RATHER THAN DEFAULTED. NULL means "not configured",
+-- which is true of every existing row and of every account created before the
+-- onboarding screen exists. Defaulting exp_range_low to a number nobody chose
+-- would put an invented value in a column that a later step reads as a decision
+-- — the mistake source_posted_at exists in this schema to name.
+--
+-- The three TEXT[] columns take NOT NULL DEFAULT '{}' instead, matching cities,
+-- keywords and exclusions directly above them: the ADD COLUMN backfills the
+-- existing rows to empty, and "empty" is told apart from "chosen" by
+-- onboarding_completed rather than by a NULL.
+ALTER TABLE preferences ADD COLUMN IF NOT EXISTS exp_range_low            INT;
+ALTER TABLE preferences ADD COLUMN IF NOT EXISTS exp_range_high           INT;
+ALTER TABLE preferences ADD COLUMN IF NOT EXISTS years_of_experience_held INT;
+ALTER TABLE preferences ADD COLUMN IF NOT EXISTS show_no_experience_jobs  BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE preferences ADD COLUMN IF NOT EXISTS selected_cities          TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE preferences ADD COLUMN IF NOT EXISTS all_india                BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE preferences ADD COLUMN IF NOT EXISTS work_modes               TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE preferences ADD COLUMN IF NOT EXISTS salary_bands             TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE preferences ADD COLUMN IF NOT EXISTS onboarding_completed     BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- THE DEFAULTS ABOVE ARE FOR A NEW ACCOUNT AND ARE DELIBERATELY NOT A
+-- DESCRIPTION OF THE EXISTING ONE. show_no_experience_jobs DEFAULT FALSE is the
+-- opposite of what this install does today: min_experience IS NULL means KEEP
+-- (see notify/match.experience_excluded — never read, no minimum stated, and
+-- fetch failed are all NULL and all kept). FALSE is the right default for
+-- someone who has not answered the question yet; it is the wrong value for the
+-- person whose digest has been running on "unknown means keep" for months. The
+-- gap between the two is what scripts/backfill_onboarding_prefs.py exists to
+-- close, and it is why that seed is a script rather than an UPDATE in this file:
+-- a guarded UPDATE here would be re-run by every future init_db.py and would
+-- silently mark the NEXT new signup as already-onboarded, since
+-- dashboard/src/lib/link-user.ts creates their row with all nine of these at
+-- their defaults. Same reasoning as scripts/backfill_preferences_user.py, one
+-- table over.
+
+-- jobs: the storage a LATER enrichment step's parsers will write.
+--
+-- All three nullable with no default, which is not a formality: NULL is the
+-- value that means "not yet parsed", and it is the only honest thing to say
+-- about ~10k rows nothing has looked at. It also makes the ALTER metadata-only
+-- rather than a table rewrite, so applying this against the live jobs table
+-- costs one catalogue update per column and no row is touched.
+--
+-- salary_min / salary_max are NUMERIC rather than NUMERIC(6,2), and the
+-- constraint is refused on purpose. A parser that misreads an annual figure in
+-- rupees as lakhs would raise against a constrained column — on the CRAWL path,
+-- where crawler/loop.py Guard 1 catches the exception, records a tripped guard,
+-- writes nothing and moves on. The company would then crawl to nothing
+-- indefinitely while looking exactly like an unreachable board, which is the
+-- shape of the config double-encoding bug that took thirty minutes and a second
+-- language to diagnose. A wrong number in a column is visible; a swallowed crawl
+-- is not.
+--
+-- No CHECK on work_mode, matching companies.category and public.users.plan: the
+-- permitted values are named in the comment and constrained nowhere, so a
+-- vendor writing a fourth thing is data to look at rather than a crash.
+--
+-- min_experience already exists, is read by both matchers, and is not touched.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS work_mode  TEXT;     -- onsite | hybrid | remote; NULL = not yet parsed
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_min NUMERIC;  -- normalised to LPA; NULL = not yet parsed
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_max NUMERIC;  -- normalised to LPA; NULL = not yet parsed
+
+-- NOTHING TO ADD TO THE RLS BLOCK ABOVE, and that is checked rather than
+-- assumed. This step creates no table and no sequence, so there is no new object
+-- for lock 1 or lock 2 to name — a column inherits its table's row-level
+-- security and the table-level REVOKE that already covers it. tests/test_rls.py
+-- derives its table list from this file rather than from a hardcoded one, so it
+-- stays green without an edit, and scripts/init_db.py's EXPECTED_TABLES is
+-- likewise unchanged. What init_db.py DID gain is EXPECTED_COLUMNS: twelve
+-- (table, column) pairs asserted against information_schema after the apply, so
+-- "the migration landed" is something the script reports rather than something a
+-- person infers from the absence of an error.
