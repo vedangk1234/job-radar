@@ -73,9 +73,10 @@ export function CompanyList({ initial, mode }: { initial: CompanyCard[]; mode: M
  * One company: a header that is always visible, and a job list that is not.
  *
  * The header is deliberately NOT one big click target. The disclosure button
- * covers the name and the counts; the category tag and the tracked switch sit
+ * covers the name and the counts; the category tag and the tracked pill sit
  * outside it, as siblings. Nesting a <select> inside a <button> is invalid HTML
  * and behaves accordingly — the row would open every time the tag was changed.
+ * The pill next to it is a span and reads a crawler fact; it is not a control.
  */
 function CompanyRow({
   company,
@@ -136,7 +137,7 @@ function CompanyRow({
   /**
    * Tick or untick "applied" on one job.
    *
-   * Optimistic like the company switch above and for the same reason — the round
+   * Optimistic like the category select below and for the same reason — the round
    * trip to Tokyo is long enough that a checkbox which waits for it feels broken
    * — but with one extra step: the response carries the re-read row, and that is
    * what finally lands in state, because `applied_at` is the database clock's to
@@ -194,11 +195,15 @@ function CompanyRow({
   }
 
   /**
-   * One PATCH for both editable fields. Optimistic — the round trip to Tokyo is
-   * long enough that a switch which waits for it feels broken and gets tapped
-   * twice — and it rolls back to the card we started from if the write fails.
+   * The one editable field. Optimistic — the round trip to Tokyo is long enough
+   * that a control which waits for it feels broken and gets tapped twice — and
+   * it rolls back to the card we started from if the write fails.
+   *
+   * It carried `tracked` too until that write was removed as a security fix; the
+   * shape is kept as an object so the next genuinely per-user field is an
+   * addition rather than a rewrite. See lib/companies.updateCompany.
    */
-  async function patch(body: { tracked?: boolean; category?: string }) {
+  async function patch(body: { category?: string }) {
     const before = company;
     setPending(true);
     onError(null);
@@ -302,18 +307,30 @@ function CompanyRow({
               ))}
             </select>
           </label>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={company.tracked}
-              disabled={pending}
-              onChange={() => patch({ tracked: !company.tracked })}
-              aria-label={`Track ${company.name}`}
-            />
-            <span className={company.tracked ? "tag on" : "tag off"}>
-              {company.tracked ? "tracked" : "off"}
-            </span>
-          </label>
+          {/*
+            READ-ONLY, AND IT USED TO BE A SWITCH. This pill sat inside a
+            <label> wrapping a checkbox that PATCHed companies.tracked — the
+            crawler's catalog-wide flag, one shared value for the whole install.
+            Any signed-in account could therefore stop a company being crawled
+            for everybody. The write is gone from the route and from the SQL (see
+            lib/companies.updateCompany), and the control is gone from here, so
+            there is no longer a writable control anywhere that maps to it.
+
+            The pill stays because the fact is still worth showing: an untracked
+            company's jobs are stale, and the note below says so. A span, with no
+            handler and no input — this must not become interactive again without
+            an answer to "whose flag is it", and the answer is: not the reader's.
+          */}
+          <span
+            className={company.tracked ? "tag on" : "tag off"}
+            title={
+              company.tracked
+                ? "Crawled hourly. This is the catalog-wide crawl flag, not a per-account setting."
+                : "Not being crawled. This is the catalog-wide crawl flag, not a per-account setting."
+            }
+          >
+            {company.tracked ? "tracked" : "off"}
+          </span>
         </div>
       </div>
 
@@ -321,7 +338,9 @@ function CompanyRow({
         <p className="untracked-note muted small">
           Not being crawled. These {company.open_jobs} job
           {company.open_jobs === 1 ? "" : "s"} are whatever was stored the last time it was
-          tracked, and nothing new will arrive until the switch goes back on.
+          tracked, and nothing new will arrive until it is tracked again. That is a
+          catalog-wide setting for this install, changed where the crawler runs — not from
+          here.
         </p>
       )}
 

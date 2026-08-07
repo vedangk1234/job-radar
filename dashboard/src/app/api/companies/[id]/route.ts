@@ -8,14 +8,35 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * PATCH { tracked?: boolean, category?: string } — the only two fields the
- * dashboard may change on a company, and the only two it has ever been able to.
+ * PATCH { category?: string } — the one field the dashboard may change on a
+ * company.
  *
  * The response carries the whole re-read card, counts included, so the client
  * re-renders from what the database now says rather than from what it guessed.
- * That matters more than it looks: the optimistic toggle in the UI flips the
- * switch before the round trip, and this response is what corrects it if the
- * write did something other than what the click assumed.
+ * That matters more than it looks: the optimistic control in the UI moves before
+ * the round trip, and this response is what corrects it if the write did
+ * something other than what the click assumed.
+ *
+ * `tracked` IS REFUSED HERE, EXPLICITLY, AND THE REFUSAL IS THE POINT OF THE
+ * ROUTE NOW. It used to be the second accepted field, and this handler's only
+ * gate is requireSession() — which asks whether there is a session, never whose.
+ * Since sign-up opened in 2a that means any signed-in stranger could have
+ * switched the crawler off for a company, or for the whole catalog, for every
+ * account at once (scripts/crawl.py reads `WHERE tracked = TRUE`). See
+ * lib/companies.updateCompany for why the write was deleted rather than gated:
+ * there is no operator identity in this app to gate on, by design.
+ *
+ * WHY 400 AND NOT 403. A 403 says "you may not", which implies somebody may.
+ * Nobody may — the statement behind it no longer exists, for any caller, so the
+ * honest answer is that the field is not a thing this route accepts. And it is
+ * an explicit refusal rather than a silently-ignored key: a caller told 200 for
+ * a write that did not happen is how the next person concludes the flag is
+ * per-user and builds on it.
+ *
+ * THE PER-USER WATCH LIST IS THE THING THIS IS NOT. `user_companies` is where
+ * "I want alerts for this company" belongs, it is a different table on a
+ * different axis, and no route writes it yet. Nothing here should be widened to
+ * stand in for it.
  */
 export async function PATCH(request: Request, ctx: { params: Promise<{ id: string }> }) {
   const gate = await requireSession();
@@ -32,11 +53,17 @@ export async function PATCH(request: Request, ctx: { params: Promise<{ id: strin
     return badRequest("body was not JSON");
   }
 
-  const patch: { tracked?: boolean; category?: string } = {};
+  const patch: { category?: string } = {};
 
+  // Refused before anything is validated or written, so the answer does not
+  // depend on what else was in the body.
   if ("tracked" in body) {
-    if (typeof body.tracked !== "boolean") return badRequest("tracked must be true or false");
-    patch.tracked = body.tracked;
+    return badRequest(
+      "tracked is not editable from the dashboard. It is the crawler's " +
+        "catalog-wide flag — one shared value that decides whether this company " +
+        "is fetched at all, for every account on this install — so it is owned by " +
+        "the crawl runtime and changed there, not by a signed-in request.",
+    );
   }
 
   if ("category" in body) {
@@ -50,8 +77,8 @@ export async function PATCH(request: Request, ctx: { params: Promise<{ id: strin
     patch.category = category;
   }
 
-  if (patch.tracked === undefined && patch.category === undefined) {
-    return badRequest("nothing to update: send tracked and/or category");
+  if (patch.category === undefined) {
+    return badRequest("nothing to update: send category");
   }
 
   try {

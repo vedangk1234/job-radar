@@ -362,6 +362,15 @@ already declares.
 catalog; a row here means "this person wants alerts for this company", a property
 of a person. They agree today and answer different questions.
 
+That distinction stopped being merely conceptual in Phase 3 Slice 1a. The
+dashboard used to let any signed-in account write `companies.tracked` from a
+toggle on every company row — a per-install flag edited through a control that
+looked like a personal setting, which is precisely the confusion this paragraph
+warns about, shipped. The write is gone (see *Writes the dashboard is allowed to
+make*). Nothing in the web app writes either column yet: `user_companies` is
+still created only by `scripts/track_companies.py`, and the picker that will
+create it is the next slice.
+
 `db/watchlist.py` holds the statements (so the tests exercise what production
 runs) and `scripts/backfill_user_companies.py` is the seed — the same MY_EMAIL
 bridge as the preferences backfill, tracking every catalog company for the single
@@ -1024,6 +1033,14 @@ create a tracking row until that screen exists (Phase 3). Worth knowing because
 the two halves now disagree: a company can be visible on Home, crawled hourly,
 full of matching jobs, and still in nobody's digest.
 
+**Each row on that list is now entirely read-only except its category tag.**
+Until Phase 3 Slice 1a it also carried a switch writing `companies.tracked`,
+which is a catalog-wide crawl flag and not a per-account setting — so on a screen
+that shows everybody the same shared list, one user could stop the crawl for all
+of them. Removing it leaves the pill as a label. The control that *should* live
+here is a watch-list picker writing `user_companies`, and that is the next slice;
+the seal is deliberately not a stand-in for it.
+
 Both screens ship only counts, never job rows: sending ~790 rows of JSON with
 the page to render twelve numbers would be wasted, and eleven of twelve rows
 stay collapsed. A row fetches its own jobs from
@@ -1169,8 +1186,8 @@ session reads. The two must name the same person and nothing checks that they do
 Phase 2 replaces with a session carrying a real user id.
 
 **Writes the dashboard is allowed to make**, and nothing else:
-`companies.tracked`, `companies.category`, this user's `preferences` row,
-inserting a company, and `jobs.applied` / `jobs.applied_at`. Everything else
+`companies.category`, this user's `preferences` row, inserting a company, and
+`jobs.applied` / `jobs.applied_at`. Everything else
 about a job stays read-only — the crawler owns the lifecycle, and a dashboard
 able to edit `seeded` or `status` could silently un-send or re-send a digest.
 Note what is *not* on that list: `user_companies` and `user_job_notifications`.
@@ -1183,6 +1200,41 @@ writes to `jobs`, and it names those two columns and no others; the route that
 *lists* jobs is deliberately a different file, so "the listing route cannot
 change a job" stays true by inspection. The dashboard still has no cron, sends
 no email, and never fetches a job description.
+
+**`companies.tracked` came off that list in Phase 3 Slice 1a, and it is the one
+entry that was removed as a security fix rather than never added.** It was
+writable from the start, through a toggle on every company row of Home and Jobs,
+and it was defensible for exactly as long as `ALLOWED_EMAIL` meant the only
+person who could reach the toggle was the person who owned the crawler. Phase 2a
+opened sign-up and the control did not change: `requireSession()` asks whether
+there is a session and never whose, the `UPDATE` was scoped by company id alone,
+and `scripts/crawl.py` selects `FROM companies WHERE tracked = TRUE`. So any
+account minutes old could switch the crawl off for a company — or for all fifty —
+and every other account's digest would go quiet, with nothing recording who or
+why. A dashboard write that can silence somebody else's inbox is the failure the
+`applied` / `seeded` ownership split exists to prevent, one table over.
+
+**Removed rather than gated**, which is the load-bearing half. Gating it to an
+operator needs an operator identity, and there is deliberately none in the
+deployed app — `lib/env.ts` has carried no `myEmail()` since 2b and says why: an
+ambient identity read in `src/` becomes the thing the next page in a hurry
+reaches for. Defending the flag that way would mean reversing 2b for a column the
+web app has no business owning. A statement that does not exist cannot be reached
+by curl or by a condition someone later edits the wrong way round, so
+`updateCompany` dropped the column and `PATCH /api/companies/:id` refuses the
+field outright with a 400 — 400 and not 403 because 403 implies somebody may, and
+nobody may. The row still *shows* a tracked/off pill; reading a crawler fact is
+not owning it.
+
+What that costs, stated rather than glossed: **no script in this project sets
+`tracked = FALSE`.** Every Python writer sets TRUE (`seed_companies.py`,
+`add_workday.py`, `discover.TRACK_SQL`, the last being `ON CONFLICT DO NOTHING`
+precisely so a sweep cannot undo a hand-set FALSE). The toggle was therefore the
+repo's only off-switch, and switching a company off is now a statement against
+the pooler by whoever holds the DSN — a rare operator action moving to the
+runtime that already owns the column. `tests/test_tracked_write_sealed.py` is the
+guard: no statement under `dashboard/src` may write it, with one enumerated
+exemption for the Add upsert that a second test re-earns rather than assumes.
 
 ---
 
@@ -1870,8 +1922,66 @@ Newest last. Append here as the project evolves.
   confirmed to fail under a deliberate mutation of the clause it defends. The
   suite ends Phase 1 at 724, with the column absent from `information_schema`.
 
+- **2026-08-08 — Phase 3 Slice 1a. Sealing the global crawl switch.** A
+  dashboard-only security fix, and a subtraction: `companies.tracked` is no
+  longer writable from the web app. It is the crawler's catalog-wide exclusion
+  flag — `scripts/crawl.py` selects `FROM companies WHERE tracked = TRUE`, one
+  shared value for the whole install — and every company row on Home and Jobs
+  carried a checkbox that PATCHed it. `requireSession()` asks whether there is a
+  session and never whose, and the `UPDATE` was scoped by company id alone, so
+  after 2a opened sign-up any account minutes old could switch the crawl off for
+  a company, or for all fifty, and silence every other account's digest with
+  nothing recording who or why.
+
+  The write was **removed rather than gated**, and that is the decision worth
+  keeping. Gating needs an operator identity; `lib/env.ts` has deliberately
+  carried none since 2b, whose comment warns that an ambient identity read in
+  `src/` becomes what the next page in a hurry reaches for. So a gate would have
+  meant reversing 2b to defend a column the web app has no business owning.
+  `updateCompany` dropped it and is category-only; the route refuses the field
+  with a **400 rather than a 403**, because 403 implies somebody may and nobody
+  does — the statement is gone for every caller. The pill stays as a label:
+  reading a crawler fact is not owning it.
+
+  What it costs is real and small: **no script in this repo sets
+  `tracked = FALSE`** (every Python writer sets TRUE, and `discover.TRACK_SQL` is
+  `ON CONFLICT DO NOTHING` precisely so a sweep cannot undo a hand-set FALSE), so
+  that toggle was the only off-switch anywhere. Switching a company off is now a
+  statement against the pooler by whoever holds the DSN.
+
+  Two guards, because they fail apart, which is the same reason
+  `npm run badge-check` asks both its questions. `tests/test_tracked_write_sealed.py`
+  asserts no statement under `dashboard/src` writes the column — one enumerated
+  exemption for the Add upsert, re-earned by its own test rather than granted —
+  and it was confirmed to fail against the pre-fix tree rather than assumed to
+  work. `npm run ui-check` renders the shipped `CompanyList` over a live card and
+  asserts the markup carries the pill and no `Track <company>` control, because a
+  sealed route with the button still on screen is a bug report waiting to happen.
+
+  Deliberately **not** in this slice: the per-user watch list. `user_companies`
+  is the control that belongs on that row and it is the next slice; nothing here
+  is a stand-in for it. Also untouched: the Home match query, the `companies.ts`
+  read path, matching, the crawler, and every line of Python outside the new test.
+
+  *(Note for whoever writes the history: this changelog jumps from 1g to here.
+  Phases 2a–2c, 3 Step 0 and 3 Slice 1 shipped without entries — the commits are
+  in the log and the prose above describes the code as it stands, but the
+  narrative for those five is missing.)*
+
 **Pending**
 
+- **The Add flow can still turn `tracked` back ON, and can rename a company.**
+  The residual half of Slice 1a, deliberately left. `POST /api/companies` →
+  `lib/companies.upsertCompany` carries
+  `ON CONFLICT (ats, token) DO UPDATE SET name = EXCLUDED.name, tracked = TRUE`,
+  so any signed-in account that re-adds an existing company by name flips a
+  deliberately-off row back on and overwrites its display name. It is a strictly
+  smaller surface than the toggle that was removed — it can only ever set TRUE,
+  so it cannot stop a crawl or silence a digest, which is why it was not folded
+  into that fix — but it is the same shape: a shared-catalog write reachable by a
+  caller whose identity nothing checks. Fixing it means deciding what a re-add
+  should mean for a row somebody switched off on purpose, which is the question
+  `discover.TRACK_SQL` already answered for the sweep with `DO NOTHING`.
 - Work the `discovered_companies` "try Workday" queue by hand with
   `scripts/add_workday.py` — the sweep cannot resolve a Workday site. **97**
   names carry the flag, out of 224 unresolved rows; 5 Workday tenants are

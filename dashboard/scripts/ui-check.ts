@@ -45,7 +45,9 @@ import { config } from "dotenv";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
+import { CompanyList } from "../src/components/CompanyList";
 import { JobLine, type Mode } from "../src/components/JobLine";
+import type { CompanyCard } from "../src/lib/companies";
 import type { JobView } from "../src/lib/jobs";
 
 config({ path: ".env.local" });
@@ -62,6 +64,13 @@ config({ path: ".env.local" });
  *
  * JobLine stays a static import: it reaches lib/badges and lib/match, neither of
  * which touches the database, and its lib/jobs import is type-only and erased.
+ * CompanyList is static for the same reason and it is worth checking rather than
+ * assuming: its lib/companies and lib/jobs imports are both `import type` and so
+ * are erased, its lib/labels import is a value but that file imports nothing at
+ * all by design, and the only component it reaches is JobLine. Nothing on that
+ * graph builds a pool. If a future edit gives it a runtime import of lib/db this
+ * script starts failing with `DASHBOARD_DB_URL is not set` before its first
+ * assertion, and the fix is to move it into loadLib() below.
  */
 type Lib = {
   sql: typeof import("../src/lib/db").sql;
@@ -144,6 +153,20 @@ async function gateIsShut() {
     [
       "/api/companies",
       { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+    ],
+    // The sealed write. 401 here proves only the outer gate; that the field is
+    // refused for a caller who IS signed in is proved by the route reading no
+    // identity at all (see the 400 branch in api/companies/[id]/route.ts) and by
+    // tests/test_tracked_write_sealed.py, which asserts no statement under src/
+    // can write the column. Both halves matter: this one would still pass if the
+    // field were quietly re-accepted behind the session gate.
+    [
+      "/api/companies/1",
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tracked: false }),
+      },
     ],
   ];
 
@@ -313,6 +336,51 @@ async function main() {
       "and the raw list carries user_notified too, so that text is per-user as well",
     );
   }
+
+  // --- HOME: the tracked flag is SHOWN and NOT EDITABLE --------------------
+  //
+  // The security fix, asserted where it can actually be seen. companies.tracked
+  // is the crawler's catalog-wide flag — scripts/crawl.py selects
+  // `WHERE tracked = TRUE`, one shared value for the whole install — and this
+  // component used to render a checkbox that PATCHed it. The route gate is
+  // requireSession(), which asks whether there is a session and never whose, so
+  // any signed-in stranger could stop a company being crawled for everybody.
+  //
+  // This is the "the button is gone and stays gone" half. It renders the SHIPPED
+  // component over a LIVE company card, which is the whole argument this script
+  // exists for: a control that was removed from a spec but left in the markup
+  // fails silently, and so does one put back by a merge. The other half — that no
+  // statement under src/ can write the column even with a session and curl — is
+  // tests/test_tracked_write_sealed.py.
+  console.log("\nHome — the tracked pill is read-only");
+  const card = companies[0];
+  const companyMarkup = renderToStaticMarkup(
+    createElement(CompanyList, { initial: [card] as CompanyCard[], mode: "matches" as Mode }),
+  );
+  check(Boolean(card), "there is a live company card to render");
+  check(
+    companyMarkup.includes(">tracked<") || companyMarkup.includes(">off<"),
+    "the row still SHOWS the tracked/off pill — the fact is worth reading",
+  );
+  check(
+    !companyMarkup.includes("aria-label=\"Track "),
+    "there is no `Track <company>` control in the markup",
+  );
+  check(
+    !companyMarkup.includes('class="switch"'),
+    "the pill is not wrapped in the switch label that carried the checkbox",
+  );
+  // The category select is the one control that legitimately remains on this
+  // header, so a check that merely counted inputs would pass with the toggle
+  // restored. This names the input type the toggle actually was.
+  check(
+    !companyMarkup.includes('type="checkbox"'),
+    "a collapsed row renders no checkbox at all (the Applied box lives on a job, not a company)",
+  );
+  check(
+    companyMarkup.includes("<select"),
+    "and the category select — the one control that legitimately stays — is still there",
+  );
 
   // --- PREFERENCES: the delete-account surface ----------------------------
   //

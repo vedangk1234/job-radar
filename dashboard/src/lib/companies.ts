@@ -171,11 +171,7 @@ export async function upsertCompany(input: {
 }
 
 /**
- * The two fields the dashboard may edit on a company.
- *
- * `tracked` is the one write in the whole dashboard that changes what gets
- * FETCHED rather than what gets shown: an untracked company is skipped by the
- * crawler entirely.
+ * The one field the dashboard may edit on a company.
  *
  * `category` is a hand-tag — product / gcc / services / staffing / unknown —
  * and changes nothing at all. It is here because the tag is only ever right if
@@ -183,21 +179,59 @@ export async function upsertCompany(input: {
  * deliberately refuse to overwrite it (see upsertCompany), so this is its only
  * editor.
  *
- * Both are optional and a patch with neither is rejected by the route rather
- * than silently doing nothing. Returns false when no such id exists.
+ * `tracked` USED TO BE THE SECOND FIELD, AND REMOVING IT IS A SECURITY FIX
+ * ----------------------------------------------------------------------
+ * This statement used to carry `tracked = COALESCE($1::boolean, tracked)`, fed
+ * by a toggle on every company row of Home and Jobs. That column is not a
+ * per-user preference and never was: scripts/crawl.py selects
+ * `FROM companies WHERE tracked = TRUE`, so it is the crawler's catalog-wide
+ * exclusion axis — one shared row, one shared value, for the whole install.
+ *
+ * With Phase 2a opening sign-up, the arithmetic changed and the control did not.
+ * The route behind it authenticates but authorises nothing beyond "is there a
+ * session", and this UPDATE is scoped by company id alone — so any stranger who
+ * signed up ninety seconds ago could switch crawling OFF for any company, or for
+ * all fifty, and every other account's digest would go quiet with nothing
+ * anywhere recording why. A dashboard write that can silence somebody else's
+ * inbox is the exact failure the `applied` / `seeded` ownership split in
+ * lib/jobs.ts exists to prevent, arriving one table over.
+ *
+ * IT IS REMOVED RATHER THAN GATED, and that is the load-bearing choice. The
+ * obvious alternative — let only the operator call it — needs an operator
+ * identity, and there is deliberately none in the deployed app: lib/env.ts has
+ * carried no myEmail() since 2b, and the comment there warns that an ambient
+ * identity read in src/ becomes the thing the next page in a hurry reaches for.
+ * So gating would mean reversing 2b to protect a flag the web app has no
+ * business owning. A removed statement cannot be reached by curl at all; a gate
+ * is a condition a later edit can get wrong silently.
+ *
+ * WHAT THAT COSTS, stated rather than glossed: no script in this project sets
+ * `tracked = FALSE` — every Python writer sets TRUE (scripts/seed_companies.py,
+ * scripts/add_workday.py, crawler/discover.TRACK_SQL, which is ON CONFLICT DO
+ * NOTHING precisely so a sweep cannot undo a hand-set FALSE). This toggle was
+ * therefore the only off-switch in the repo, and switching a company off is now
+ * a statement against the pooler by whoever holds the DSN. That is a rare
+ * operator action moving to the runtime that already owns the column.
+ *
+ * The column is still READ here — companyRows() selects it and the row still
+ * shows a tracked/off pill. Reading a crawler fact is not owning it.
+ *
+ * Optional, and a patch with nothing in it is rejected by the route rather than
+ * silently doing nothing. Returns false when no such id exists.
  */
 export async function updateCompany(
   id: number,
-  patch: { tracked?: boolean; category?: string },
+  patch: { category?: string },
 ): Promise<boolean> {
-  // COALESCE on a NULL parameter is what makes one statement serve both fields:
-  // an absent key binds NULL and the column keeps its current value. `category`
-  // is nullable in the schema, but "no category" is spelled 'unknown' on this
-  // screen, so NULL here can only ever mean "not being edited".
+  // COALESCE on a NULL parameter: an absent key binds NULL and the column keeps
+  // its current value. `category` is nullable in the schema, but "no category"
+  // is spelled 'unknown' on this screen, so NULL here can only ever mean "not
+  // being edited". It served two fields before `tracked` came out and is kept
+  // for the one that remains, so re-adding a second editable column is an
+  // addition rather than a rewrite.
   const rows = await sql<{ id: number }[]>`
     UPDATE companies
-       SET tracked  = COALESCE(${patch.tracked ?? null}::boolean, tracked),
-           category = COALESCE(${patch.category ?? null}::text,   category)
+       SET category = COALESCE(${patch.category ?? null}::text, category)
      WHERE id = ${id}
     RETURNING id
   `;
