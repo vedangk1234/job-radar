@@ -9,11 +9,26 @@
  * from anywhere; values are not.
  */
 
+/**
+ * The preferences ROW, as the editor and the pages see it.
+ *
+ * Deliberately a superset of lib/match.Preferences, which is the subset the RULES
+ * read. The extra fields here are the ones a screen needs and a verdict must not
+ * have: `updated_at` ("last saved"), `onboarding_completed` (the gate), and
+ * `years_of_experience_held` — how much experience the person HAS, which is
+ * informational and never filters. Structural typing means this is assignable to
+ * the matcher's type wherever a rule is evaluated, without the matcher's type ever
+ * gaining a field it has no business reading.
+ */
 export type Preferences = {
   cities: string[];
   keywords: string[];
   exclusions: string[];
   max_level: number;
+  exp_range_low: number | null;
+  exp_range_high: number | null;
+  years_of_experience_held: number | null;
+  show_no_experience_jobs: boolean;
   updated_at: string;
   onboarding_completed: boolean;
 };
@@ -124,6 +139,19 @@ export const DEFAULT_PREFERENCES = {
     "architect", "sales", "recruiter", "support", "qa", "analyst",
   ],
   max_level: 2,
+  // The experience rule, mirroring notify/match.DEFAULT_EXP_RANGE_LOW / _HIGH /
+  // DEFAULT_SHOW_NO_EXPERIENCE_JOBS. (0, 2) reproduces the fixed `<= 2` ceiling
+  // this install ran on until Slice 2 — min_experience is never negative, so
+  // {0,1,2} and "at most 2" select the same rows — and TRUE is the "unknown means
+  // keep" bias that ceiling was paired with.
+  //
+  // NOT the same thing as the COLUMN defaults, which are NULL / NULL / FALSE and
+  // mean "nobody has answered". These three are the install's answer, which is
+  // what a row with no owner falls back to and what tests/test_default_
+  // preferences.py compares against the Python.
+  exp_range_low: 0,
+  exp_range_high: 2,
+  show_no_experience_jobs: true,
 } as const;
 
 /**
@@ -180,6 +208,16 @@ export const DEFAULT_PREFERENCES = {
  *     Every one of them already declares a default that IS blank (`'{}'`,
  *     `FALSE`, or NULL for the nullable ints), so an INSERT that does not name
  *     them produces exactly the row this constant describes.
+ *
+ *     SLICE 2 WIRED THREE OF THEM UP AND THIS PARAGRAPH STILL HOLDS, which is
+ *     worth one sentence because it is the first time a column named here became
+ *     load-bearing. A new account's experience range arrives NULL, and NULL now
+ *     means "matches nothing" rather than "unread" — so an account in that state
+ *     must not be able to reach a digest or a match count, and it cannot: the
+ *     gate holds it on /onboarding, `is_active` is FALSE, and
+ *     PUT /api/preferences refuses a save whose range is incomplete. Blank is
+ *     still the honest seed; what changed is that finishing onboarding is now the
+ *     only way out of it.
  *
  *     They are described here rather than listed by name on purpose, and this
  *     file is one of the reasons: tests/test_phase3_columns.py sweeps every

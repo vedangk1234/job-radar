@@ -35,8 +35,11 @@ from notify.digest import DigestError
 from notify.match import (
     DEFAULT_CITIES,
     DEFAULT_EXCLUSIONS,
+    DEFAULT_EXP_RANGE_HIGH,
+    DEFAULT_EXP_RANGE_LOW,
     DEFAULT_KEYWORDS,
     DEFAULT_MAX_LEVEL,
+    DEFAULT_SHOW_NO_EXPERIENCE_JOBS,
 )
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -631,6 +634,24 @@ class FakeConn:
         rows = await self.fetch("SELECT user_id, company_id FROM user_companies")
         return {(row["user_id"], row["company_id"]) for row in rows}
 
+    # WHY BOTH HELPERS BELOW NAME THE THREE EXPERIENCE COLUMNS, AND WHY NOT NAMING
+    # THEM WOULD BE A TRAP.
+    #
+    # The mirror above declares `show_no_experience_jobs INTEGER NOT NULL DEFAULT 0`,
+    # matching the real column's `BOOLEAN NOT NULL DEFAULT FALSE`, and the two range
+    # ints default to NULL. Those defaults are right for the SCHEMA — they mean
+    # "nobody has answered" — and they are wrong for a FIXTURE, because since Phase
+    # 3 Slice 2 they no longer describe a filter that behaves like this install's.
+    # An unnamed row would come out with an unconfigured range (matches nothing at
+    # all) and the toggle off (hides every job whose description was not read, which
+    # is 99% of them), so every test that seeds a filter and then asserts an ordinary
+    # unenriched job matches would fail — for reasons about the fixture rather than
+    # about the thing under test.
+    #
+    # So the defaults here are notify.match's DEFAULT_* mirror, which reproduces the
+    # pre-Slice-2 rule exactly: a test that says nothing about experience gets the
+    # behaviour it had before the column existed. A test that wants to exercise the
+    # new rule passes the values it means.
     async def set_preferences(
         self,
         cities: Sequence[str] = DEFAULT_CITIES,
@@ -638,6 +659,9 @@ class FakeConn:
         exclusions: Sequence[str] = DEFAULT_EXCLUSIONS,
         max_level: int = DEFAULT_MAX_LEVEL,
         user_id: str | None = TEST_USER_ID,
+        exp_range_low: int | None = DEFAULT_EXP_RANGE_LOW,
+        exp_range_high: int | None = DEFAULT_EXP_RANGE_HIGH,
+        show_no_experience_jobs: bool = DEFAULT_SHOW_NO_EXPERIENCE_JOBS,
     ) -> None:
         """Seed the preferences row, TEXT[] columns encoded as JSON.
 
@@ -647,20 +671,28 @@ class FakeConn:
         thing production can be in for a minute, and load_preferences is
         supposed to refuse rather than silently fall back to defaults in it.
 
+        `exp_range_low=None` (or high) writes the UNCONFIGURED range, which is the
+        other real state: a brand-new account before it has onboarded. It matches
+        nothing, deliberately — see notify.match.experience_excluded.
+
         Still clears the table first, so a test that calls it twice replaces the
         filter rather than colliding with itself. A SECOND user's filter goes
         through add_preferences_for, which does not clear — see there.
         """
         await self.execute("DELETE FROM preferences")
         await self.execute(
-            "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, user_id) "
-            "VALUES (1, $1, $2, $3, $4, $5, $6)",
+            "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, "
+            "user_id, exp_range_low, exp_range_high, show_no_experience_jobs) "
+            "VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9)",
             json.dumps(list(cities)),
             json.dumps(list(keywords)),
             json.dumps(list(exclusions)),
             int(max_level),
             self.clock.tick(),
             user_id,
+            exp_range_low,
+            exp_range_high,
+            int(bool(show_no_experience_jobs)),
         )
 
 
@@ -671,6 +703,9 @@ class FakeConn:
         keywords: Sequence[str] = DEFAULT_KEYWORDS,
         exclusions: Sequence[str] = DEFAULT_EXCLUSIONS,
         max_level: int = DEFAULT_MAX_LEVEL,
+        exp_range_low: int | None = DEFAULT_EXP_RANGE_LOW,
+        exp_range_high: int | None = DEFAULT_EXP_RANGE_HIGH,
+        show_no_experience_jobs: bool = DEFAULT_SHOW_NO_EXPERIENCE_JOBS,
     ) -> None:
         """A SECOND user's filter. Adds a row; deletes nothing.
 
@@ -683,8 +718,9 @@ class FakeConn:
         """
         next_id = int(await self.fetchval("SELECT COALESCE(max(id), 0) + 1 FROM preferences"))
         await self.execute(
-            "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, user_id) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, "
+            "user_id, exp_range_low, exp_range_high, show_no_experience_jobs) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             next_id,
             json.dumps(list(cities)),
             json.dumps(list(keywords)),
@@ -692,6 +728,9 @@ class FakeConn:
             int(max_level),
             self.clock.tick(),
             user_id,
+            exp_range_low,
+            exp_range_high,
+            int(bool(show_no_experience_jobs)),
         )
 
 

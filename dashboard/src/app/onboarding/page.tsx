@@ -55,10 +55,12 @@ export default async function OnboardingPage() {
     <>
       <h1>Set up your filter</h1>
       <p className="lede">
-        One thing decides what reaches your inbox: the keywords below. A job title has to
-        contain at least one of them, so this list is yours to write — nothing has been chosen
-        for you. Upload your resume and we will read it once and suggest some, or type your own.
-        Save when it looks right and the dashboard opens; you can change any of this later.
+        Two things decide what reaches your inbox: the keywords below and how much experience
+        you are looking for. A job title has to contain at least one keyword, and the years its
+        description asks for have to fall inside your range — so both are yours to write, and
+        nothing has been chosen for you. Upload your resume and we will read it once and suggest
+        some keywords, or type your own. Save when it looks right and the dashboard opens; you
+        can change any of this later.
       </p>
       <PreferencesEditor initial={preferences} resume={resume} redirectOnSave="/" />
     </>

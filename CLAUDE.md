@@ -139,7 +139,7 @@ that re-applying the schema can never reset a value the dashboard has edited.
 | `miss_count` | consecutive fetches that did *not* contain it |
 | `status` | `open` \| `closed` |
 | `seeded` | stored during this company's first-ever crawl — **back catalogue, never emailed to anybody** |
-| `min_experience` | years the description demands as a minimum. **NULL = unknown, and unknown means keep** |
+| `min_experience` | years the description demands as a minimum. **NULL = unknown; whether unknown means keep is the reader's `show_no_experience_jobs`, per account, since Slice 2** |
 | `is_pm_role` | the description frames the role as product/people management |
 | `desc_checked` | the description has been read once; never read twice |
 | `desc_fetch_failed` | we looked and could not read it — retried, occasionally |
@@ -276,7 +276,16 @@ which is a different decision and one nobody can undo.
 
 ### `preferences` — the filter, as data rather than code
 Columns: `cities`, `keywords`, `exclusions` (all `TEXT[]`), `max_level` (`INT`,
-default 2), `updated_at`, and `user_id` (`UUID`, FK to `public.users`).
+default 2), `updated_at`, and `user_id` (`UUID`, FK to `public.users`). Phase 3
+Step 0 added nine more; five are wired up, four are still inert:
+
+| Column | Status |
+|---|---|
+| `onboarding_completed` | **live** since Slice 1 — the gate `requirePage()` reads |
+| `exp_range_low`, `exp_range_high` | **live** since Slice 2 — the looking range. Nullable, and NULL means *not configured*, which matches nothing |
+| `show_no_experience_jobs` | **live** since Slice 2 — what a NULL `jobs.min_experience` means for this account |
+| `years_of_experience_held` | stored, editable, **read by no matcher, ever** — informational only |
+| `selected_cities`, `all_india`, `work_modes`, `salary_bands` | still inert, still covered by `tests/test_phase3_columns.py`'s sweep |
 
 It lives in the database and not in a Python constant precisely so the dashboard
 can `UPDATE` it and the very next digest obeys — no redeploy, no commit.
@@ -647,7 +656,7 @@ is_match  =  city_ok
          AND NOT excluded            (a word in the title)
          AND NOT level_excluded      (a level notation in the title)
          AND NOT is_pm_role          (a fact from the description)
-         AND (min_experience IS NULL OR min_experience <= 2)
+         AND experience_ok           (the row's minimum vs YOUR range)
 ```
 
 The first four are the **title stage** (`title_stage_ok`) — free, and run over
@@ -655,12 +664,61 @@ every open job. The last two read columns, not text, and the seam is named
 explicitly because the enrichment pass needs to know which jobs are worth a
 network request: the ones that already pass every title test.
 
-**Every ambiguity resolves toward keeping the job — except the city.**
-`min_experience IS NULL` covers three different situations — never read, read
-and no minimum stated, and fetch failed — and all three mean *we do not know, so
-do not hide it*. Only a confident minimum above 2, or a detected PM role, hides
-a posting. Likewise a title stating no level survives: treating silence as
-senior would empty the digest.
+**The experience rule is per-account since Phase 3 Slice 2**, and it is three
+branches rather than one comparison:
+
+```
+exp_range_low IS NULL OR exp_range_high IS NULL   ->  match NOTHING
+min_experience IS NULL                            ->  keep iff show_no_experience_jobs
+otherwise                                         ->  keep iff low <= min_experience <= high
+```
+
+It replaced a module constant, `MAX_MIN_EXPERIENCE = 2`, whose own comment
+predicted this: *"if it ever needs to be editable it becomes a column, exactly
+like max_level did."* The constant is deleted in both languages rather than left
+unread — the `jobs.notified` lesson applied to a name.
+
+Two things changed in kind, not degree. The rule can now drop a posting for being
+too **junior**, which a ceiling could never express; and a NULL `min_experience`
+is no longer unconditionally kept. **The install's own row is `(0, 2)` with
+`show_no_experience_jobs = TRUE`, which reproduces the old rule exactly** —
+`min_experience` is never negative, so `{0,1,2}` and "at most 2" select the same
+rows — and `scripts/backfill_onboarding_prefs.py` seeded it that way for
+precisely this step. Verified rather than argued: `match-parity` reports the same
+38 matches before and after.
+
+**Only the minimum is stored, and that cost is accepted deliberately.** There is
+no `max_experience` column, so a "3–6 years" posting is a `min = 3` row and an
+account looking for 5–8 never sees it although 5 and 6 are inside the posting's
+own band. The alternative (`min_experience <= high`) would keep it and would never
+fire the junior half at all. For a range of `(0, 2)` the two agree on every stored
+row; the cost is borne only by an account looking higher up.
+
+**An unconfigured range matches nothing, and is not a fallback to `(0, 2)`.**
+Handing an account the operator's answer is the failure Slices 1b and 1c spent two
+commits removing from `keywords`, `cities`, `exclusions` and `max_level`. It is
+also unreachable for an onboarded account by construction: `PUT
+/api/preferences` refuses an incomplete range and is the only writer of these
+columns *and* of `onboarding_completed`, so **onboarded implies configured** —
+asserted against the live database by `npm run onboarding-check`. It excludes
+rather than *raises* because `run_fan_out` catches only `DigestError`, so an
+exception would take every account's digest down over one account's blank row.
+
+**Every other ambiguity still resolves toward keeping the job — except the city.**
+`min_experience IS NULL` covers three different situations — never read, read and
+no minimum stated, and fetch failed — and all three still mean *we do not know*.
+What changed is only who answers what to do about not knowing. On the live
+database **7,809 of 7,880 open rows are NULL**, so that one boolean decides 99% of
+the board — which is why the onboarding form pre-checks it ON (a suggested answer;
+the column stays FALSE until a real save) and why the hint on the screen states
+the number. A detected PM role still hides a posting outright, and a title stating
+no level still survives: treating silence as senior would empty the digest.
+
+`years_of_experience_held` is **informational and never filters.** It is on the
+form and in the row, and it is deliberately absent from both `Preferences` value
+objects and from `PREFERENCES_SQL`, so "it never decides" is a property rather
+than a promise — `tests/test_phase3_columns.py` asserts the name appears in no
+matcher in either language.
 
 `city_ok` is the one test with no inclusion bias, and the asymmetry is the
 point. A description can be absent and a level can go unstated, but a location
@@ -701,8 +759,11 @@ one-directional: an unrecognised level costs one line in a digest, a misread
 experience range costs the job.
 
 **Preferences are DB-backed and dashboard-editable**: `keywords`, `cities`,
-`exclusions`, `max_level`. The API rejects an empty `cities` or `keywords` list,
-because either would match no job at all.
+`exclusions`, `max_level`, and since Slice 2 `exp_range_low` / `exp_range_high` /
+`show_no_experience_jobs` / `years_of_experience_held`. The API rejects an empty
+`cities` or `keywords` list and an incomplete experience range, because each of the
+three would match no job at all. `exclusions` may be empty (a real choice) and so
+may `years_of_experience_held` (it filters nothing).
 
 ### Enrichment
 
@@ -1282,10 +1343,25 @@ disagreement:
 | Command | Checks |
 |---|---|
 | `npm run parity` | `lib/ats.ts` + `lib/workday.ts` against `fetchers/resolve.py`, over fixed inputs |
-| `npm run match-parity` | `lib/match.ts` against `notify/match.py`, over every open row in the live database |
+| `npm run match-parity` | `lib/match.ts` against `notify/match.py`, over every open row in the live database, under **four** filters |
 
 Run `match-parity` after touching either matcher; its total is directly
 comparable to `python scripts/preview_digest.py --dry-run --ignore-notified`.
+
+**Four filters rather than one, since Slice 2, and the reason generalises.** The
+live `preferences` row is `(0, 2)` with the no-experience toggle on — which is the
+one branch of the new experience rule that reproduces the *old* rule. Running only
+it would have proven the port did not regress and proven nothing whatever about
+the three branches the slice added: a parity check that cannot reach the new code
+is a green light bolted over an untested rule. So the same live rows are judged
+under the real row plus `(2,5)`+off, `(0,0)`+on, and an unconfigured range,
+differing **only** in the experience fields so any disagreement is attributable to
+the rule under test. The last one is additionally asserted to be **empty** rather
+than merely equal across languages — both sides agreeing on a wrong answer would
+pass a comparison, and "an unset range matches nothing" is the property.
+
+Current: **7,882 live rows × 4 filters, no disagreement**; the live row's total is
+38, unmoved by the slice, and the variants report 45 / 18 / 0.
 
 Two more checks answer questions parity cannot. Neither is about drift between
 the two languages; both are about a thing being *true against the real database*.
@@ -2147,6 +2223,94 @@ Newest last. Append here as the project evolves.
   afterwards — the screen shows it as "last saved" and this claims no edit
   anybody made. A second preview matches 0 rows.
 
+- **2026-08-08 — Phase 3 Slice 2. The experience ceiling becomes a per-account
+  range.** `MAX_MIN_EXPERIENCE = 2` is gone from both languages. `is_match` now
+  reads three columns Step 0 created and left inert — `exp_range_low`,
+  `exp_range_high`, `show_no_experience_jobs` — and the constant's own comment had
+  predicted exactly this ("if it ever needs to be editable it becomes a column,
+  exactly like max_level did"). It was **deleted rather than left unread**, which is
+  the `jobs.notified` argument applied to a name in Python: a value written by
+  nobody and read by nobody is worse than absent.
+
+  **No migration.** The columns existed and the operator's row was already
+  backfilled, so this slice is pure code — the first one in a while that handed
+  over no manual database step. That is Step 0's expand half paying off.
+
+  Three branches, and the ORDER of the first two is load bearing:
+
+  ```
+  range unconfigured (either end NULL)  ->  match NOTHING
+  min_experience NULL                   ->  keep iff show_no_experience_jobs
+  otherwise                             ->  keep iff low <= min IS <= high
+  ```
+
+  **The first draft had those two the other way round, and a test caught it.** With
+  the NULL-minimum branch first, an account with no range but the toggle on keeps
+  every job whose description states no minimum — 7,809 of 7,880 open rows — so
+  "matches nothing" silently meant "matches almost everything". `lib/jobs.ts` had
+  the order right, so the SQL prefilter would have excluded rows the matcher kept:
+  the prefilter narrower than the rule it prefilters for, which is the one thing
+  that file may not be. Both languages now check the range first.
+
+  **The install's behaviour is unchanged, and that is measured.** `(0, 2)` with the
+  toggle TRUE reproduces `NULL or <= 2` exactly, because `min_experience` is never
+  negative — `{0,1,2}` and "at most 2" select the same rows, and the range form is
+  marginally *safer* since it would also exclude a negative. `match-parity` reports
+  **38 before and 38 after**, same 18 companies, and
+  `preview_digest --dry-run --ignore-notified` independently agrees at 38.
+
+  Two things changed in kind. The rule can now drop a posting for being too
+  **junior**, which a ceiling could not express (zero live rows affected: nothing
+  sits below 0). And **only the minimum is stored**, so a job whose advertised band
+  overlaps the range from below is dropped — a "3–6 years" posting is `min = 3` and
+  an account looking for 5–8 never sees it. The symmetric rule was specified
+  deliberately over the alternative `min_experience <= high`; the cost is on the
+  record in a test that has to be deleted to change it.
+
+  **An unconfigured range matches nothing rather than falling back to `(0, 2)`.**
+  A fallback would hand a stranger the operator's answer, which is what Slices 1b
+  and 1c spent two commits removing from the other four fields. It excludes rather
+  than raising, because `run_fan_out` catches only `DigestError` and an exception
+  would take every account's digest down over one blank row. And it is unreachable
+  for an onboarded account by construction: `PUT /api/preferences` refuses an
+  incomplete range and is the only writer of these columns *and* of
+  `onboarding_completed`, so **onboarded implies configured** —
+  `savePreferences`' parameter type is `number`, not `number | null`, so the one
+  writer *cannot* write a NULL, and `npm run onboarding-check` asserts the resulting
+  row against the live database.
+
+  `years_of_experience_held` is wired to the **form only**. It is informational and
+  never filters, and that is a property rather than a promise: it is absent from
+  both `Preferences` value objects and from `PREFERENCES_SQL`, and
+  `tests/test_phase3_columns.py` asserts the name appears in no matcher in either
+  language — over `tokenize`d source, because the first draft of that guard used a
+  line-prefix heuristic and tripped on the docstring that *states* the guarantee.
+
+  **The onboarding form gained an Experience panel**, and one deliberate
+  asymmetry in it. The range renders BLANK for a new account (a pre-filled `0-2`
+  would be the operator's answer smuggled back in) while the toggle renders
+  pre-checked **ON** — "unknown means keep" is this project's documented inclusion
+  bias, not a personal preference, and a new account whose first digest is empty for
+  an unexplained reason is the worse failure. The column stays FALSE until a real
+  save, so it is a suggested answer rather than a smuggled default; the hint states
+  the 99% that makes it matter. A blank range blocks Save, in the browser and at the
+  route, exactly as an empty `cities` or `keywords` does.
+
+  Verification: **997 pytest / 1 skipped**, typecheck clean, `match-parity` 4/4
+  variants agreeing (38 / 45 / 18 / 0), `onboarding-check` 40 assertions,
+  `ui-check` including 11 new ones over the shipped panel, `badge-check` green.
+  Seven mutations were run against the new guards and all seven were caught —
+  including the two decisions this slice turns on (the pre-checked toggle, the blank
+  range) and the prefilter-narrower-than-the-matcher case, which `badge-check`
+  catches as 38 → 20.
+
+  `tests/conftest.py`'s two preference-seeding helpers now name the three columns.
+  That is not housekeeping: the SQLite mirror declares
+  `show_no_experience_jobs NOT NULL DEFAULT 0` and the range ints as NULL, so an
+  unnamed row would have arrived unconfigured-with-unknowns-hidden and every test
+  that seeds a filter and expects an ordinary unenriched job to match would have
+  failed for a reason about the fixture.
+
 **Pending**
 
 - **The nav does not know about the onboarding gate.** During setup the chrome
@@ -2175,7 +2339,12 @@ Newest last. Append here as the project evolves.
   are related: the gap has never bitten because nothing exercises it. If a
   `custom_jsonld` or `custom_sitemap` company is ever tracked, every one of its
   postings enters the digest with `min_experience` NULL — the second-stage filter
-  silently off for that vendor, which is precisely the Step 7c failure.
+  silently off for that vendor, which is precisely the Step 7c failure. Slice 2
+  narrowed that slightly without closing it: an account with
+  `show_no_experience_jobs = FALSE` now drops those postings instead of receiving
+  them. That is not a fix, and reading it as one would be a mistake — the install's
+  own row has the toggle ON, so for the account that actually exists the leak is
+  exactly as open as it was.
 - **Nothing creates a `user_companies` row except `scripts/track_companies.py`.**
   The discovery sweep and the dashboard's Add screen both write `companies` and
   stop there, which is the right default — auto-subscribing every account to

@@ -12,7 +12,7 @@ The six tests are independent and combine with AND:
     excluded             the title matches at least one exclusion            (negated)
     level_excluded       the title states a seniority level above max_level  (negated)
     pm_excluded          the description frames the role as management       (negated)
-    experience_excluded  the description demands a minimum above 2 years     (negated)
+    experience_excluded  the stated minimum is outside the looking range     (negated)
 
 Nothing here reads the database, the clock, or the environment. `preferences`
 arrives as a value, `job` arrives as a mapping, and the answer is a bool — so
@@ -34,14 +34,48 @@ is already an integer and a boolean sitting on the row.
 know which jobs are worth a request — the answer is "the ones that already pass
 every title test", which is a handful per run rather than the whole board.
 
-Both new tests inherit the same inclusion bias as everything else here:
+The PM test inherits the same inclusion bias as everything else here: an
+unenriched row is FALSE, which means kept.
+
+The experience test USED TO, unconditionally, and no longer does — it asks the
+account instead. Until Phase 3 Slice 2 the rule was a module constant,
+MAX_MIN_EXPERIENCE = 2, and
 
     min_experience IS NULL  ->  KEEP
 
-NULL covers three different situations — the description was never read, it was
-read and stated no requirement, or the fetch failed — and all three mean the
-same thing: we do not know, so do not delete the job. Only a number we are
-confident about, above 2, drops a posting.
+was a property of this file, true for everybody forever. NULL still covers the
+same three situations — the description was never read, it was read and stated no
+requirement, or the fetch failed — and they still all mean "we do not know". What
+changed is who answers the question that follows. `show_no_experience_jobs` is
+that answer, per account:
+
+    min_experience IS NULL  ->  KEEP if prefs.show_no_experience_jobs else DROP
+
+The inclusion bias is not abandoned, it is relocated: the install's own row says
+TRUE (see scripts/backfill_onboarding_prefs.py, which seeded it precisely so that
+wiring this column in could not silently start hiding every unenriched job), and
+DEFAULT_SHOW_NO_EXPERIENCE_JOBS below keeps TRUE as the fallback for a row that
+does not exist. It is worth knowing how much rests on it: on the live database
+7,809 of 7,880 open rows have min_experience NULL, so this one boolean decides
+99% of the board.
+
+A confident number is now judged against a RANGE rather than a ceiling:
+
+    exp_range_low <= min_experience <= exp_range_high
+
+which drops a posting for being too JUNIOR as well as too senior. That is new —
+under the constant no value could ever be too low. For the install's row the
+range is (0, 2), which reproduces the old `<= 2` exactly, because min_experience
+is never negative: {0,1,2} and "at most 2" select the same rows.
+
+ONE CONSEQUENCE OF STORING ONLY A MINIMUM, accepted deliberately rather than
+overlooked. There is no max_experience column — notify/description.py reduces
+"3-6 years" to the integer 3 — so a job whose advertised band OVERLAPS the range
+from below is still dropped: min 3 is outside (5, 8) although 5 and 6 are inside
+the posting's own band. The alternative rule (`min_experience <= high`, today's
+generalised) would keep it and would never fire the junior half at all. The
+symmetric rule is the specified one; for a range of (0, 2) the two agree on every
+stored row, and the cost is borne only by an account looking higher up.
 
 
 Why word boundaries, not substrings
@@ -152,13 +186,42 @@ DEFAULT_EXCLUSIONS = (
 # "Software Engineer II" and "SDE 2" and drops "SDE III" and above.
 DEFAULT_MAX_LEVEL = 2
 
-# The most years of experience a description may demand and still be worth an
-# email. A constant rather than a preferences column: max_level is about what a
-# title CALLS the role, this is about what the description ASKS FOR, and the two
+# THE EXPERIENCE RULE, WHICH USED TO BE A CONSTANT AND IS NOW THREE COLUMNS.
+#
+# What stood here was `MAX_MIN_EXPERIENCE = 2`, with a comment ending "If it ever
+# needs to be editable it becomes a column, exactly like max_level did." This is
+# that. Phase 3 Step 0 created preferences.exp_range_low / exp_range_high /
+# show_no_experience_jobs and deliberately left them unread; Slice 2 is the
+# feature step that reads them.
+#
+# THE CONSTANT WAS DELETED RATHER THAN LEFT STANDING, which is the jobs.notified
+# lesson applied to a name in Python instead of a column in Postgres: a value
+# written by nobody and read by nobody is worse than absent, because the next
+# person to find it reasonably assumes something depends on it and the first edit
+# made on that assumption is a silent one.
+#
+# max_level is STILL a separate axis and is untouched by this. It is about what a
+# title CALLS the role; these are about what the description ASKS FOR, and the two
 # have been wrong together often enough that conflating them would hide bugs in
-# both. If it ever needs to be editable it becomes a column, exactly like
-# max_level did.
-MAX_MIN_EXPERIENCE = 2
+# both. That both defaults happen to be 2 is a coincidence.
+#
+# THESE THREE ARE A MIRROR, NEVER AN OVERRIDE — the same status DEFAULT_CITIES has
+# above. The database is the runtime source of truth. What they mirror is not a
+# db/schema.sql seed (the columns arrive NULL / NULL / FALSE, which is
+# "unconfigured") but the values scripts/backfill_onboarding_prefs.py wrote onto
+# the install's existing row, chosen there to reproduce the old fixed rule to the
+# character. They are reached only by Preferences() with no row behind it: an
+# un-migrated database, and the tests.
+#
+# WHY THE FALLBACK FOR THE TOGGLE IS TRUE WHILE THE COLUMN DEFAULT IS FALSE, and
+# the asymmetry is deliberate on both ends. FALSE is right for a column on a row
+# nobody has answered yet — it is not a decision, and onboarding_completed is what
+# says so. TRUE is right for "there is no row at all", because that is the
+# un-migrated database whose digest has been running on "unknown means keep" all
+# along, and flipping it by omission would hide 99% of the board.
+DEFAULT_EXP_RANGE_LOW = 0
+DEFAULT_EXP_RANGE_HIGH = 2
+DEFAULT_SHOW_NO_EXPERIENCE_JOBS = True
 
 # Inside a multi-word term, what may stand between the words.
 _INNER_SEP = r"[\s\-_/]+"
@@ -289,13 +352,33 @@ class Preferences:
 
     Frozen because matching must not be able to edit the filter it is being
     judged against, and because that makes it safe to share across every job in
-    a run.
+    a run. Frozen also makes it hashable, which notify/store.load_active_
+    preferences relies on to deduplicate identical filters — the three fields
+    added in Slice 2 are an int, an int and a bool, so that still holds.
+
+    SEVEN FIELDS, AND THE ONE THAT IS DELIBERATELY ABSENT.
+    preferences.years_of_experience_held is NOT here, and it is not an oversight.
+    It is informational — how much experience the person HAS, which the profile
+    screen collects and shows — and it must never filter anything. Keeping it off
+    this object is what makes that a PROPERTY rather than a promise: is_match
+    reads nothing else, so a column that never reaches here cannot reach a
+    verdict however some future loader is written. notify/store.PREFERENCES_SQL
+    correspondingly does not select it, and tests/test_phase3_columns.py asserts
+    that no matcher in either language so much as names it.
+
+    exp_range_low and exp_range_high are OPTIONAL ints because NULL is a real and
+    meaningful value on those columns: "this account has not configured a range".
+    See experience_excluded for what that resolves to, and why it is not the
+    seeded default.
     """
 
     cities: tuple[str, ...] = DEFAULT_CITIES
     keywords: tuple[str, ...] = DEFAULT_KEYWORDS
     exclusions: tuple[str, ...] = DEFAULT_EXCLUSIONS
     max_level: int = DEFAULT_MAX_LEVEL
+    exp_range_low: int | None = DEFAULT_EXP_RANGE_LOW
+    exp_range_high: int | None = DEFAULT_EXP_RANGE_HIGH
+    show_no_experience_jobs: bool = DEFAULT_SHOW_NO_EXPERIENCE_JOBS
 
     @staticmethod
     def _as_tuple(value: Any, fallback: Sequence[str]) -> tuple[str, ...]:
@@ -332,9 +415,64 @@ class Preferences:
         except (TypeError, ValueError):
             return fallback
 
+    @staticmethod
+    def _as_optional_int(row: Mapping[str, Any], key: str) -> int | None:
+        """Read a nullable INT column, PRESERVING the NULL. No fallback anywhere.
+
+        THE ONE READER IN THIS CLASS THAT DOES NOT FALL BACK, and the difference
+        from _as_level above is the whole point rather than an inconsistency.
+
+        max_level is `INT NOT NULL DEFAULT 2`, so a NULL there cannot mean
+        anything a person chose — it can only mean a database old enough not to
+        have the column, and the seeded default is the honest answer. exp_range_low
+        and exp_range_high are nullable BY DESIGN (db/schema.sql says why: "NULL
+        means not configured, which is true of every existing row and of every
+        account created before the onboarding screen exists"), so NULL is a value
+        with a meaning and replacing it with 0..2 would be handing this account the
+        operator's answer — exactly the failure Slices 1b and 1c spent two commits
+        removing from keywords, cities, exclusions and max_level.
+
+        A missing key resolves to None for the same reason rather than raising:
+        notify/store.PREFERENCES_SQL names both columns, so a KeyError here would
+        mean a database without them, where the SELECT would already have failed —
+        and "unconfigured" is the safe reading of a column that is not there.
+        """
+        try:
+            value = row[key]
+        except (KeyError, IndexError, TypeError):
+            return None
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _as_bool(row: Mapping[str, Any], key: str, fallback: bool) -> bool:
+        """Read show_no_experience_jobs, which is NOT NULL and so may fall back.
+
+        Same shape as _as_level and for the same reason: the column is
+        `BOOLEAN NOT NULL DEFAULT FALSE`, so a NULL or an absent key means a row
+        that predates it, where the fallback is the only honest answer. The SQLite
+        test shim stores it as an INTEGER, which bool() reads correctly.
+        """
+        try:
+            value = row[key]
+        except (KeyError, IndexError, TypeError):
+            return fallback
+        return fallback if value is None else bool(value)
+
     @classmethod
     def from_row(cls, row: Mapping[str, Any] | None) -> "Preferences":
-        """Build from a preferences row; an absent row means the seeded defaults."""
+        """Build from a preferences row; an absent row means the seeded defaults.
+
+        Note the asymmetry between the two halves, which is stated on each reader
+        above: the four columns that have always decided fall back to their
+        mirrors when NULL, and the two nullable experience ints do not. A real row
+        saying NULL is answering "nobody has configured this", and that answer has
+        to survive being read.
+        """
         if row is None:
             return cls()
         return cls(
@@ -342,6 +480,11 @@ class Preferences:
             keywords=cls._as_tuple(row["keywords"], DEFAULT_KEYWORDS),
             exclusions=cls._as_tuple(row["exclusions"], DEFAULT_EXCLUSIONS),
             max_level=cls._as_level(row, DEFAULT_MAX_LEVEL),
+            exp_range_low=cls._as_optional_int(row, "exp_range_low"),
+            exp_range_high=cls._as_optional_int(row, "exp_range_high"),
+            show_no_experience_jobs=cls._as_bool(
+                row, "show_no_experience_jobs", DEFAULT_SHOW_NO_EXPERIENCE_JOBS
+            ),
         )
 
 
@@ -415,20 +558,66 @@ def pm_excluded(job: Mapping[str, Any]) -> bool:
     return bool(job.get("is_pm_role"))
 
 
-def experience_excluded(job: Mapping[str, Any]) -> bool:
-    """The description states a minimum, and that minimum is above the ceiling.
+def experience_excluded(job: Mapping[str, Any], prefs: Preferences) -> bool:
+    """The stated minimum is outside this account's looking range.
 
-    "States a minimum" is the load-bearing half, exactly as with level_excluded.
-    NULL is silence, and silence is kept: a fetch that failed, a description that
-    never mentioned years, and a description nobody has read yet are all NULL,
-    and dropping any of them would delete jobs for the reason that we did not
-    look hard enough.
+    THREE BRANCHES, AND EACH ANSWERS A DIFFERENT QUESTION.
 
-    A non-integer value is treated as silence too, rather than as an exception in
-    the middle of a digest run.
+    THE ORDER IS LOAD BEARING AND WAS WRONG IN THE FIRST DRAFT. The unconfigured
+    check has to come FIRST, before the NULL-min_experience one. Written the other
+    way round, an account with no range but the toggle at TRUE keeps every job whose
+    description states no minimum — which on the live database is 7,809 of 7,880
+    open rows, so "matches nothing" would have quietly meant "matches almost
+    everything". It was caught by a test rather than by review, and by the fact that
+    dashboard/src/lib/jobs.experienceClause had the order right: the SQL prefilter
+    would have excluded rows this function kept, making the prefilter narrower than
+    the rule it prefilters for, which is the one thing that file may not be.
+
+    1. An unconfigured range -> EXCLUDE EVERYTHING. Deliberately not a fallback to
+       (0, 2), and the reasoning is the one Slices 1b and 1c settled: a filter
+       nobody chose, applied silently, is the expensive failure. It cannot widen
+       into somebody's inbox and it cannot narrow a filter somebody tuned, because
+       there is no filter here to narrow.
+
+       IT IS ALSO UNREACHABLE FOR AN ONBOARDED ACCOUNT, by construction rather
+       than by luck: PUT /api/preferences refuses a save whose range is incomplete
+       and is the only writer of these columns AND of onboarding_completed, so
+       "onboarded" now implies "configured". The one row in this state today is the
+       account that has never finished onboarding, which lib/guard.requirePage
+       keeps off every screen that computes a match and db/users.DIGEST_USERS_SQL
+       keeps out of the fan-out (is_active FALSE). npm run onboarding-check asserts
+       the implication against the live database.
+
+       Excluding rather than RAISING is a decision about blast radius.
+       notify/digest.run_fan_out catches DigestError and nothing else, so an
+       exception raised here would take every account's digest down over one
+       account's unconfigured row — the "one broken account silences every other"
+       failure the fan-out is arranged against.
+
+    2. NULL min_experience -> the account decides. Silence still covers the same
+       three things (fetch failed, no minimum stated, nobody has read it yet) and
+       still means "we do not know"; show_no_experience_jobs is the answer to what
+       to do about not knowing. TRUE keeps it, which is what this install has
+       always done and what its row says; FALSE hides it. A non-integer value is
+       silence too, rather than an exception in the middle of a digest run.
+
+    3. A confident number -> range membership, ends INCLUSIVE. This is where the
+       junior half lives: a minimum BELOW the range drops the posting exactly as a
+       minimum above it does. Written as a range compare rather than by building
+       the integer set the spec describes, because for integers the two are the
+       same test, and this is the form dashboard/src/lib/jobs.ts can state to
+       Postgres verbatim as BETWEEN — a rule the two runtimes must agree on is
+       worth writing in the shape both can express.
     """
+    low, high = prefs.exp_range_low, prefs.exp_range_high
+    if low is None or high is None:
+        return True
+
     years = min_experience_of(job)
-    return years is not None and years > MAX_MIN_EXPERIENCE
+    if years is None:
+        return not prefs.show_no_experience_jobs
+
+    return not (low <= years <= high)
 
 
 def min_experience_of(job: Mapping[str, Any]) -> int | None:
@@ -459,7 +648,7 @@ def is_match(job: Mapping[str, Any], prefs: Preferences) -> bool:
     return (
         title_stage_ok(job, prefs)
         and not pm_excluded(job)
-        and not experience_excluded(job)
+        and not experience_excluded(job, prefs)
     )
 
 
@@ -495,8 +684,21 @@ def explain(job: Mapping[str, Any], prefs: Preferences) -> MatchReport:
         reason = f"level {level} above max_level {prefs.max_level}"
     elif is_pm:
         reason = "description frames this as a PM/management role"
-    elif experience_excluded(job):
-        reason = f"minimum {min_experience} years above ceiling {MAX_MIN_EXPERIENCE}"
+    elif experience_excluded(job, prefs):
+        # One test, four ways to fail it — and a preview that said only "outside
+        # the range" would leave the reader to work out which, when the whole
+        # point of this function is that it does not make them.
+        # Same order as the test itself, so the explanation names the branch that
+        # actually fired rather than the first one a reader would guess.
+        low, high = prefs.exp_range_low, prefs.exp_range_high
+        if low is None or high is None:
+            reason = "the looking range is not configured"
+        elif min_experience is None:
+            reason = "experience unknown, and this account hides jobs stating no minimum"
+        elif min_experience < low:
+            reason = f"minimum {min_experience} years below the looking range {low}-{high}"
+        else:
+            reason = f"minimum {min_experience} years above the looking range {low}-{high}"
     else:
         reason = "matched " + ", ".join(repr(t) for t in keywords_hit)
 

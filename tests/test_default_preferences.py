@@ -28,8 +28,11 @@ from pathlib import Path
 from notify.match import (
     DEFAULT_CITIES,
     DEFAULT_EXCLUSIONS,
+    DEFAULT_EXP_RANGE_HIGH,
+    DEFAULT_EXP_RANGE_LOW,
     DEFAULT_KEYWORDS,
     DEFAULT_MAX_LEVEL,
+    DEFAULT_SHOW_NO_EXPERIENCE_JOBS,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -40,12 +43,22 @@ LINK_USER_TS = PROJECT_ROOT / "dashboard" / "src" / "lib" / "link-user.ts"
 def parsed_defaults() -> dict:
     """DEFAULT_PREFERENCES out of labels.ts, without running TypeScript.
 
-    The object is plain data — string arrays and one integer — so it is read by
-    isolating the literal and repairing the two ways TypeScript spells JSON
-    differently: a trailing comma before a closing bracket, and the `as const`
-    suffix. Anything more elaborate than that in this constant should fail here
-    loudly rather than be parsed cleverly, because a computed default is a
-    default nobody can read off the page.
+    The object is plain data — string arrays, two integers and a boolean — so it is
+    read by isolating the literal and repairing the three ways TypeScript spells
+    JSON differently: `//` line comments, a trailing comma before a closing
+    bracket, and the `as const` suffix. Anything more elaborate than that in this
+    constant should fail here loudly rather than be parsed cleverly, because a
+    computed default is a default nobody can read off the page.
+
+    LINE COMMENTS ARE STRIPPED RATHER THAN REFUSED, which is a widening of that
+    rule and worth saying why. The warning above is about COMPUTED values — a
+    spread, a concat, a ternary — because those cannot be read off the page. A
+    comment is the opposite: it is how the page explains itself, and Slice 2 added
+    three fields (the experience range and the no-experience toggle) whose values
+    mean nothing without a sentence saying that (0, 2) reproduces the ceiling that
+    used to be a constant. Refusing comments would have meant either an
+    unexplained literal or the explanation drifting to the top of the file, away
+    from the values it is about.
     """
     text = LABELS_TS.read_text(encoding="utf-8")
     match = re.search(
@@ -54,6 +67,7 @@ def parsed_defaults() -> dict:
     assert match, "DEFAULT_PREFERENCES not found in labels.ts as a plain object literal"
 
     literal = match.group(1)
+    literal = re.sub(r"//[^\n]*", "", literal)               # line comments
     literal = re.sub(r"(\w+):", r'"\1":', literal)          # bare keys -> quoted
     literal = re.sub(r",(\s*[}\]])", r"\1", literal)         # trailing commas
     return json.loads(literal)
@@ -81,6 +95,45 @@ def test_exclusions_match():
 
 def test_max_level_matches():
     assert parsed_defaults()["max_level"] == DEFAULT_MAX_LEVEL
+
+
+def test_the_experience_range_matches():
+    """Phase 3 Slice 2's three values, mirrored like the four above them.
+
+    These carry more weight than the other four, because they are what makes the
+    slice a no-op for the account already running. (0, 2) is the range
+    scripts/backfill_onboarding_prefs.py wrote onto the install's row precisely
+    because it reproduces the old fixed `MAX_MIN_EXPERIENCE = 2` ceiling — so a
+    drift between the two languages here is not a cosmetic inconsistency, it is one
+    runtime deciding a different set of jobs is worth an email than the other.
+    """
+    defaults = parsed_defaults()
+    assert defaults["exp_range_low"] == DEFAULT_EXP_RANGE_LOW
+    assert defaults["exp_range_high"] == DEFAULT_EXP_RANGE_HIGH
+
+
+def test_the_no_experience_toggle_matches_and_is_on():
+    """TRUE in both languages, and the value is asserted rather than just compared.
+
+    A mirror test would pass if both sides said FALSE. That would be wrong in a way
+    no comparison could see: 99% of open postings state no minimum, so a default of
+    FALSE means the fallback filter — the one a database with no preferences row
+    runs on — silently matches almost nothing. The old rule kept unknowns for
+    everybody, and this constant is what carries that forward.
+    """
+    assert parsed_defaults()["show_no_experience_jobs"] == DEFAULT_SHOW_NO_EXPERIENCE_JOBS
+    assert DEFAULT_SHOW_NO_EXPERIENCE_JOBS is True
+
+
+def test_the_default_range_is_the_old_fixed_ceiling():
+    """The mirror is only right if it reproduces what the constant used to do.
+
+    `MAX_MIN_EXPERIENCE = 2` kept min_experience 0, 1 and 2 and dropped 3 upwards.
+    A low end above 0 would start excluding entry-level postings that used to
+    arrive; a high end other than 2 would move the ceiling. Stated as an assertion
+    so that changing either number has to be a deliberate edit here as well.
+    """
+    assert (DEFAULT_EXP_RANGE_LOW, DEFAULT_EXP_RANGE_HIGH) == (0, 2)
 
 
 def test_the_defaults_are_not_empty():

@@ -75,12 +75,16 @@ type Row = {
 };
 
 /*
- * The Python side. It builds a Preferences from the same row the dashboard read
- * and answers is_match for each job — no database, no network, no writes. Rows
+ * The Python side. It builds a Preferences from each filter the dashboard sends
+ * and answers is_match for every job — no database, no network, no writes. Rows
  * arrive as BYTES and are decoded utf-8 explicitly: on Windows, Python's
  * text-mode stdin defaults to the ANSI codepage, which mangles a job title with
  * an en-dash in it into a different string than the one that was sent, and the
  * resulting mismatch looks exactly like a real parity failure.
+ *
+ * SEVERAL FILTERS PER RUN SINCE PHASE 3 SLICE 2, in ONE subprocess. The
+ * interesting variants (see VARIANTS below) all run against the same job list, so
+ * paying for the interpreter and the import four times would buy nothing.
  */
 const PY = `
 import json, sys
@@ -88,13 +92,16 @@ sys.path.insert(0, ${JSON.stringify(REPO_ROOT)})
 from notify.match import Preferences, is_match
 
 payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
-prefs = Preferences.from_row(payload["prefs"])
+jobs = payload["jobs"]
 print(json.dumps({
-    "matched": [j["canonical_id"] for j in payload["jobs"] if is_match(j, prefs)],
+    "matched": [
+        [j["canonical_id"] for j in jobs if is_match(j, Preferences.from_row(v["prefs"]))]
+        for v in payload["variants"]
+    ],
 }))
 `;
 
-function python(payload: unknown): { matched: string[] } {
+function python(payload: unknown): { matched: string[][] } {
   for (const exe of ["python", "python3", "py"]) {
     const run = spawnSync(exe, ["-c", PY], {
       input: JSON.stringify(payload),
@@ -125,8 +132,13 @@ async function main() {
   `;
   if (!user) throw new Error("MY_EMAIL matches no row in public.users — run scripts/seed_user.py");
 
+  // The same seven columns notify/store.PREFERENCES_SQL selects. Selecting fewer
+  // would hand both matchers an undefined range, which is not a state any real
+  // loader can produce — the check would then be comparing two implementations on
+  // an input neither will ever see.
   const [prefsRow] = await sql<Preferences[]>`
-    SELECT cities, keywords, exclusions, max_level
+    SELECT cities, keywords, exclusions, max_level,
+           exp_range_low, exp_range_high, show_no_experience_jobs
       FROM preferences WHERE user_id = ${user.id}
   `;
   if (!prefsRow) {
@@ -164,23 +176,110 @@ async function main() {
 
   console.log(
     `preferences: ${prefsRow.cities.length} cities, ${prefsRow.keywords.length} keywords, ` +
-      `${prefsRow.exclusions.length} exclusions, max_level ${prefsRow.max_level}`,
+      `${prefsRow.exclusions.length} exclusions, max_level ${prefsRow.max_level}, ` +
+      `experience ${prefsRow.exp_range_low}-${prefsRow.exp_range_high}, ` +
+      `show_no_experience_jobs ${prefsRow.show_no_experience_jobs}`,
   );
   console.log(`open jobs   : ${jobs.length}\n`);
 
-  const fromPython = new Set(python({ prefs: prefsRow, jobs }).matched);
-  const fromTs = new Set(jobs.filter((j) => isMatch(j, prefsRow)).map((j) => j.canonical_id));
+  /*
+   * THE PREFS MATRIX — added by Phase 3 Slice 2, and the reason is that the live
+   * row exercises exactly ONE corner of the rule it is supposed to be checking.
+   *
+   * The operator's filter is (0, 2) with the toggle on. That is the branch which
+   * reproduces the pre-Slice-2 ceiling, so running only it proves the port did not
+   * regress and proves nothing whatever about the three branches the new rule
+   * added. A parity check that cannot reach the new code is a green light bolted
+   * over an untested rule.
+   *
+   * So the same live rows are judged under four filters. They differ ONLY in the
+   * experience fields, so any disagreement is attributable to the rule under test
+   * rather than to a city or a keyword.
+   */
+  const VARIANTS: { label: string; note: string; prefs: Preferences }[] = [
+    {
+      label: "live row",
+      note: "the operator's own filter — must reproduce the old `NULL or <= 2` exactly",
+      prefs: prefsRow,
+    },
+    {
+      label: "(2,5) toggle OFF",
+      note: "the junior half fires, and every unread description is hidden",
+      prefs: { ...prefsRow, exp_range_low: 2, exp_range_high: 5, show_no_experience_jobs: false },
+    },
+    {
+      label: "(0,0) toggle ON",
+      note: "a degenerate single-year range; boundary inclusivity at both ends",
+      prefs: { ...prefsRow, exp_range_low: 0, exp_range_high: 0, show_no_experience_jobs: true },
+    },
+    {
+      label: "unconfigured",
+      note: "a range nobody has set — must match NOTHING, in both languages",
+      prefs: {
+        ...prefsRow,
+        exp_range_low: null,
+        exp_range_high: null,
+        show_no_experience_jobs: true,
+      },
+    },
+  ];
 
-  const disagreements = jobs.filter(
-    (j) => fromPython.has(j.canonical_id) !== fromTs.has(j.canonical_id),
-  );
+  const pythonMatched = python({ variants: VARIANTS, jobs }).matched;
+  let drifted = 0;
 
-  for (const job of disagreements) {
-    const py = fromPython.has(job.canonical_id);
-    console.log(`  DRIFT  ${job.company} — ${job.title}`);
-    console.log(`         python says ${py ? "MATCH" : "no"}, typescript says ${py ? "no" : "MATCH"}`);
-    console.log(`         ts reason: ${explain(job, prefsRow).reason}`);
+  console.log("prefs matrix — the same open rows under four experience filters:");
+  const perVariant: Set<string>[] = [];
+
+  for (const [i, variant] of VARIANTS.entries()) {
+    const fromPy = new Set(pythonMatched[i]);
+    const fromTsVariant = new Set(
+      jobs.filter((j) => isMatch(j, variant.prefs)).map((j) => j.canonical_id),
+    );
+    perVariant.push(fromTsVariant);
+
+    const disagree = jobs.filter(
+      (j) => fromPy.has(j.canonical_id) !== fromTsVariant.has(j.canonical_id),
+    );
+    drifted += disagree.length;
+
+    const verdict = disagree.length ? `DRIFT x${disagree.length}` : "agree";
+    console.log(
+      `  ${variant.label.padEnd(18)} py ${String(fromPy.size).padStart(4)}  ` +
+        `ts ${String(fromTsVariant.size).padStart(4)}  ${verdict}`,
+    );
+    console.log(`  ${"".padEnd(18)} ${variant.note}`);
+
+    for (const job of disagree) {
+      const py = fromPy.has(job.canonical_id);
+      console.log(`    DRIFT  ${job.company} — ${job.title}`);
+      console.log(
+        `           python says ${py ? "MATCH" : "no"}, typescript says ${py ? "no" : "MATCH"}`,
+      );
+      console.log(`           ts reason: ${explain(job, variant.prefs).reason}`);
+    }
   }
+
+  // The unconfigured variant is not merely compared between the two languages —
+  // both agreeing on a wrong answer would pass that. It is asserted to be EMPTY,
+  // because "an unset range matches nothing" is the property, and a fallback to the
+  // install's 0-2 would make both sides agree on ~38 matches instead.
+  const unconfigured = perVariant[3].size;
+  if (unconfigured !== 0) {
+    console.error(
+      `\nUNCONFIGURED RANGE MATCHED ${unconfigured} job(s). An unset experience range ` +
+        `must match nothing — see notify/match.experience_excluded. Both languages ` +
+        `agreeing on this number would still be the wrong answer.`,
+    );
+    process.exitCode = 1;
+  }
+
+  // The live row's verdict is what the rest of the report describes: the per-company
+  // breakdown, the "For you" total, and the number this script exists to be
+  // comparable with (preview_digest.py). The other three variants are checked above
+  // and deliberately do not appear below — they are hypotheticals, not this
+  // account's inbox.
+  const fromTs = perVariant[0];
+  console.log("");
 
   const byCompany = new Map<string, number>();
   let unchecked = 0;
@@ -210,15 +309,18 @@ async function main() {
     `\nCompare with: python scripts/preview_digest.py --dry-run --ignore-notified --no-descriptions`,
   );
 
-  if (disagreements.length) {
+  if (drifted) {
     console.error(
-      `\n${disagreements.length} disagreement(s). lib/match.ts and notify/match.py do not ` +
-        `agree — fix the port, or change both deliberately.`,
+      `\n${drifted} disagreement(s) across the matrix. lib/match.ts and notify/match.py ` +
+        `do not agree — fix the port, or change both deliberately.`,
     );
     process.exitCode = 1;
     return;
   }
-  console.log(`\nOK — ${jobs.length} live rows, both implementations agree on every one.`);
+  console.log(
+    `\nOK — ${jobs.length} live rows x ${VARIANTS.length} filters, both implementations ` +
+      `agree on every one.`,
+  );
 }
 
 main()

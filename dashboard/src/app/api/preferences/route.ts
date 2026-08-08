@@ -37,9 +37,13 @@ export async function GET() {
  *     goes quiet and looks like "nothing was posted" rather than "you broke the
  *     filter";
  *   - a city label outside CITY_LABELS can never equal jobs.city, so it is a
- *     typo that costs a week of empty digests before anyone notices.
+ *     typo that costs a week of empty digests before anyone notices;
+ *   - an incomplete EXPERIENCE RANGE matches no job at all either, since Phase 3
+ *     Slice 2 — see the block below, which is the third member of exactly this
+ *     family rather than a new kind of rule.
  *
- * Exclusions may be empty — that is a real, meaningful choice.
+ * Exclusions may be empty — that is a real, meaningful choice. So is
+ * years_of_experience_held, which is informational and never filters.
  *
  * SINCE SLICE 1 THIS IS ALSO THE KEYWORD CAP, and it is here rather than only in
  * the editor because the editor is a convenience and this is the rule. It is
@@ -98,16 +102,96 @@ export async function PUT(request: Request) {
     return badRequest("max_level must be an integer from 0 to 5");
   }
 
+  /*
+   * THE EXPERIENCE RANGE — REQUIRED, and it belongs in the same paragraph of the
+   * doc comment above as the empty-cities and empty-keywords rules, because it is
+   * the same failure. lib/match.experienceExcluded treats an unconfigured range as
+   * "matches nothing", so a row saved without one would produce a digest that goes
+   * quiet and reads as "nothing was posted" rather than "the filter is unset".
+   *
+   * This refusal is also what makes "onboarded implies configured" true: this
+   * route is the only writer of these columns AND of onboarding_completed, so a
+   * save that gets past here is the only way an account becomes onboarded.
+   *
+   * EXPLICIT null / undefined CHECKS BEFORE Number(), because Number(null) is 0
+   * and Number(undefined) is NaN. Without them a missing exp_range_low would be
+   * accepted as a perfectly valid 0 — a filter silently widened to include
+   * everything from zero years, which is the shape of failure this file's
+   * validation exists to catch rather than commit.
+   */
+  const RANGE_CEILING = 20;
+  if (body.exp_range_low === null || body.exp_range_low === undefined ||
+      body.exp_range_high === null || body.exp_range_high === undefined) {
+    return badRequest(
+      "an experience range is required — an unset range matches no job at all. " +
+        "Give exp_range_low and exp_range_high as whole years.",
+    );
+  }
+  const expLow = Number(body.exp_range_low);
+  const expHigh = Number(body.exp_range_high);
+  if (!Number.isInteger(expLow) || expLow < 0 || expLow > RANGE_CEILING) {
+    return badRequest(`exp_range_low must be a whole number of years from 0 to ${RANGE_CEILING}`);
+  }
+  if (!Number.isInteger(expHigh) || expHigh < 0 || expHigh > RANGE_CEILING) {
+    return badRequest(`exp_range_high must be a whole number of years from 0 to ${RANGE_CEILING}`);
+  }
+  if (expLow > expHigh) {
+    return badRequest(
+      `the experience range is inverted: ${expLow} to ${expHigh}. The low end must not ` +
+        `exceed the high end (they may be equal, which looks for exactly that year).`,
+    );
+  }
+
+  /*
+   * A STRICT BOOLEAN RATHER THAN A TRUTHINESS TEST. A PUT is a full document, so
+   * treating an absent field as FALSE would be defensible in general — and here it
+   * would hide every job whose description states no minimum, which on the live
+   * database is 99% of the open board. A filter that empties itself because a
+   * field was omitted is not a thing to infer, so it is refused instead.
+   */
+  if (typeof body.show_no_experience_jobs !== "boolean") {
+    return badRequest(
+      "show_no_experience_jobs must be true or false — it decides what happens to " +
+        "jobs whose description states no minimum, which is most of them",
+    );
+  }
+  const showNoExperienceJobs = body.show_no_experience_jobs;
+
+  /*
+   * OPTIONAL, AND NEVER CHECKED AGAINST THE RANGE. This is how much experience the
+   * person HAS; the range is what they are LOOKING FOR, and the two are
+   * independent — holding five years and looking at 0-2 roles is a legitimate
+   * answer, not a contradiction to validate away. It filters nothing (see
+   * lib/preferences.savePreferences), so null is a permanent legitimate value.
+   */
+  const heldRaw = body.years_of_experience_held;
+  let yearsHeld: number | null = null;
+  if (heldRaw !== null && heldRaw !== undefined && heldRaw !== "") {
+    yearsHeld = Number(heldRaw);
+    if (!Number.isInteger(yearsHeld) || yearsHeld < 0 || yearsHeld > 50) {
+      return badRequest("years_of_experience_held must be null or a whole number from 0 to 50");
+    }
+  }
+
   try {
     const preferences = await savePreferences(gate.session.userId, {
       cities,
       keywords,
       exclusions,
       max_level: maxLevel,
+      exp_range_low: expLow,
+      exp_range_high: expHigh,
+      years_of_experience_held: yearsHeld,
+      show_no_experience_jobs: showNoExperienceJobs,
     });
     return NextResponse.json({
       preferences,
-      message: `Saved. ${keywords.length} keyword(s), ${cities.length} cit(y/ies), ${exclusions.length} exclusion(s), max_level ${maxLevel}. The next digest uses this.`,
+      message:
+        `Saved. ${keywords.length} keyword(s), ${cities.length} cit(y/ies), ` +
+        `${exclusions.length} exclusion(s), max_level ${maxLevel}, ` +
+        `looking for ${expLow}-${expHigh} years` +
+        `${showNoExperienceJobs ? ", including" : ", excluding"} jobs that state no minimum. ` +
+        `The next digest uses this.`,
     });
   } catch (err) {
     return serverError(err, "PUT /api/preferences");

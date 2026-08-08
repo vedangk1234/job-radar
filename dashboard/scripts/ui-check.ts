@@ -44,6 +44,8 @@
 import { config } from "dotenv";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+// See the stub-router note in the experience-panel section for why this is needed.
+import { AppRouterContext } from "next/dist/shared/lib/app-router-context.shared-runtime";
 
 import { CompanyList } from "../src/components/CompanyList";
 import { JobLine, type Mode } from "../src/components/JobLine";
@@ -88,17 +90,26 @@ type Lib = {
    * `DASHBOARD_DB_URL is not set` before the first assertion.
    */
   DeleteAccount: typeof import("../src/components/DeleteAccount").DeleteAccount;
+  /**
+   * Deferred like DeleteAccount, and for a nearer-miss version of the same reason:
+   * PreferencesEditor imports ResumePanel, which reaches the upload route's types.
+   * It is here rather than statically imported so nothing in its graph can build a
+   * pool before loadEnv().
+   */
+  PreferencesEditor: typeof import("../src/components/PreferencesEditor").PreferencesEditor;
 };
 
 async function loadLib(): Promise<Lib> {
-  const [db, currentUser, jobs, companies, preferences, deleteAccount] = await Promise.all([
-    import("../src/lib/db"),
-    import("./current-user"),
-    import("../src/lib/jobs"),
-    import("../src/lib/companies"),
-    import("../src/lib/preferences"),
-    import("../src/components/DeleteAccount"),
-  ]);
+  const [db, currentUser, jobs, companies, preferences, deleteAccount, editor] =
+    await Promise.all([
+      import("../src/lib/db"),
+      import("./current-user"),
+      import("../src/lib/jobs"),
+      import("../src/lib/companies"),
+      import("../src/lib/preferences"),
+      import("../src/components/DeleteAccount"),
+      import("../src/components/PreferencesEditor"),
+    ]);
   return {
     sql: db.sql,
     currentUserId: currentUser.currentUserId,
@@ -107,6 +118,7 @@ async function loadLib(): Promise<Lib> {
     listCompanyCards: companies.listCompanyCards,
     loadPreferences: preferences.loadPreferences,
     DeleteAccount: deleteAccount.DeleteAccount,
+    PreferencesEditor: editor.PreferencesEditor,
   };
 }
 
@@ -468,6 +480,127 @@ async function main() {
   check(
     resumeStuck.includes("Nothing was deleted"),
     "a failed resume erasure says NOTHING was deleted, first",
+  );
+
+  /*
+   * --- Preferences — the experience panel, Phase 3 Slice 2 -----------------
+   *
+   * THIS SECTION EXISTS FOR THE REASON THIS WHOLE SCRIPT DOES. The Applied
+   * checkbox and the badges were specified, agreed and never built, and nothing in
+   * the repo could tell a rendered feature from a designed one — a typechecker
+   * proves the props line up and a test proves the column exists, and neither
+   * proves a person opening the page sees a control. The experience rule is now
+   * REQUIRED to finish onboarding, so a panel that failed to render would not be a
+   * cosmetic gap: it would be an account that cannot complete setup and cannot see
+   * why.
+   *
+   * Rendered from the SHIPPED component over a real preferences row, twice, for the
+   * two states that behave differently.
+   */
+  console.log("\nPreferences — the experience panel");
+
+  /*
+   * A STUB ROUTER, because PreferencesEditor calls useRouter() at the top of its
+   * body — it needs router.replace() to leave /onboarding after a successful save.
+   * Outside Next's own render there is no AppRouterContext, and useRouter() does not
+   * return null there, it throws "invariant expected app router to be mounted", so
+   * the render dies before a single assertion runs.
+   *
+   * Providing the context is the honest fix and the alternative was worse: making
+   * the hook conditional in the component so a test could skip it would be shaping
+   * shipped code around this harness, and hooks cannot be conditional anyway. The
+   * stub's methods are never called — nothing here saves — so they are deliberately
+   * no-ops rather than spies. What is being checked is the MARKUP.
+   */
+  const stubRouter = {
+    push: () => {},
+    replace: () => {},
+    refresh: () => {},
+    back: () => {},
+    forward: () => {},
+    prefetch: () => {},
+  };
+  const withRouter = (element: ReturnType<typeof createElement>) =>
+    renderToStaticMarkup(
+      createElement(AppRouterContext.Provider, { value: stubRouter as never }, element),
+    );
+
+  const configured = withRouter(
+    createElement(lib.PreferencesEditor, { initial: prefs, resume: null }),
+  );
+  check(
+    configured.includes("Experience"),
+    "the panel renders at all — there is an Experience heading",
+  );
+  check(
+    configured.includes('id="exp-low"') && configured.includes('id="exp-high"'),
+    "with both ends of the range as their own inputs",
+  );
+  check(
+    configured.includes('value="0"') && configured.includes('value="2"'),
+    "carrying this account's stored 0-2 rather than a placeholder",
+    "the stored range did not reach the inputs",
+  );
+  check(
+    configured.includes("Show jobs that don&#x27;t state a minimum") ||
+      configured.includes("Show jobs that don’t state a minimum"),
+    "and the no-minimum toggle, labelled in words rather than as a column name",
+  );
+  check(
+    /99%/.test(configured),
+    "whose hint states how much of the board it decides — the number is the reason the control matters",
+  );
+  check(
+    configured.includes('id="years-held"'),
+    "the informational years-held field is on the screen",
+  );
+  check(
+    /never filters/.test(configured),
+    "and says out loud that it never filters, so nobody reads it as part of the rule",
+  );
+
+  /*
+   * THE UNCONFIGURED ROW — a brand-new account, before onboarding. Two things must
+   * be true at once and they pull in opposite directions: the range must be BLANK
+   * (nothing was chosen, and a pre-filled 0-2 would be the operator's answer
+   * smuggled in), while the toggle must be pre-checked ON (the project's documented
+   * inclusion bias, which the column default of FALSE does not express). The column
+   * stays FALSE until a real save either way — this is a suggestion on a form, not
+   * a value in a database.
+   */
+  const blank = withRouter(
+    createElement(lib.PreferencesEditor, {
+      initial: {
+        ...prefs,
+        cities: [],
+        keywords: [],
+        exclusions: [],
+        exp_range_low: null,
+        exp_range_high: null,
+        years_of_experience_held: null,
+        show_no_experience_jobs: false,
+        onboarding_completed: false,
+      },
+      resume: null,
+    }),
+  );
+  check(
+    !/id="exp-low"[^>]*value="[^"]/.test(blank),
+    "a new account's range inputs are EMPTY — no operator default is pre-filled",
+    "something was pre-filled into exp-low",
+  );
+  check(
+    blank.includes("Fix the experience range to save"),
+    "and Save says why it is disabled, rather than being greyed for no stated reason",
+  );
+  check(
+    /Both ends of the range are needed/.test(blank),
+    "with the blank range named as the problem inline",
+  );
+  check(
+    (blank.match(/type="checkbox"[^>]*checked/g) ?? []).length >= 1,
+    "the no-minimum toggle is pre-checked ON despite the column being FALSE — a suggested answer",
+    "the toggle rendered unchecked, so a new account would hide 99% of the board by default",
   );
 
   // --- the ordering rule --------------------------------------------------

@@ -32,7 +32,9 @@ that, against information_schema, on the database that matters.
 from __future__ import annotations
 
 import dataclasses
+import io
 import re
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -72,21 +74,40 @@ JOB_COLUMNS = [
 
 NEW_COLUMNS = [name for name, *_ in PREFERENCE_COLUMNS] + [name for name, _ in JOB_COLUMNS]
 
-# THE COLUMNS SLICE 1 WIRED UP, and why this list exists rather than the sweep
-# below simply being deleted.
+# THE COLUMNS A FEATURE STEP HAS WIRED UP, and why this list exists rather than
+# the sweep below simply being deleted.
 #
 # Step 0 created twelve columns with no readers and asserted that none of them
 # had one. That assertion was never meant to hold forever — it holds until the
 # FEATURE step for a given column arrives, which is the step that owns the
-# migration proof for it. Phase 3 Slice 1 is that step for exactly one:
-# onboarding_completed, which lib/preferences.savePreferences now sets when a
-# person saves their own filter for the first time.
+# migration proof for it. Phase 3 Slice 1 was that step for onboarding_completed,
+# which lib/preferences.savePreferences sets when a person saves their own filter
+# for the first time.
 #
-# So the guard narrows by one name and goes on protecting the other eleven. The
-# alternative — dropping the test now that it has fired once — would retire the
-# whole guarantee on the day the first column was wired, which is the day it
-# starts being worth something.
-WIRED_UP = {"onboarding_completed"}
+# PHASE 3 SLICE 2 ADDS FOUR MORE, and they divide in a way worth keeping straight:
+#
+#   exp_range_low            read by notify.match.experience_excluded, its
+#   exp_range_high           TypeScript port, and the SQL prefilter in
+#   show_no_experience_jobs  lib/jobs.experienceClause. These genuinely decide.
+#
+#   years_of_experience_held informational. It appears in lib/preferences.ts and
+#                            lib/labels.ts because a person edits it on the
+#                            screen, and it must reach NO matcher — which the
+#                            sweep can no longer assert for it, so
+#                            test_the_informational_column_reaches_no_matcher
+#                            below replaces that coverage rather than losing it.
+#
+# So the guard narrows by five names and goes on protecting the other seven. The
+# alternative — dropping the test now that it has fired — would retire the whole
+# guarantee on the day the first column was wired, which is the day it starts
+# being worth something.
+WIRED_UP = {
+    "onboarding_completed",
+    "exp_range_low",
+    "exp_range_high",
+    "show_no_experience_jobs",
+    "years_of_experience_held",
+}
 
 STILL_UNWIRED = [c for c in NEW_COLUMNS if c not in WIRED_UP]
 
@@ -140,6 +161,41 @@ def test_schema_adds_the_jobs_column(column: str, sql_type: str) -> None:
     assert pattern.search(SCHEMA), (
         f"db/schema.sql does not add jobs.{column} as a nullable {sql_type} with no default"
     )
+
+
+def _executable_text(path: Path) -> str:
+    """One source file with its comments and string literals removed.
+
+    A GENUINE STRIP RATHER THAN A LINE-PREFIX HEURISTIC, and the first draft of this
+    was the heuristic: it looked for lines not starting with a hash, a double slash
+    or a triple quote, and it failed immediately — on the CONTINUATION lines of a
+    Python docstring, which start with an ordinary word. (It also could not be
+    written down without breaking itself: spelling a triple quote inside a docstring
+    ends the docstring, which is the second thing that went wrong here.) The rule
+    being asserted is about what the module
+    DOES, and every module here explains what it deliberately does not do, at
+    length, naming the column while it does so. notify/match.Preferences' own
+    docstring says "years_of_experience_held is NOT here, and it is not an
+    oversight" — the clearest possible statement of the guarantee, and a
+    prose-blind test reads it as the breach.
+
+    Python goes through `tokenize`, which knows exactly which bytes are a COMMENT or
+    a STRING (docstrings included, being expression statements). TypeScript gets a
+    regex for `/* */` and `//`, which is enough here because these files carry no
+    string literal that could contain the name.
+    """
+    source = path.read_text(encoding="utf-8")
+
+    if path.suffix == ".py":
+        kept: list[str] = []
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type in (tokenize.COMMENT, tokenize.STRING):
+                continue
+            kept.append(token.string)
+        return "\n".join(kept)
+
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", "", source)
 
 
 def _step_zero_statements() -> str:
@@ -233,33 +289,111 @@ def test_the_job_write_paths_name_none_of_the_new_job_columns() -> None:
             )
 
 
-def test_the_filter_queries_name_none_of_the_new_preference_columns() -> None:
+def test_the_filter_queries_name_none_of_the_still_unwired_columns() -> None:
     """The two statements that decide what reaches an inbox, checked directly.
 
     Redundant with the file sweep above and deliberately kept: the sweep proves a
     file is clean, this proves the two specific statements are — and they are the
     ones whose text would have to change for a digest to come out different.
+
+    STILL_UNWIRED RATHER THAN EVERY COLUMN, since Slice 2. PREFERENCES_SQL now
+    names the three experience columns on purpose, so iterating the full list would
+    fail on the very wiring this slice exists to do. The four remaining preference
+    columns (selected_cities, all_india, work_modes, salary_bands) are still
+    forbidden here, which is the half of the guarantee that has not expired.
     """
     for statement_name, statement in (
         ("notify.store.PREFERENCES_SQL", PREFERENCES_SQL),
         ("notify.store.CANDIDATES_SQL", CANDIDATES_SQL),
     ):
-        for column, *_ in PREFERENCE_COLUMNS:
+        for column in STILL_UNWIRED:
             assert not re.search(rf"\b{re.escape(column)}\b", statement), (
                 f"{statement_name} names preferences.{column}"
             )
 
 
-def test_the_matcher_value_object_still_has_exactly_four_fields() -> None:
+def test_the_queue_still_names_no_experience_column_at_all() -> None:
+    """CANDIDATES_SQL is exempt from the wiring, and that is not an oversight.
+
+    The queue answers "is this job eligible for this person" — open, watched, not
+    back catalogue, not already sent. Whether the job is INTERESTING is
+    notify/match.py's question, applied in Python over the rows this returns, and
+    the experience rule is squarely the second kind. Pushing it into the queue
+    would put the same rule in a third place (it is already in Python and, for the
+    dashboard's prefilter, in SQL) with no check comparing them.
+
+    So the three wired columns are asserted ABSENT here even though they are
+    present in PREFERENCES_SQL, which the sweep above can no longer say for them.
+    """
+    for column in ("exp_range_low", "exp_range_high", "show_no_experience_jobs"):
+        assert not re.search(rf"\b{re.escape(column)}\b", CANDIDATES_SQL), (
+            f"notify.store.CANDIDATES_SQL names preferences.{column}. The queue decides "
+            f"ELIGIBILITY; notify/match.py decides interest, and the experience rule is "
+            f"the second kind."
+        )
+
+
+def test_the_informational_column_reaches_no_matcher() -> None:
+    """years_of_experience_held may be stored and shown, and never consulted.
+
+    THIS REPLACES THE SWEEP COVERAGE THE WIRED_UP EXEMPTION GIVES UP. The column is
+    now named in lib/preferences.ts (the SELECT and the UPDATE) and lib/labels.ts
+    (the row type), because a person edits it on the preferences screen — so the
+    file sweep above cannot forbid it any more. What must stay true is narrower and
+    more important: it is how much experience the person HAS, not what they are
+    looking for, and it must never decide whether a job is a match.
+
+    Enforced in four places, three of them structural rather than textual:
+    notify.match.Preferences has no such field (asserted below), lib/match.ts's
+    Preferences type has none, notify/store.PREFERENCES_SQL does not select it, and
+    this test forbids the name outright in every module that computes a verdict.
+
+    notify/store.py IS on the list even though it is a query module, because
+    PREFERENCES_SQL is what feeds the matcher: a column selected there could be
+    read by Preferences.from_row tomorrow with nothing else changing.
+    """
+    for relative_path in (
+        "notify/match.py",
+        "notify/store.py",
+        "dashboard/src/lib/match.ts",
+        "dashboard/src/lib/jobs.ts",
+        "dashboard/src/lib/badges.ts",
+    ):
+        source = _executable_text(PROJECT_ROOT / relative_path)
+        assert not re.search(r"\byears_of_experience_held\b", source), (
+            f"{relative_path} names years_of_experience_held in executable code. It is "
+            f"informational — how much experience the person HAS — and must never decide "
+            f"whether a job is a match. See the docstring above."
+        )
+
+
+def test_the_matcher_value_object_carries_exactly_the_seven_deciding_fields() -> None:
     """The last gate: even a loader that selected a new column could not use it.
 
-    notify.match.Preferences is frozen and is the only thing is_match reads. Four
-    fields is the whole filter as of Phase 2; a fifth appearing here means a
-    Phase-3 column reached the matcher, whatever the SQL says.
+    notify.match.Preferences is frozen and is the only thing is_match reads, so this
+    list IS the filter. It was four fields through Phase 2 and is seven since Slice
+    2; an eighth appearing means a column reached the matcher, whatever the SQL says.
+
+    THE EXACT LIST, NOT A COUNT, and the order is asserted too — a count would pass
+    if somebody swapped years_of_experience_held in for show_no_experience_jobs,
+    which is the one substitution that would be both easy to make and wrong in the
+    way that matters.
     """
     names = [f.name for f in dataclasses.fields(Preferences)]
-    assert names == ["cities", "keywords", "exclusions", "max_level"], (
-        f"notify.match.Preferences carries {names}; Phase 3 Step 0 must not add to it"
+    assert names == [
+        "cities",
+        "keywords",
+        "exclusions",
+        "max_level",
+        "exp_range_low",
+        "exp_range_high",
+        "show_no_experience_jobs",
+    ], f"notify.match.Preferences carries {names}"
+
+    assert "years_of_experience_held" not in names, (
+        "years_of_experience_held is on notify.match.Preferences. It is informational "
+        "— how much experience the person HAS — and putting it where is_match can "
+        "reach it makes 'it never filters' a promise instead of a property."
     )
 
 

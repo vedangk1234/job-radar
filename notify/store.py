@@ -70,8 +70,24 @@ from .match import Preferences
 # either one parameter or a list of records through executemany, and the chunking
 # that a digest's worth of ids genuinely needs lives with the statement that
 # needs it — db/notifications.record_notified.
+# SEVEN COLUMNS SINCE PHASE 3 SLICE 2, and the one it still does not name.
+#
+# The three experience columns arrived empty in Step 0 and are read here for the
+# first time: exp_range_low / exp_range_high are the looking range, and
+# show_no_experience_jobs decides what a NULL jobs.min_experience means for this
+# account. notify/match.experience_excluded is what does something with them.
+#
+# years_of_experience_held IS DELIBERATELY NOT SELECTED. It is how much experience
+# the person HAS rather than what they are looking for, it is informational, and
+# it must never filter anything — so the statement that feeds the matcher does not
+# fetch it, notify.match.Preferences has no field for it, and
+# tests/test_phase3_columns.py asserts textually that no matcher in either
+# language names it. Three independent reasons it cannot reach a verdict, none of
+# which is somebody remembering.
 PREFERENCES_SQL = (
-    "SELECT cities, keywords, exclusions, max_level FROM preferences WHERE user_id = $1"
+    "SELECT cities, keywords, exclusions, max_level, "
+    "exp_range_low, exp_range_high, show_no_experience_jobs "
+    "FROM preferences WHERE user_id = $1"
 )
 
 # Asked only when the statement above found nothing, and only to tell two very
@@ -103,8 +119,15 @@ UNOWNED_PREFERENCES_SQL = "SELECT count(*) FROM preferences WHERE user_id IS NUL
 # ORDER BY u.id so a pass is deterministic. Nothing depends on the order — the
 # candidate test is an OR over all of them — but a run whose output moves between
 # invocations for no reason is harder to compare against yesterday's.
+#
+# THE SAME SEVEN COLUMNS AS PREFERENCES_SQL, which is not a coincidence to be
+# tidied later: both build a notify.match.Preferences, so a column one of them
+# selects and the other does not is a filter that means two things depending on
+# which entry point loaded it. The enrichment union would then narrow on a rule
+# the digest does not apply, or the reverse.
 ACTIVE_PREFERENCES_SQL = """
-SELECT p.cities, p.keywords, p.exclusions, p.max_level
+SELECT p.cities, p.keywords, p.exclusions, p.max_level,
+       p.exp_range_low, p.exp_range_high, p.show_no_experience_jobs
   FROM preferences p
   JOIN public.users u ON u.id = p.user_id
  WHERE u.is_active = TRUE

@@ -49,9 +49,25 @@ async function explainMissingRow(): Promise<never> {
   );
 }
 
+/**
+ * TEN COLUMNS SINCE SLICE 2, and the four new ones split two ways.
+ *
+ * exp_range_low, exp_range_high and show_no_experience_jobs are read by the RULES
+ * (lib/match.experienceExcluded) as well as shown on the screen.
+ * years_of_experience_held is read by the SCREEN ONLY — it is how much experience
+ * the person has, it never filters, and lib/match.Preferences has no field for it
+ * so no rule can reach it. Selected here because the editor has to render it.
+ *
+ * Still an explicit column list, as Step 0 warned: a SELECT * over this table
+ * would drag the five columns no feature step has wired up into a type that
+ * describes a filter.
+ */
 export async function loadPreferences(userId: string): Promise<Preferences> {
   const [row] = await sql<Preferences[]>`
-    SELECT cities, keywords, exclusions, max_level, updated_at, onboarding_completed
+    SELECT cities, keywords, exclusions, max_level,
+           exp_range_low, exp_range_high, years_of_experience_held,
+           show_no_experience_jobs,
+           updated_at, onboarding_completed
       FROM preferences
      WHERE user_id = ${userId}
   `;
@@ -105,6 +121,19 @@ export async function onboardingCompleted(userId: string): Promise<boolean> {
  * The column list on the RETURNING is explicit, as it has been since Step 0
  * warned that a SELECT * over this table would drag eight unread onboarding
  * columns into a type that describes a filter.
+ *
+ * THE RANGE PARAMETERS ARE `number`, NOT `number | null`, AND THAT IS THE
+ * INVARIANT MADE STRUCTURAL. An unconfigured range means "matches nothing"
+ * (lib/match.experienceExcluded), so an ONBOARDED account must never have one —
+ * and this is the only statement that writes either column or
+ * onboarding_completed, so "onboarded implies configured" holds if and only if
+ * this function cannot write a NULL. The type is what says it cannot; the route
+ * above it rejects the request with a reason a person can read; and
+ * `npm run onboarding-check` asserts the result against the live database. Three
+ * layers, because the failure would be a silently empty digest.
+ *
+ * years_of_experience_held IS nullable here, deliberately. It never filters, so
+ * "not stated" is a legitimate permanent answer rather than a broken filter.
  */
 export async function savePreferences(
   userId: string,
@@ -113,18 +142,29 @@ export async function savePreferences(
     keywords: string[];
     exclusions: string[];
     max_level: number;
+    exp_range_low: number;
+    exp_range_high: number;
+    years_of_experience_held: number | null;
+    show_no_experience_jobs: boolean;
   },
 ): Promise<Preferences> {
   const [row] = await sql<Preferences[]>`
     UPDATE preferences
-       SET cities               = ${next.cities}::text[],
-           keywords             = ${next.keywords}::text[],
-           exclusions           = ${next.exclusions}::text[],
-           max_level            = ${next.max_level},
-           onboarding_completed = TRUE,
-           updated_at           = now()
+       SET cities                   = ${next.cities}::text[],
+           keywords                 = ${next.keywords}::text[],
+           exclusions               = ${next.exclusions}::text[],
+           max_level                = ${next.max_level},
+           exp_range_low            = ${next.exp_range_low},
+           exp_range_high           = ${next.exp_range_high},
+           years_of_experience_held = ${next.years_of_experience_held},
+           show_no_experience_jobs  = ${next.show_no_experience_jobs},
+           onboarding_completed     = TRUE,
+           updated_at               = now()
      WHERE user_id = ${userId}
-    RETURNING cities, keywords, exclusions, max_level, updated_at, onboarding_completed
+    RETURNING cities, keywords, exclusions, max_level,
+              exp_range_low, exp_range_high, years_of_experience_held,
+              show_no_experience_jobs,
+              updated_at, onboarding_completed
   `;
   if (!row) return explainMissingRow();
   return row;

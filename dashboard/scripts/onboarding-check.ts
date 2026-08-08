@@ -189,17 +189,28 @@ async function main() {
   // field, so "unaffected" is a before/after rather than an assurance.
   console.log("\n§2 the existing account, before");
   const operatorId = await lib.currentUserId();
+  // The four Slice-2 columns are IN the snapshot, because they are now part of what
+  // decides this account's digest. Its range was seeded to (0, 2) by
+  // scripts/backfill_onboarding_prefs.py precisely to reproduce the ceiling that
+  // used to be a constant, so a script that moved it would silently change which
+  // jobs the operator is emailed — the exact thing §7 exists to rule out.
   type Snapshot = {
     onboarding_completed: boolean;
     keywords: string[];
     cities: string[];
     exclusions: string[];
     max_level: number;
+    exp_range_low: number | null;
+    exp_range_high: number | null;
+    years_of_experience_held: number | null;
+    show_no_experience_jobs: boolean;
     updated_at: string;
   };
   const snapshot = async (): Promise<Snapshot> => {
     const [row] = await sql<Snapshot[]>`
-      SELECT onboarding_completed, keywords, cities, exclusions, max_level, updated_at
+      SELECT onboarding_completed, keywords, cities, exclusions, max_level,
+             exp_range_low, exp_range_high, years_of_experience_held,
+             show_no_experience_jobs, updated_at
         FROM preferences WHERE user_id = ${operatorId}
     `;
     return row;
@@ -339,6 +350,14 @@ async function main() {
       keywords: ["backend engineer"],
       exclusions: ["intern"],
       max_level: 3,
+      // Phase 3 Slice 2's four. The range is deliberately NOT (0, 2): that is the
+      // install's own answer, and passing it here would let a regression where the
+      // save ignored these fields and left the operator's mirror in place go
+      // unnoticed. 1-4 is a value only a person could have chosen.
+      exp_range_low: 1,
+      exp_range_high: 4,
+      years_of_experience_held: 3,
+      show_no_experience_jobs: false,
     });
 
     check(saved.keywords.length === 1, "it stored the one keyword the person chose");
@@ -348,8 +367,50 @@ async function main() {
       `got [${saved.cities.join(", ")}] / [${saved.exclusions.join(", ")}] / ${saved.max_level}`,
     );
     check(
+      saved.exp_range_low === 1 && saved.exp_range_high === 4,
+      "and the experience range they chose, rather than the install's 0-2",
+      `got ${saved.exp_range_low}..${saved.exp_range_high}`,
+    );
+    check(
+      saved.years_of_experience_held === 3 && saved.show_no_experience_jobs === false,
+      "and the years they hold and their no-minimum answer, both off the default",
+      `got held=${saved.years_of_experience_held} show=${saved.show_no_experience_jobs}`,
+    );
+    check(
       saved.onboarding_completed === true,
       "and flipped onboarding_completed TRUE in the same statement",
+    );
+
+    /*
+     * THE SLICE-2 INVARIANT: ONBOARDED IMPLIES CONFIGURED.
+     *
+     * An unset experience range matches NOTHING (notify/match.experience_excluded),
+     * so an account that has passed the gate must never have one — otherwise the
+     * gate releases somebody straight onto a dashboard that shows zero matches and
+     * a digest that never arrives, with nothing anywhere reporting why.
+     *
+     * It is asserted here, against the live database, because it is a claim about a
+     * ROW rather than about TypeScript. Three things make it true and none of them
+     * can be checked by reading one file: this statement is the only writer of
+     * either column, PUT /api/preferences refuses an incomplete range, and that
+     * same save is the only writer of onboarding_completed. Read back from the
+     * database rather than from the RETURNING, so a column the UPDATE forgot to
+     * name would show up as NULL here.
+     */
+    const [persisted] = await sql<
+      { onboarding_completed: boolean; exp_range_low: number | null; exp_range_high: number | null }[]
+    >`
+      SELECT onboarding_completed, exp_range_low, exp_range_high
+        FROM preferences WHERE user_id = ${newUserId}
+    `;
+    check(
+      persisted.onboarding_completed === true &&
+        persisted.exp_range_low !== null &&
+        persisted.exp_range_high !== null,
+      "ONBOARDED IMPLIES CONFIGURED — the row that passed the gate has both range ends set, " +
+        "so it cannot be holding a filter that matches nothing",
+      `onboarded=${persisted.onboarding_completed} ` +
+        `exp=${persisted.exp_range_low}..${persisted.exp_range_high}`,
     );
 
     const gatedAfter = await onboardingCompleted(newUserId);
@@ -389,6 +450,23 @@ async function main() {
       [...after.exclusions].join() === [...before.exclusions].join() &&
       after.max_level === before.max_level,
     "as are its cities, exclusions and max_level",
+  );
+  check(
+    after.exp_range_low === before.exp_range_low &&
+      after.exp_range_high === before.exp_range_high &&
+      after.years_of_experience_held === before.years_of_experience_held &&
+      after.show_no_experience_jobs === before.show_no_experience_jobs,
+    `and so is its experience rule — still ${before.exp_range_low}..${before.exp_range_high} ` +
+      `with show_no_experience_jobs ${before.show_no_experience_jobs}`,
+    `now ${after.exp_range_low}..${after.exp_range_high} show=${after.show_no_experience_jobs}`,
+  );
+  check(
+    before.exp_range_low === 0 &&
+      before.exp_range_high === 2 &&
+      before.show_no_experience_jobs === true,
+    "and that rule is the one that reproduces the pre-Slice-2 ceiling: 0-2, unknowns kept",
+    `got ${before.exp_range_low}..${before.exp_range_high} ` +
+      `show=${before.show_no_experience_jobs} — this account's digest has CHANGED`,
   );
   check(
     String(after.updated_at) === String(before.updated_at),

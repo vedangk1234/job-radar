@@ -1,5 +1,5 @@
 import { sql } from "./db";
-import { isMatch, MAX_MIN_EXPERIENCE, type Preferences } from "./match";
+import { isMatch, type Preferences } from "./match";
 
 /**
  * The jobs queries.
@@ -189,7 +189,7 @@ export async function openJobsForCompany(
  *   status = 'open'                          the lifecycle test
  *   city = ANY(preferences.cities)           city_ok
  *   is_pm_role = FALSE                       NOT pm_excluded
- *   min_experience IS NULL OR <= ceiling     NOT experience_excluded
+ *   the experience clause below               NOT experience_excluded
  *
  * The other three tests read the TITLE with word-boundary regexes and a level
  * detector that has to mask experience numbers first, and those stay in
@@ -221,10 +221,50 @@ export async function matchCandidates(
      WHERE j.status = 'open'
        AND j.city = ANY(${cities}::text[])
        AND j.is_pm_role = FALSE
-       AND (j.min_experience IS NULL OR j.min_experience <= ${MAX_MIN_EXPERIENCE})
+       AND ${experienceClause(prefs)}
        AND (${companyId}::int IS NULL OR j.company_id = ${companyId}::int)
      ORDER BY j.first_seen_at DESC, j.title ASC
   `;
+}
+
+/**
+ * NOT experience_excluded, in SQL — the transcription of
+ * lib/match.experienceExcluded, branch for branch.
+ *
+ * IT MUST BE EXACTLY AS WIDE AS THE MATCHER AND NEVER NARROWER. This clause is a
+ * prefilter: whatever it drops, lib/match.isMatch never sees, so a clause tighter
+ * than the rule silently deletes matches and the "for you" count is quietly wrong
+ * about what the digest would send. That is why it is three explicit branches
+ * rather than one clever expression.
+ *
+ * BRANCHED IN TYPESCRIPT RATHER THAN IN SQL, and this is the load-bearing part.
+ * The tempting one-liner is
+ *
+ *     (j.min_experience IS NULL AND ${prefs.show_no_experience_jobs})
+ *      OR j.min_experience BETWEEN ${low} AND ${high}
+ *
+ * which is correct today and correct BY ACCIDENT in the unconfigured case:
+ * `BETWEEN NULL AND NULL` evaluates to NULL, NULL is not TRUE, so the row is
+ * excluded — the right answer reached through three-valued logic that nobody
+ * reading it would have checked. A rule that holds by accident is one a later
+ * rewrite breaks without failing anything. So the range being unset is its own
+ * branch, saying FALSE out loud.
+ *
+ * Note also that BETWEEN already excludes NULL, which is why the toggle-off branch
+ * needs no `IS NOT NULL`: a NULL min_experience simply does not satisfy it.
+ */
+function experienceClause(prefs: Preferences) {
+  const { exp_range_low: low, exp_range_high: high } = prefs;
+
+  // Unconfigured range -> nothing matches. See notify/match.experience_excluded
+  // for why this is not a fallback to the install's 0..2, and why an onboarded
+  // account can never be in this state.
+  if (low === null || high === null) return sql`FALSE`;
+
+  if (prefs.show_no_experience_jobs) {
+    return sql`(j.min_experience IS NULL OR j.min_experience BETWEEN ${low} AND ${high})`;
+  }
+  return sql`j.min_experience BETWEEN ${low} AND ${high}`;
 }
 
 /** The matching jobs for one company: the SQL prefilter, then the title rules. */

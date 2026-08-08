@@ -27,10 +27,17 @@
  * -----------------------------
  * `desc_checked` is not consulted here, exactly as it is not consulted in
  * Python. An un-enriched row arrives with is_pm_role = FALSE and
- * min_experience = NULL, and both of those already mean KEEP — the inclusion
- * bias the Python module states outright. So "description never read" and
- * "description read, nothing disqualifying found" produce the same verdict, and
- * the dashboard shows the same set either way. What the dashboard does extra is
+ * min_experience = NULL, and neither of those is disqualifying on its own. So
+ * "description never read" and "description read, nothing disqualifying found"
+ * produce the same verdict, and the dashboard shows the same set either way.
+ *
+ * WHAT CHANGED IN SLICE 2: a NULL min_experience is no longer KEEP
+ * unconditionally. It defers to preferences.show_no_experience_jobs, so the two
+ * states above still agree with each other — they just now agree on whatever the
+ * account answered rather than always on "keep". `desc_checked` is still not
+ * consulted, which is the part this paragraph is about.
+ *
+ * What the dashboard does extra is
  * SAY SO: `descriptionHint` turns desc_checked = false into a visible
  * "desc not checked" note, so a match that rests on an unread description is
  * legible rather than implied. It changes the label, never the answer.
@@ -44,11 +51,27 @@
  * always was.
  */
 
+/**
+ * The filter, as the rules read it — SEVEN fields since Phase 3 Slice 2.
+ *
+ * `years_of_experience_held` is deliberately NOT here, matching
+ * notify.match.Preferences. It is informational (how much experience the person
+ * HAS) and must never filter, so it is kept off the type the rules read: a field
+ * that does not exist cannot be consulted by a rule added later. lib/labels
+ * `Preferences` — the shape of the ROW, which the editor needs — does carry it,
+ * and is structurally assignable to this.
+ *
+ * The two range ends are nullable because NULL is meaningful on those columns:
+ * "this account has not configured a range". See experienceExcluded.
+ */
 export type Preferences = {
   cities: readonly string[];
   keywords: readonly string[];
   exclusions: readonly string[];
   max_level: number;
+  exp_range_low: number | null;
+  exp_range_high: number | null;
+  show_no_experience_jobs: boolean;
 };
 
 /** Anything with the columns the rules read. Both job shapes in the app satisfy it. */
@@ -61,12 +84,21 @@ export type MatchableJob = {
   desc_fetch_failed?: boolean | null;
 };
 
-/**
- * The ceiling on what a description may demand. A constant here because it is a
- * constant there — notify/match.MAX_MIN_EXPERIENCE. If it ever becomes a
- * preferences column it becomes one in both files on the same day.
+/*
+ * MAX_MIN_EXPERIENCE USED TO BE EXPORTED FROM HERE AND IS GONE.
+ *
+ * It was `2`, mirroring notify/match.MAX_MIN_EXPERIENCE, whose comment said "if
+ * it ever becomes a preferences column it becomes one in both files on the same
+ * day". Phase 3 Slice 2 is that day: the ceiling is now
+ * preferences.exp_range_high, the rule is a range, and both files changed
+ * together. Deleted rather than left at 2 for the reason the Python states — a
+ * value nothing reads invites the next reader to assume something does.
+ *
+ * lib/jobs.ts imported it for the SQL prefilter and now builds that clause from
+ * the preferences row instead. The install's own default values live in
+ * lib/labels.DEFAULT_PREFERENCES, where tests/test_default_preferences.py
+ * compares them against the Python constants.
  */
-export const MAX_MIN_EXPERIENCE = 2;
 
 // --- word-boundary terms ---------------------------------------------------
 
@@ -238,14 +270,37 @@ export function minExperienceOf(job: MatchableJob): number | null {
   return Number.isFinite(years) ? Math.trunc(years) : null;
 }
 
-export function experienceExcluded(job: MatchableJob): boolean {
+/**
+ * The stated minimum is outside this account's looking range.
+ *
+ * Three branches, in the same order and with the same answers as
+ * notify.match.experience_excluded — read that for the reasoning. In short: an
+ * unconfigured range excludes everything (never a fallback to the install's 0..2,
+ * which would be handing this account somebody else's answer); an unknown minimum
+ * defers to `show_no_experience_jobs`; and a confident number must sit inside the
+ * range, ends inclusive, which drops a posting for being too junior as well as
+ * too senior.
+ *
+ * THE ORDER MATTERS AND THE PYTHON HAD IT WRONG FIRST. Checking the unknown
+ * minimum before the unconfigured range means an account with no range but the
+ * toggle on keeps every job whose description states no minimum — 99% of the open
+ * board — so "matches nothing" silently becomes "matches almost everything".
+ * lib/jobs.experienceClause is the third statement of this rule and must agree
+ * with both.
+ */
+export function experienceExcluded(job: MatchableJob, prefs: Preferences): boolean {
+  const { exp_range_low: low, exp_range_high: high } = prefs;
+  if (low === null || high === null) return true;
+
   const years = minExperienceOf(job);
-  return years !== null && years > MAX_MIN_EXPERIENCE;
+  if (years === null) return !prefs.show_no_experience_jobs;
+
+  return !(low <= years && years <= high);
 }
 
-/** The title stage AND NOT a PM role AND NOT a 3+-years role. */
+/** The title stage AND NOT a PM role AND NOT an out-of-range role. */
 export function isMatch(job: MatchableJob, prefs: Preferences): boolean {
-  return titleStageOk(job, prefs) && !pmExcluded(job) && !experienceExcluded(job);
+  return titleStageOk(job, prefs) && !pmExcluded(job) && !experienceExcluded(job, prefs);
 }
 
 export function selectMatches<T extends MatchableJob>(jobs: T[], prefs: Preferences): T[] {
@@ -292,9 +347,17 @@ export function explain(job: MatchableJob, prefs: Preferences): { matched: boole
   else if (level !== null && level > prefs.max_level)
     reason = `level ${level} above max_level ${prefs.max_level}`;
   else if (pmExcluded(job)) reason = "description frames this as a PM/management role";
-  else if (experienceExcluded(job))
-    reason = `minimum ${years} years above ceiling ${MAX_MIN_EXPERIENCE}`;
-  else reason = `matched ${keywordsHit.join(", ")}`;
+  else if (experienceExcluded(job, prefs)) {
+    // Four ways to fail one test. Worded exactly as notify/match.explain words
+    // them: match-parity prints this string when the two disagree, and a reason
+    // that reads differently from the Python's makes a real drift harder to see.
+    const { exp_range_low: low, exp_range_high: high } = prefs;
+    if (low === null || high === null) reason = "the looking range is not configured";
+    else if (years === null)
+      reason = "experience unknown, and this account hides jobs stating no minimum";
+    else if (years < low) reason = `minimum ${years} years below the looking range ${low}-${high}`;
+    else reason = `minimum ${years} years above the looking range ${low}-${high}`;
+  } else reason = `matched ${keywordsHit.join(", ")}`;
 
   return { matched: isMatch(job, prefs), reason };
 }
