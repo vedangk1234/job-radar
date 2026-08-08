@@ -2115,6 +2115,38 @@ Newest last. Append here as the project evolves.
   Deliberately **not** here: the onboarding form and its fields, matching, the
   crawler, the watch list, and city labelling.
 
+  `scripts/reset_unonboarded_prefs.py` is the manual half, in its own commit
+  after being run — the same ordering 1b and 1g used, and the sibling of
+  `reset_unonboarded_keywords.py` one slice later. A seeding fix reaches only the
+  accounts created after it, and the one account sitting mid-onboarding had been
+  created while the seed still supplied the three cities and fourteen exclusions.
+
+  Its guard is the 1b script's, widened to three value tests
+  (`onboarding_completed = FALSE` **and** `cities` **and** `exclusions` **and**
+  `max_level` each still exactly the seeded value, ordered equality throughout).
+  **The second clause is not theoretical on this database**, which is the detail
+  worth keeping: the operator kept the install's defaults, so its three values
+  match the seed byte for byte and the value tests ALONE select it. The preview
+  therefore prints what each clause matches in isolation — 1 row for the gate
+  alone, **2 for the values alone**, 1 for both — so "the first clause is what
+  excludes the operator" is a number rather than a paragraph. On its own, clause
+  2 would have blanked the filter the operator's digest runs on, and an empty
+  city list matches no job at all: a quiet inbox rather than an error.
+
+  **`max_level` is matched but never written**, the one asymmetry in that file.
+  A genuinely new account HAS `max_level` 2, because the seed omits the column and
+  the `NOT NULL DEFAULT 2` supplies it — so writing anything would move the row
+  away from what a fresh signup gets. The nine Step 0 columns needed nothing
+  either, checked rather than assumed: they were already blank on that account,
+  having been added after it was created. The script does not name them, because
+  a statement clearing an already-blank column can only ever do harm.
+
+  Run live before the commit: 1 row written, `cities` 3 → 0 and `exclusions`
+  14 → 0, `keywords` already 0, `max_level` still 2. The operator unchanged at
+  43/3/14/2. `updated_at` unstamped on both rows and asserted unmoved by id
+  afterwards — the screen shows it as "last saved" and this claims no edit
+  anybody made. A second preview matches 0 rows.
+
 **Pending**
 
 - **The nav does not know about the onboarding gate.** During setup the chrome
@@ -2123,24 +2155,6 @@ Newest last. Append here as the project evolves.
   reads no database at all today, so telling it would mean either a query per
   navigation or threading the flag out of a page into its own layout. It belongs
   with the shell work rather than with the gate.
-- **`scripts/reset_unonboarded_keywords.py` has to be run once**, or the account
-  already sitting mid-onboarding meets `/onboarding` holding 43 keywords and
-  must delete eighteen of them before it can save. Preview first (it writes
-  nothing without `--apply`).
-- **Slice 1c has the same residue, and it is one account wide.** A seeding fix
-  reaches only accounts created after it, so the one un-onboarded row already in
-  the database still carries the operator's **3 cities, 14 exclusions and
-  `max_level` 2** — its keywords were already cleared by the 1b script, which is
-  the only field that script knows about. Confirmed live: two accounts, the
-  operator's (onboarded, 43/3/14/2) and one un-onboarded (0/3/14/2). Nothing in
-  1c touches stored rows, deliberately — branch 3 is the only statement that
-  changed. Clearing the rest needs the 1b script's guard shape rather than a
-  blunt UPDATE: `onboarding_completed = FALSE` **and** each field still exactly
-  equal to the seeded value, because either clause alone would either wipe a
-  choice somebody typed and has not saved, or wipe the filter of an account that
-  kept the defaults on purpose. Low urgency — the onboarding screen overwrites
-  all four on the first save anyway, so the only cost is that the screen opens
-  pre-filled with answers the person did not give.
 - **The Add flow can still turn `tracked` back ON, and can rename a company.**
   The residual half of Slice 1a, deliberately left. `POST /api/companies` →
   `lib/companies.upsertCompany` carries
@@ -2198,6 +2212,23 @@ Newest last. Append here as the project evolves.
 
 - Deploy the dashboard to Vercel — **done.** It is deployed with Root Directory
   = `dashboard`, and the production OAuth redirect URI is registered.
+- `scripts/reset_unonboarded_keywords.py` — **run.** The 1b manual half, and the
+  evidence is stronger than the empty list it leaves behind, because an empty list
+  is also what the 1b *seeding* fix produces for an account created after it. This
+  account was created **2026-08-07 18:16 UTC**, about ten hours BEFORE that fix
+  shipped (`822166c`, 2026-08-08 04:34 UTC), so it was seeded with all 43 and its
+  keywords are now 0. And `preferences.updated_at` is still identical to the
+  account's `created_at` — never stamped, which is that script's deliberate
+  signature and rules out the other way the list could have emptied: a save
+  through the screen sets `onboarding_completed` TRUE and moves `updated_at`, and
+  the row is still FALSE.
+- `scripts/reset_unonboarded_prefs.py` — **run** (`ea17589`), clearing the 1c
+  residue on the same account. It went `cities` 3 → 0 and `exclusions` 14 → 0,
+  with `keywords` already 0 and `max_level` left at the schema default of 2, so it
+  now sits at exactly the row a brand-new signup gets. The operator's row is
+  unchanged at 43/3/14/2 with `updated_at` unmoved. A second preview matches
+  nothing. **No un-onboarded account now carries any part of the operator's
+  filter**, which is what Slices 1b and 1c together set out to be true.
 
 ---
 
