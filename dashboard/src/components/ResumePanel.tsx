@@ -127,7 +127,7 @@ export function ResumePanel({
         </span>
         <span className="muted small">
           {resume
-            ? "Replacing overwrites the stored file and suggests skills again."
+            ? "Replacing overwrites the stored file, and the keywords below become the new resume's skills."
             : "PDF or .docx — nothing is stored until it can be read."}
         </span>
       </label>

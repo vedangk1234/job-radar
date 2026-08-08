@@ -74,30 +74,38 @@ export function PreferencesEditor({
   const overCap = keywords.length > KEYWORD_CAP;
 
   /**
-   * Fold a resume's suggestions into the list already on screen.
+   * A parsed resume REPLACES the keyword list outright.
    *
-   * MERGE, NOT REPLACE, and the existing chips win the ties. Somebody who typed
-   * six keywords by hand and then uploaded a resume has not asked for those six
-   * to be thrown away — and replacing would do exactly that, silently, in
-   * response to an action about a file. So the current list keeps its order and
-   * its place, and suggestions fill whatever room is left.
+   * REPLACE, NOT MERGE, and it used to be the other way round. Merging read
+   * well — nobody who typed six keywords by hand asked for them to be thrown
+   * away — but it made the one action people actually perform impossible to
+   * perform: uploading a NEW resume because the old one was wrong. The chips
+   * are meant to describe the resume on file, and a fold left the previous
+   * resume's terms sitting in the list with nothing on screen saying which
+   * document they came from. Observed: a replacement resume reporting "13
+   * skills found" left the panel showing 25 of 25, twelve of them the old
+   * resume's. So the list becomes exactly what was read out of the file that
+   * was just uploaded.
    *
-   * STOPS AT THE CAP RATHER THAN GOING OVER IT. Suggestions are the one source
-   * that can produce more than a person asked for, so this is the one place
-   * where dropping the excess is right: nothing a human chose is lost, and the
-   * count says how many were left out. That is the opposite of the rule on the
-   * server, where truncating a list somebody submitted would be rewriting their
-   * filter — see the note in api/preferences/route.ts.
+   * ONLY ON A SUCCESSFUL PARSE, which is a property of the caller rather than
+   * of this function: ResumePanel throws before calling onKeywords if the route
+   * refused the file, so a rejected upload cannot clear a list. That ordering
+   * is the whole safety argument — a failed replace that wiped the filter would
+   * be worse than the merge this replaces.
+   *
+   * STILL CAPPED, for the same reason as before: suggestions are the one source
+   * that can produce more than a person asked for. The server already caps at
+   * extraction (api/resume/route.ts passes KEYWORD_CAP to extractSkills), and
+   * this restates it rather than trusting it, because the over-cap state is
+   * unsaveable and arriving in it through a file upload gives a person no way
+   * to see why. Truncating here is not the same act as truncating a list
+   * somebody SUBMITTED — see the note in api/preferences/route.ts.
+   *
+   * A person edits freely afterwards: add, remove and typing are untouched, and
+   * nothing is written until Save.
    */
-  function mergeSuggestions(suggested: string[]) {
-    setKeywords((current) => {
-      const merged = [...current];
-      for (const term of suggested) {
-        if (merged.length >= KEYWORD_CAP) break;
-        if (!merged.includes(term)) merged.push(term);
-      }
-      return merged;
-    });
+  function replaceWithSuggestions(suggested: string[]) {
+    setKeywords(suggested.slice(0, KEYWORD_CAP));
   }
 
   async function save() {
@@ -138,7 +146,7 @@ export function PreferencesEditor({
 
   return (
     <>
-      <ResumePanel initial={resume} onKeywords={mergeSuggestions} />
+      <ResumePanel initial={resume} onKeywords={replaceWithSuggestions} />
 
       <KeywordChips values={keywords} onChange={setKeywords} />
 
