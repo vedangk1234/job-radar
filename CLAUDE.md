@@ -2063,6 +2063,58 @@ Newest last. Append here as the project evolves.
   first would delete a list somebody had typed and not yet saved, the second
   would clear the filter of an account that kept the defaults on purpose.
 
+- **2026-08-08 — Phase 3 Slice 1c. The rest of the operator's filter comes off
+  the seed.** Slice 1b emptied `NEW_ACCOUNT_SEED.keywords` and deliberately left
+  `cities`, `exclusions` and `max_level` as this install's defaults. This finishes
+  that argument, because the argument was never about keywords in particular.
+
+  Slice 1b had two reasons and only the second was specific to that list: the 43
+  were somebody else's answer, **and** 43 is over `KEYWORD_CAP`, which made the
+  first save impossible. Reason 2 is what made keywords urgent; reason 1 is true
+  of every field on the row. A seeded `cities` of blr/pune/hyd is the operator's
+  answer to "where do you want to work"; a seeded `exclusions` of fourteen terms
+  silently drops every architect and analyst posting for somebody who may be
+  looking for exactly those; `max_level = 2` answers "how senior". None were
+  chosen by the person holding the account, and on the screen a default nobody
+  chose is indistinguishable from a decision they made.
+
+  `NEW_ACCOUNT_SEED` is now three empty lists and nothing else. **The spread came
+  out**, reversing 1b's decision on purpose: it existed to stop three copied
+  values drifting from the Python, and empty cannot drift — while a spread would
+  now be actively dangerous in the one direction that matters, since any field
+  added to `DEFAULT_PREFERENCES` later would arrive on new accounts as the
+  operator's answer, silently. `DEFAULT_PREFERENCES` itself is **untouched** and
+  keeps its meaning as the parity mirror of `notify/match.py`'s `DEFAULT_*`.
+
+  **Two of the blanks are absences rather than empty values, and both are forced
+  by the schema.** `max_level` is `INT NOT NULL DEFAULT 2`, so NULL cannot mean
+  "unset" — binding one would violate the constraint and fail the signup. Branch
+  3 therefore drops the column from its INSERT and lets the default supply it,
+  which is the only legal spelling of "nobody has answered this". The nine
+  columns Step 0 added already declare defaults that *are* blank (`'{}'`, `FALSE`,
+  NULL), so they were already reached by not being named — which is also what
+  keeps `link-user.ts` clean for `tests/test_phase3_columns.py`'s sweep. The
+  INSERT is now `(user_id, cities, keywords, exclusions)`, and a test asserts that
+  column list exactly.
+
+  **A blank row cannot be saved through `PUT /api/preferences`, and that is
+  correct rather than a bug.** That route refuses an empty `cities` or `keywords`
+  because either matches no job at all. The row never meets it: branch 3 inserts
+  directly, so signup does no validation and cannot fail on the seed, and
+  `onboarding_completed = FALSE` holds the account on `/onboarding` until a person
+  answers. The editor renders its city checkboxes from `CITY_LABELS` rather than
+  from the stored list, so an empty `cities` is fully selectable — there is no
+  dead end where a blank account cannot pick its way out.
+
+  `npm run onboarding-check` carries the proof: 32 assertions green against the
+  live database, including a direct read of the nine columns `loadPreferences`
+  does not select (a claim about the DATABASE, which no amount of reading
+  TypeScript could check). The operator's row was snapshotted before and after —
+  43 keywords, 3 cities, 14 exclusions, `max_level` 2, `updated_at` unmoved.
+
+  Deliberately **not** here: the onboarding form and its fields, matching, the
+  crawler, the watch list, and city labelling.
+
 **Pending**
 
 - **The nav does not know about the onboarding gate.** During setup the chrome
@@ -2075,6 +2127,20 @@ Newest last. Append here as the project evolves.
   already sitting mid-onboarding meets `/onboarding` holding 43 keywords and
   must delete eighteen of them before it can save. Preview first (it writes
   nothing without `--apply`).
+- **Slice 1c has the same residue, and it is one account wide.** A seeding fix
+  reaches only accounts created after it, so the one un-onboarded row already in
+  the database still carries the operator's **3 cities, 14 exclusions and
+  `max_level` 2** — its keywords were already cleared by the 1b script, which is
+  the only field that script knows about. Confirmed live: two accounts, the
+  operator's (onboarded, 43/3/14/2) and one un-onboarded (0/3/14/2). Nothing in
+  1c touches stored rows, deliberately — branch 3 is the only statement that
+  changed. Clearing the rest needs the 1b script's guard shape rather than a
+  blunt UPDATE: `onboarding_completed = FALSE` **and** each field still exactly
+  equal to the seeded value, because either clause alone would either wipe a
+  choice somebody typed and has not saved, or wipe the filter of an account that
+  kept the defaults on purpose. Low urgency — the onboarding screen overwrites
+  all four on the first save anyway, so the only cost is that the screen opens
+  pre-filled with answers the person did not give.
 - **The Add flow can still turn `tracked` back ON, and can rename a company.**
   The residual half of Slice 1a, deliberately left. `POST /api/companies` →
   `lib/companies.upsertCompany` carries

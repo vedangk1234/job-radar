@@ -131,39 +131,76 @@ export const DEFAULT_PREFERENCES = {
  * lib/link-user.ts branch 3 is the only reader, and this is the only thing it
  * reads.
  *
- * THE ONE DIFFERENCE FROM DEFAULT_PREFERENCES IS keywords, AND IT IS THE WHOLE
- * SLICE. A new account used to be handed all 43 of the operator's, which is
- * wrong twice over and the second way is worse than the first:
+ * IT IS BLANK ON EVERY FIELD, and that is the whole of it. Slice 1b emptied
+ * `keywords` alone and left cities, exclusions and max_level as this install's
+ * defaults; this slice finishes the argument Slice 1b started, because the
+ * argument was never about keywords in particular.
+ *
+ * WHY EMPTYING keywords WAS NEVER THE POINT. Slice 1b had two reasons and only
+ * the second was specific to that list:
  *
  *   1. They are somebody else's answer. A person signs up to be told about the
- *      jobs THEY want, and the screen that asks them is pre-filled with a filter
- *      tuned for one particular resume — so the honest starting point is nothing
- *      at all, and every keyword on the row afterwards is one they chose.
- *   2. 43 is over KEYWORD_CAP, and the save that trips the cap is the same save
- *      that sets onboarding_completed. So the seed refused the only act that can
- *      finish onboarding: a new account could not get past the setup screen
- *      without first deleting eighteen terms it had never typed. Empty is 0 of
- *      25, so that catch-22 cannot exist — an account starting here has room for
- *      the whole cap.
+ *      jobs THEY want, and the screen that asks them was pre-filled with a
+ *      filter tuned for one particular resume.
+ *   2. 43 was over KEYWORD_CAP, and the save that trips the cap is the same save
+ *      that sets onboarding_completed — so the seed refused the only act that
+ *      finishes onboarding.
  *
- * SPREAD, NOT A HAND-COPIED LITERAL. cities, exclusions and max_level are
- * deliberately unchanged, and re-typing them here is how the copy that nothing
- * compares drifts from the copy tests/test_default_preferences.py checks against
- * the Python. The spread says exactly what is true: a new account starts from
- * this install's defaults EXCEPT the one list it has to supply itself.
+ * Reason 2 is what made keywords urgent; reason 1 is true of every field on the
+ * row, and it is the one that decides what this constant should be. A seeded
+ * `cities` of blr/pune/hyd is the operator's answer to "where do you want to
+ * work". A seeded `exclusions` of fourteen terms is the operator's answer to
+ * "what should never reach you" — it silently drops every architect and analyst
+ * posting for somebody who may be looking for exactly those. `max_level = 2` is
+ * the operator's answer to "how senior". None of those were chosen by the person
+ * holding the account, and a default nobody chose is indistinguishable, on the
+ * screen and in the digest, from a decision they made.
  *
- * WHY THE OTHER THREE ARE NOT ALSO EMPTIED. cities is refused empty by
- * PUT /api/preferences (an empty city list matches no job at all) and three
- * cities are the entire scope of the product today, so blanking it would add a
- * second thing a new account must get right for no gain. exclusions is a
- * NARROWING list — empty means nothing is excluded by title — so blanking it
- * would widen a new person's first digest to the manager, sales and recruiter
- * titles max_level cannot catch, which is the opposite of a safe default. Both
- * are editable on the same screen the moment somebody disagrees.
+ * A HAND-WRITTEN LITERAL, NOT A SPREAD, WHICH REVERSES SLICE 1b's DECISION ON
+ * PURPOSE. The spread existed to stop three copied values drifting from the
+ * Python — a real hazard when the seed genuinely was the defaults. Empty cannot
+ * drift: there is no value here to disagree with notify/match.py about. Worse,
+ * a spread now would be actively dangerous in the one direction that matters —
+ * a field added to DEFAULT_PREFERENCES tomorrow would arrive on new accounts as
+ * the operator's answer, silently, which is precisely the bug this slice exists
+ * to end. Spelling the blanks out means a new field is absent from a new
+ * account's row until somebody deliberately adds it here.
+ *
+ * WHAT IS NOT HERE, AND WHY THAT IS THE BLANK RATHER THAN AN OMISSION:
+ *
+ *   - `max_level`. The column is `INT NOT NULL DEFAULT 2` (db/schema.sql), so
+ *     NULL is not a legal value for it and "unset" cannot be spelled that way.
+ *     The schema default IS the unset state, and branch 3 reaches it by leaving
+ *     the column out of its INSERT rather than by binding anything from here.
+ *     Naming it in this object would mean binding a number, and the only honest
+ *     number is the one the schema already supplies.
+ *   - The nine columns Phase 3 Step 0 added to preferences — the city selection,
+ *     the all-India switch, the work-mode and salary-band lists, the
+ *     no-experience switch, the three experience ints, and the onboarding flag.
+ *     Every one of them already declares a default that IS blank (`'{}'`,
+ *     `FALSE`, or NULL for the nullable ints), so an INSERT that does not name
+ *     them produces exactly the row this constant describes.
+ *
+ *     They are described here rather than listed by name on purpose, and this
+ *     file is one of the reasons: tests/test_phase3_columns.py sweeps every
+ *     module that decides anything — this one and lib/link-user.ts included — and
+ *     fails if it so much as mentions a column Step 0 created and no feature step
+ *     has yet wired up. A name in a comment is where the next edit starts.
+ *
+ * THE ROW THIS PRODUCES CANNOT BE SAVED AS-IS, AND THAT IS CORRECT.
+ * PUT /api/preferences refuses an empty `cities` and an empty `keywords`, because
+ * either matches no job at all. A brand-new account is therefore incomplete until
+ * onboarding, which is what onboarding is for: `onboarding_completed` is FALSE, so
+ * lib/guard.requirePage holds them on /onboarding until they answer. Nothing
+ * about signup depends on the row being savable — branch 3 writes it directly and
+ * never goes through that route — so a blank seed cannot fail a sign-in.
+ * `exclusions` stays legal empty either way; it is a narrowing list, and empty
+ * honestly means "this person has not said what to drop yet".
  */
 export const NEW_ACCOUNT_SEED = {
-  ...DEFAULT_PREFERENCES,
+  cities: [] as readonly string[],
   keywords: [] as readonly string[],
+  exclusions: [] as readonly string[],
 } as const;
 
 /**

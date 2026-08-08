@@ -20,6 +20,19 @@
  * validation rule in another — visible only by carrying an account from signup
  * through to a completed save, which is exactly what this does.
  *
+ * WHAT THE LATER SLICE ADDED. The seed is now blank on EVERY field, not just on
+ * keywords, so §1 and §4 assert emptiness rather than "the defaults came
+ * through". §4 additionally reads the nine columns loadPreferences does not
+ * select: those are blank because branch 3 declines to name them and their schema
+ * defaults are already empty, which is a claim about the DATABASE and therefore
+ * cannot be checked by reading TypeScript.
+ *
+ * A BLANK ROW IS NOT A SAVABLE ROW, AND THAT IS NOT A BUG THIS CHECKS FOR.
+ * PUT /api/preferences refuses an empty cities or keywords list, so the row branch
+ * 3 writes would be rejected by that route. It never meets it: the INSERT is
+ * direct, signup does no validation, and onboarding_completed = FALSE holds the
+ * account on /onboarding until a person answers — which §6 then does.
+ *
  * WHAT IT RUNS, AND WHY IT RUNS THE REAL THING
  * --------------------------------------------
  * lib/link-user.linkUser, lib/preferences.loadPreferences,
@@ -143,20 +156,31 @@ async function main() {
     DEFAULT_PREFERENCES.keywords.length > KEYWORD_CAP,
     `the old seed really was unsavable — DEFAULT_PREFERENCES.keywords is ${DEFAULT_PREFERENCES.keywords.length}, over the cap of ${KEYWORD_CAP}`,
   );
-  // The spread, asserted rather than read off the page: the three fields this
-  // slice did NOT change must still be the install's defaults, which is what
-  // stops a hand-copied literal drifting from the Python.
+  // BLANK ON EVERY FIELD, and asserted against DEFAULT_PREFERENCES rather than
+  // only against zero. "Empty" and "not the operator's" are two different claims:
+  // a seed could be emptied here and re-filled from the defaults by a spread
+  // somebody added back, so each field is checked to be empty AND the constant it
+  // used to copy is checked to be non-empty — otherwise these all pass vacuously
+  // the day DEFAULT_PREFERENCES itself is blanked.
   check(
-    [...NEW_ACCOUNT_SEED.cities].join() === [...DEFAULT_PREFERENCES.cities].join(),
-    `cities is untouched (${NEW_ACCOUNT_SEED.cities.join(", ")})`,
+    NEW_ACCOUNT_SEED.cities.length === 0,
+    "NEW_ACCOUNT_SEED.cities is empty — nobody is told where they want to work",
+    `got [${NEW_ACCOUNT_SEED.cities.join(", ")}]`,
   );
   check(
-    [...NEW_ACCOUNT_SEED.exclusions].join() === [...DEFAULT_PREFERENCES.exclusions].join(),
-    `exclusions is untouched (${NEW_ACCOUNT_SEED.exclusions.length} terms)`,
+    NEW_ACCOUNT_SEED.exclusions.length === 0,
+    "NEW_ACCOUNT_SEED.exclusions is empty — no title is dropped on a new account's behalf",
+    `got ${NEW_ACCOUNT_SEED.exclusions.length}`,
   );
   check(
-    NEW_ACCOUNT_SEED.max_level === DEFAULT_PREFERENCES.max_level,
-    `max_level is untouched (${NEW_ACCOUNT_SEED.max_level})`,
+    !("max_level" in NEW_ACCOUNT_SEED),
+    "NEW_ACCOUNT_SEED states no max_level — the column is NOT NULL DEFAULT 2, so its " +
+      "blank is the schema default, reached by branch 3 omitting the column",
+  );
+  check(
+    DEFAULT_PREFERENCES.cities.length > 0 && DEFAULT_PREFERENCES.exclusions.length > 0,
+    `and the defaults they no longer copy are still there (${DEFAULT_PREFERENCES.cities.length} cities, ` +
+      `${DEFAULT_PREFERENCES.exclusions.length} exclusions), so the checks above are not passing vacuously`,
   );
 
   // §2 — the operator, read BEFORE the new account exists. Whatever this slice
@@ -235,16 +259,65 @@ async function main() {
       "onboarding_completed is FALSE, so this account is behind the gate",
     );
     check(
-      [...seeded.cities].join() === [...DEFAULT_PREFERENCES.cities].join(),
-      "cities came through as the install's defaults",
+      seeded.cities.length === 0,
+      "cities is EMPTY — the operator's blr/pune/hyd did not come through",
       `got [${seeded.cities.join(", ")}]`,
     );
     check(
-      [...seeded.exclusions].join() === [...DEFAULT_PREFERENCES.exclusions].join(),
-      `exclusions came through as the install's ${DEFAULT_PREFERENCES.exclusions.length} defaults`,
-      `got ${seeded.exclusions.length}`,
+      seeded.exclusions.length === 0,
+      "exclusions is EMPTY — the operator's 14 terms did not come through",
+      `got ${seeded.exclusions.length}: ${seeded.exclusions.slice(0, 5).join(", ")}…`,
     );
-    check(seeded.max_level === DEFAULT_PREFERENCES.max_level, "max_level came through as the default");
+    check(
+      seeded.max_level === 2,
+      "max_level is the schema default of 2 — the column is NOT NULL, so this is " +
+        "what 'unset' looks like, and it is there because branch 3 did not name it",
+      `got ${seeded.max_level}`,
+    );
+
+    // EVERY REMAINING COLUMN ON THE ROW, read directly rather than through
+    // loadPreferences — which selects six columns and would report a blank seed
+    // while nine others quietly carried something. These nine are the ones branch 3
+    // reaches by NOT naming them, so this is the assertion that their schema
+    // defaults really are the blanks lib/labels.NEW_ACCOUNT_SEED claims they are.
+    type Rest = {
+      selected_cities: string[];
+      work_modes: string[];
+      salary_bands: string[];
+      all_india: boolean;
+      show_no_experience_jobs: boolean;
+      exp_range_low: number | null;
+      exp_range_high: number | null;
+      years_of_experience_held: number | null;
+    };
+    const [rest] = await sql<Rest[]>`
+      SELECT selected_cities, work_modes, salary_bands, all_india,
+             show_no_experience_jobs, exp_range_low, exp_range_high,
+             years_of_experience_held
+        FROM preferences WHERE user_id = ${newUserId}
+    `;
+    console.log(
+      `  selected_cities=[${rest.selected_cities.join(", ")}] work_modes=[${rest.work_modes.join(", ")}] ` +
+        `salary_bands=[${rest.salary_bands.join(", ")}] all_india=${rest.all_india} ` +
+        `show_no_experience_jobs=${rest.show_no_experience_jobs} ` +
+        `exp=${rest.exp_range_low}..${rest.exp_range_high} held=${rest.years_of_experience_held}`,
+    );
+
+    check(rest.selected_cities.length === 0, "selected_cities is empty");
+    check(rest.work_modes.length === 0, "work_modes is empty");
+    check(rest.salary_bands.length === 0, "salary_bands is empty");
+    check(rest.all_india === false, "all_india is FALSE");
+    check(rest.show_no_experience_jobs === false, "show_no_experience_jobs is FALSE");
+    check(
+      rest.exp_range_low === null && rest.exp_range_high === null,
+      "the experience range is NULL at both ends — not configured, rather than a range nobody picked",
+      `got ${rest.exp_range_low}..${rest.exp_range_high}`,
+    );
+    check(
+      rest.years_of_experience_held === null,
+      "years_of_experience_held is NULL",
+      `got ${rest.years_of_experience_held}`,
+    );
 
     // §5 — the gate's own predicate, which is what lib/guard.requirePage reads.
     console.log("\n§5 the gate, before the save");
@@ -254,17 +327,26 @@ async function main() {
       `requirePage() would redirect this account to ${guard.ONBOARDING_PATH} instead of the dashboard`,
     );
 
-    // §6 — the exit. One keyword is all a person has to supply, and this is the
-    // save the old seed made impossible.
-    console.log("\n§6 the first save — the act the old seed refused");
+    // §6 — the exit. Every value here is written out rather than taken from
+    // DEFAULT_PREFERENCES, and that is the point of the slice made literal: these
+    // are the answers a PERSON supplies at onboarding, and after this slice there
+    // is no longer any overlap between what they choose and what they were seeded.
+    // Passing the install's defaults in here would still pass, and would read as
+    // though the row arrived carrying them.
+    console.log("\n§6 the first save — a person answering, from a blank row");
     const saved = await savePreferences(newUserId, {
-      cities: [...DEFAULT_PREFERENCES.cities],
+      cities: ["blr"],
       keywords: ["backend engineer"],
-      exclusions: [...DEFAULT_PREFERENCES.exclusions],
-      max_level: DEFAULT_PREFERENCES.max_level,
+      exclusions: ["intern"],
+      max_level: 3,
     });
 
     check(saved.keywords.length === 1, "it stored the one keyword the person chose");
+    check(
+      saved.cities.join() === "blr" && saved.exclusions.join() === "intern" && saved.max_level === 3,
+      "and their cities, exclusions and max_level — every field on the row is now theirs",
+      `got [${saved.cities.join(", ")}] / [${saved.exclusions.join(", ")}] / ${saved.max_level}`,
+    );
     check(
       saved.onboarding_completed === true,
       "and flipped onboarding_completed TRUE in the same statement",
@@ -317,8 +399,8 @@ async function main() {
   console.log(
     failures
       ? `\nFAILED — ${failures} assertion(s) did not hold.`
-      : "\nOK — a new account starts with no keywords, is held at onboarding, " +
-          "and its first save releases it. The existing account is untouched.",
+      : "\nOK — a new account starts blank on every preference field, is held at " +
+          "onboarding, and its first save releases it. The existing account is untouched.",
   );
   if (failures) process.exitCode = 1;
 }

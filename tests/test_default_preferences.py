@@ -94,9 +94,12 @@ def test_the_defaults_are_not_empty():
 
     NOTE WHAT THIS NO LONGER SAYS, since Phase 3 Slice 1b. It used to be an
     argument about new accounts, because DEFAULT_PREFERENCES was also the SEED. A
-    new account is now seeded from NEW_ACCOUNT_SEED, whose keywords list is
-    deliberately empty — see the tests below for why that is the opposite of this
-    failure rather than an instance of it.
+    new account is now seeded from NEW_ACCOUNT_SEED, which is deliberately empty on
+    every field — see the tests below for why that is the opposite of this failure
+    rather than an instance of it. The short version: this constant describes the
+    filter the INSTALL runs, where empty means a digest that silently matches
+    nothing; that one describes a row nobody has configured yet, where empty is the
+    honest state and onboarding_completed = FALSE is what stops it being used.
     """
     defaults = parsed_defaults()
     assert defaults["cities"], "an empty cities list matches no job at all"
@@ -125,50 +128,102 @@ def labels_source() -> str:
     return LABELS_TS.read_text(encoding="utf-8")
 
 
-def test_the_new_account_seed_exists_and_is_a_spread_of_the_defaults():
-    """cities, exclusions and max_level are NOT re-typed here.
-
-    A hand-copied literal is a fourth copy of four values that nothing compares —
-    and the four above are compared against the Python precisely because a copy
-    nothing checks is a copy that drifts. The spread says what is actually true:
-    a new account starts from this install's defaults except the one list it has
-    to supply itself.
-    """
+def new_account_seed_body() -> str:
+    """The literal's body, or a failure naming the constant rather than a regex."""
     body = re.search(
         r"export const NEW_ACCOUNT_SEED\s*=\s*\{(.*?)\}\s*as const;",
         labels_source(),
         re.DOTALL,
     )
     assert body, "NEW_ACCOUNT_SEED is not defined in labels.ts as a plain object literal"
+    return body.group(1)
 
-    text = body.group(1)
-    assert "...DEFAULT_PREFERENCES" in text, (
-        "NEW_ACCOUNT_SEED must spread DEFAULT_PREFERENCES rather than re-typing "
-        "cities / exclusions / max_level"
+
+def test_the_new_account_seed_does_not_spread_the_defaults():
+    """The spread came OUT, and putting it back is the regression to catch.
+
+    Slice 1b wrote NEW_ACCOUNT_SEED as `{...DEFAULT_PREFERENCES, keywords: []}`,
+    to stop three copied values drifting from the Python. That argument expired
+    with the values: empty cannot drift, because there is no number or string here
+    for notify/match.py to disagree with.
+
+    What replaced it is the sharper hazard, and it runs the other way. A spread
+    means every field DEFAULT_PREFERENCES gains in future arrives on new accounts
+    as the operator's answer, silently and with nothing failing — which is exactly
+    the bug this slice exists to end, re-entering through a constant nobody edited.
+    Spelling the blanks out means a new field is absent from a new account's row
+    until somebody deliberately adds it below.
+    """
+    text = new_account_seed_body()
+    assert "...DEFAULT_PREFERENCES" not in text, (
+        "NEW_ACCOUNT_SEED spreads DEFAULT_PREFERENCES again. A new account must "
+        "start blank on every field, and a spread hands it whatever the install's "
+        "filter happens to contain — including any field added to it later."
     )
-    for field in ("cities", "exclusions", "max_level"):
-        assert not re.search(rf"^\s*{field}\s*:", text, re.MULTILINE), (
-            f"NEW_ACCOUNT_SEED overrides {field}; only keywords may differ from the defaults"
+
+
+def test_a_new_account_is_seeded_blank_on_every_list():
+    """cities, keywords and exclusions are all the empty list.
+
+    keywords is the assertion that would have caught the Slice 1b catch-22: any
+    non-empty literal is somebody else's filter on a new person's row, and one over
+    KEYWORD_CAP is the loop itself, back again. cities and exclusions are the same
+    argument finished — a seeded city list is the operator's answer to "where do you
+    want to work", and a seeded exclusion list silently drops the architect and
+    analyst postings somebody might be looking for.
+
+    All three columns are TEXT[] NOT NULL DEFAULT '{}', so the empty list is a legal
+    value for each and none of them can fail the INSERT.
+    """
+    text = new_account_seed_body()
+    for field in ("cities", "keywords", "exclusions"):
+        assert re.search(rf"{field}\s*:\s*\[\s*\]", text), (
+            f"NEW_ACCOUNT_SEED.{field} must be the empty list — onboarding is what "
+            f"collects it, and anything seeded here is a preference the person "
+            f"holding the account never chose"
         )
 
 
-def test_a_new_account_is_seeded_with_no_keywords():
-    """Empty, which is 0 of 25 and therefore cannot be over the cap.
+def test_the_new_account_seed_states_no_max_level():
+    """The one field whose blank is an ABSENCE rather than an empty literal.
 
-    This is the assertion that would have caught the catch-22. Any non-empty
-    literal here is somebody else's filter arriving on a new person's row; a
-    literal of more than KEYWORD_CAP entries is the loop itself, back again.
+    preferences.max_level is `INT NOT NULL DEFAULT 2`, so NULL cannot mean "unset"
+    for it — binding one would violate the constraint and fail the signup rather
+    than blank the field. The schema default is the unset state, and branch 3
+    reaches it by leaving the column out of its INSERT entirely.
+
+    So naming max_level here is wrong in both possible spellings: a number is the
+    operator's answer to "how senior", and a null is a signup that throws.
     """
-    body = re.search(
-        r"export const NEW_ACCOUNT_SEED\s*=\s*\{(.*?)\}\s*as const;",
-        labels_source(),
-        re.DOTALL,
+    assert not re.search(r"^\s*max_level\s*:", new_account_seed_body(), re.MULTILINE), (
+        "NEW_ACCOUNT_SEED names max_level. The column is NOT NULL DEFAULT 2, so the "
+        "only legal 'unset' is the schema default — reached by omitting the column "
+        "from the INSERT in lib/link-user.ts, not by binding a value from here."
     )
-    assert body, "NEW_ACCOUNT_SEED is not defined in labels.ts"
-    assert re.search(r"keywords\s*:\s*\[\s*\]", body.group(1)), (
-        "NEW_ACCOUNT_SEED.keywords must be the empty list — onboarding is what "
-        "collects them, and a seeded list over KEYWORD_CAP makes the first save "
-        "(the only writer of onboarding_completed) impossible"
+
+
+def test_link_user_inserts_only_the_three_blank_lists():
+    """Branch 3's INSERT column list, checked against its own text.
+
+    Two failures this catches, and they arrive from opposite directions. A column
+    ADDED here is a field a new account is handed rather than asked about — the
+    whole of this slice, reverted. max_level REAPPEARING is the specific one: it
+    was removed so the NOT NULL DEFAULT 2 supplies it, and re-adding it means
+    binding either the operator's 2 or a NULL that violates the constraint.
+
+    The nine columns Phase 3 Step 0 added are covered by
+    tests/test_phase3_columns.py's sweep, which forbids link-user.ts from naming
+    any of them at all; their blanks come from their own schema defaults.
+    """
+    source = LINK_USER_TS.read_text(encoding="utf-8")
+    insert = re.search(r"INSERT INTO preferences\s*\((.*?)\)", source, re.DOTALL)
+    assert insert, "no INSERT INTO preferences found in link-user.ts"
+
+    names = [c.strip() for c in insert.group(1).split(",")]
+    assert names == ["user_id", "cities", "keywords", "exclusions"], (
+        f"branch 3 inserts {names}. It must name only the owner and the three blank "
+        f"lists — every other column on preferences has a schema default that is "
+        f"already the blank a new account should start with."
     )
 
 

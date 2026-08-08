@@ -191,29 +191,44 @@ export async function linkUser(user: User): Promise<LinkedUser> {
       // works and an account that errors on its first page load.
       //
       // SEEDED FROM NEW_ACCOUNT_SEED AND NOT FROM DEFAULT_PREFERENCES, since
-      // Slice 1b. The two differ in exactly one field: this row starts with NO
-      // keywords. Handing a new account the operator's 43 gave them somebody
-      // else's filter AND put them over KEYWORD_CAP, which the first save
-      // refuses — and that first save is the only thing that marks a person as
-      // having chosen a filter. The seed was therefore refusing the act that
-      // finishes onboarding. See lib/labels.NEW_ACCOUNT_SEED.
+      // Slice 1b — AND THAT SEED IS NOW BLANK ON EVERY FIELD. Slice 1b emptied
+      // keywords, because 43 of the operator's terms is over KEYWORD_CAP and the
+      // save that trips the cap is the only writer of the onboarding flag, so
+      // the seed was refusing the act that finishes onboarding. This slice
+      // empties the rest for the other half of that reasoning, which was never
+      // specific to keywords: a seeded city list, exclusion list or max_level is
+      // the operator's answer to a question this person has not been asked yet,
+      // and on the screen it is indistinguishable from one they chose.
+      // See lib/labels.NEW_ACCOUNT_SEED.
       //
       // THIS IS BRANCH 3 AND ONLY BRANCH 3, which is what makes "no existing
       // account is affected" a property of where the statement sits rather than
       // a promise. Branch 1 returns before reaching here and branch 2 adopts a
       // row that already has its own filter; neither writes preferences at all.
       //
-      // EVERY COLUMN PHASE 3 STEP 0 ADDED IS ABSENT FROM THIS INSERT and takes
-      // its schema default. That is what leaves a new account behind the
-      // onboarding gate in lib/guard.ts rather than past it, and
-      // tests/test_phase3_columns.py asserts this file never names the flag.
+      // max_level IS ABSENT FROM THIS INSERT ON PURPOSE, and its absence is the
+      // blank. The column is INT NOT NULL DEFAULT 2, so NULL is not available to
+      // mean "unset" — binding one would violate the constraint and fail the
+      // signup outright. Omitting the column lets the schema default supply it,
+      // which is the only legal way to say "nobody has answered this yet".
+      //
+      // EVERY COLUMN PHASE 3 STEP 0 ADDED IS LIKEWISE ABSENT and takes its schema
+      // default, each of which is already blank — '{}' for the three TEXT[], FALSE
+      // for the two booleans, NULL for the three nullable ints. So the row this
+      // writes is empty on all of them without this statement naming any, which is
+      // both what leaves a new account behind the onboarding gate in lib/guard.ts
+      // and what keeps this file clean for tests/test_phase3_columns.py's sweep.
+      //
+      // THE ROW THIS WRITES COULD NOT BE SAVED THROUGH PUT /api/preferences — that
+      // route refuses an empty cities or keywords list. It does not have to be: the
+      // INSERT is direct, so signup does not touch that validation, and a brand-new
+      // account is EXPECTED to be incomplete until onboarding collects the answers.
       await tx`
-        INSERT INTO preferences (user_id, cities, keywords, exclusions, max_level)
+        INSERT INTO preferences (user_id, cities, keywords, exclusions)
         VALUES (${created.id},
                 ${NEW_ACCOUNT_SEED.cities}::text[],
                 ${NEW_ACCOUNT_SEED.keywords}::text[],
-                ${NEW_ACCOUNT_SEED.exclusions}::text[],
-                ${NEW_ACCOUNT_SEED.max_level})
+                ${NEW_ACCOUNT_SEED.exclusions}::text[])
         ON CONFLICT DO NOTHING
       `;
       console.log(
