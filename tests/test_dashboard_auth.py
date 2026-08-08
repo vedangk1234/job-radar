@@ -233,6 +233,98 @@ def test_every_page_guards_itself():
     assert not unguarded, "page(s) with no requirePage():\n  " + "\n  ".join(unguarded)
 
 
+def test_the_onboarding_gate_is_closed_by_default_and_has_exactly_three_holes():
+    """Phase 3 Slice 1b's gate, asserted the way the middleware matcher is.
+
+    requirePage() redirects a signed-in account whose preferences row says
+    onboarding_completed = FALSE. Being inside requirePage rather than beside it
+    is what makes a page added next month gated by DEFAULT — the same
+    allow-nothing-with-named-holes direction middleware.ts chose, for the same
+    reason: forgetting to register a new page cannot open a hole, only forgetting
+    to exempt one can close a door.
+
+    So the thing that can go wrong is the exemption spreading, and it spreads by
+    being copied. Three files may pass it, each for a stated reason:
+
+      app/onboarding/page.tsx — the redirect target; gated it redirects to itself
+      app/preferences/page.tsx — DELETE ACCOUNT lives there, and erasure is a
+                                 right that does not wait on a filter
+      app/actions.ts — the same argument for the form post itself
+
+    A fourth is a page that has decided onboarding is optional, which is the
+    whole gate gone one file at a time.
+    """
+    flag = "allowUnfinishedOnboarding"
+    guard = (SRC / "lib" / "guard.ts").read_text(encoding="utf-8")
+    body = "\n".join(code_lines(guard))
+
+    # THREE FACTS, NOT ONE, and the first draft of this test asserted the wrong
+    # one. It looked for the name `onboardingCompleted` anywhere in the code, and
+    # deleting the entire redirect still left the IMPORT of that name at the top
+    # of the file — so the gate could be removed wholesale with the test still
+    # green. A mutation run is what turned that up. The three below name the call,
+    # the consequence and the condition separately, because a gate can be broken
+    # by removing any one of them: a read whose answer is discarded, a redirect
+    # nothing triggers, or a condition that ignores the exemption.
+    assert "onboardingCompleted(" in body, (
+        "requirePage() does not CALL onboardingCompleted — importing the name is "
+        "not reading the flag, and an unused import is exactly what a deleted gate "
+        "leaves behind"
+    )
+    assert "redirect(ONBOARDING_PATH)" in body, (
+        "nothing redirects to ONBOARDING_PATH — the flag is read and the answer thrown away"
+    )
+    assert f"!{flag}" in body, (
+        f"the redirect is not conditioned on !{flag}, so either every page is exempt "
+        f"or none can be"
+    )
+    assert re.search(rf"{flag}\s*=\s*false", guard), (
+        f"{flag} must DEFAULT to false, or every page is exempt unless it opts in"
+    )
+
+    allowed = {
+        SRC / "app" / "onboarding" / "page.tsx",
+        SRC / "app" / "preferences" / "page.tsx",
+        SRC / "app" / "actions.ts",
+        SRC / "lib" / "guard.ts",  # where the parameter is declared
+    }
+    offenders = [
+        f"{path.relative_to(PROJECT_ROOT)}: {line.strip()}"
+        for path, text in sources(SRC).items()
+        if path not in allowed
+        for line in code_lines(text)
+        if flag in line
+    ]
+    assert not offenders, (
+        "a file outside the three enumerated holes opts out of the onboarding gate:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_the_onboarding_target_is_a_real_page_that_guards_itself():
+    """The redirect must land somewhere that exists and is behind the session.
+
+    A redirect to a missing route is a 404 for every new account, and the page it
+    lands on is the one page exempt from the onboarding gate — which is exactly
+    the file where an over-wide exemption would also drop the SESSION gate. It
+    calls requirePage() like every other page; test_every_page_guards_itself
+    covers that, and this states the pairing so the two cannot be separated by
+    someone renaming the route.
+    """
+    guard = (SRC / "lib" / "guard.ts").read_text(encoding="utf-8")
+    target = re.search(r'ONBOARDING_PATH\s*=\s*"(/[^"]*)"', guard)
+    assert target, "lib/guard.ts does not declare ONBOARDING_PATH as a literal path"
+
+    page = SRC / "app" / target.group(1).strip("/") / "page.tsx"
+    assert page.exists(), (
+        f"requirePage() redirects to {target.group(1)}, but {page.relative_to(PROJECT_ROOT)} "
+        f"does not exist — every new account would get a 404"
+    )
+    assert "requirePage" in page.read_text(encoding="utf-8"), (
+        "the onboarding page is exempt from the ONBOARDING gate, not from the session gate"
+    )
+
+
 def test_server_errors_do_not_leak_the_message_to_the_client():
     """The "one authorised user, they are the operator" argument expired in 2a.
 

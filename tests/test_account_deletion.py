@@ -368,7 +368,13 @@ def test_nothing_in_the_delete_path_takes_a_user_id_from_the_request():
     """
     actions = body("app", "actions.ts")
 
-    assert "requirePage()" in actions, "the delete action does not resolve a session"
+    # `requirePage(` and not `requirePage()`, since Phase 3 Slice 1b. That gate
+    # took an argument — the onboarding exemption — and the delete action is one
+    # of the three callers that pass it, because erasure is a right and must not
+    # be answered with "finish setting up your filter first". The rule this test
+    # states is unchanged and is the one below: identity comes from the session,
+    # never from the form. Matching the empty parens was matching the arity.
+    assert "requirePage(" in actions, "the delete action does not resolve a session"
 
     reads = re.findall(r"formData\.get\(\s*[\"'](\w+)[\"']\s*\)", actions)
     assert reads, "the delete action reads nothing from the form — the confirmation is missing"

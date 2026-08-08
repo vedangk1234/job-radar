@@ -80,7 +80,13 @@ export async function signOutEverywhere() {
  * that is still stored.
  */
 export async function deleteAccountAction(formData: FormData) {
-  const { userId, authUserId, email } = await requirePage();
+  // EXEMPT FROM THE ONBOARDING GATE, the third and last of the holes enumerated
+  // in lib/guard.requirePage. The page this form sits on is exempt for the same
+  // reason, and exempting only the page would leave the POST itself answered
+  // with a redirect to /onboarding — a person asking to be erased, sent to a
+  // setup screen, with nothing deleted and nothing said. Erasure is a right and
+  // it does not wait on a filter.
+  const { userId, authUserId, email } = await requirePage({ allowUnfinishedOnboarding: true });
 
   const typed = String(formData.get("confirm") ?? "").trim().toLowerCase();
   if (typed !== email.trim().toLowerCase()) {

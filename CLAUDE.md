@@ -1023,6 +1023,36 @@ Next.js App Router + TypeScript in `dashboard/`. Read-mostly.
 - **Preferences (`/preferences`)** — edits **this user's** `preferences` row,
   found by owner since 1b rather than at `id = 1`. `PUT` rather than `PATCH`,
   because the editor sends the full lists it is showing.
+- **Onboarding (`/onboarding`)** — the same `PreferencesEditor`, with setup copy
+  and no delete-account section, and the one page `requirePage()` lets past its
+  own gate. It redirects to Home the moment `onboarding_completed` is TRUE, so an
+  onboarded account cannot sit on a setup screen.
+
+### The onboarding gate
+
+A signed-in account whose `preferences.onboarding_completed` is FALSE is
+redirected to `/onboarding` instead of the page it asked for. The check is in
+`lib/guard.requirePage()` — not middleware, which holds no database connection
+and deliberately asks only "is there a verified user" — and it reads
+`lib/preferences.onboardingCompleted()`, one lookup on
+`preferences_one_per_user_idx`, on page renders only.
+
+It is **inside `requirePage` rather than beside it**, so a page added next month
+is gated by default: the same allow-nothing-with-named-holes direction the
+middleware matcher chose, where forgetting to register something cannot open a
+hole. Three callers pass `{ allowUnfinishedOnboarding: true }` and
+`tests/test_dashboard_auth.py` fails on a fourth — `/onboarding` (gated, it would
+redirect to itself), `/preferences` (**because deleting an account lives there,
+and erasure is a right that does not wait on a filter**) and
+`deleteAccountAction` (the same argument for the form post). Exempting
+`/preferences` opens no way round the gate: the flag is set by a save, and a save
+there is the same editor writing the same row through the same statement.
+
+**API routes are deliberately not gated.** `PUT /api/preferences` is the only
+exit from onboarding, so a second exemption list would have its first mistake
+seal the only door; the data routes are already scoped to the caller's own id.
+Sign-in, the callback and sign-out are untouched by construction rather than by
+exemption — none of them calls a guard.
 
 **The company list is still the shared catalog, on both screens.** Phase 1 made
 the watch list per-user in the database and stopped there on purpose — 1f moved
@@ -1065,7 +1095,7 @@ Guard 3 (`miss_count >= 3`) disappears from both screens.
 | `companies.ts` | shared company queries + `upsertCompany`; read by routes *and* by server components directly |
 | `preferences.ts` | load/save this user's row, `cleanList` |
 | `currentUser.ts` | the MY_EMAIL → `public.users.id` bridge, memoised. **Temporary; deleted at Phase 2 auth** |
-| `labels.ts` | `Preferences`, `CITY_LABELS` — **constants with no database import** |
+| `labels.ts` | `Preferences`, `CITY_LABELS`, `KEYWORD_CAP`, `DEFAULT_PREFERENCES` (the install's filter, mirrored from Python) and `NEW_ACCOUNT_SEED` (what a signup actually gets) — **constants with no database import** |
 | `match.ts` | the port of `notify/match.py` |
 | `ats.ts` / `workday.ts` | the port of `fetchers/resolve.py` |
 | `board-url.ts` | a pasted URL → `(ats, token, config)`. Dashboard-only; no Python counterpart |
@@ -1968,8 +1998,83 @@ Newest last. Append here as the project evolves.
   in the log and the prose above describes the code as it stands, but the
   narrative for those five is missing.)*
 
+- **2026-08-08 — Phase 3 Slice 1b. A new account stops being handed the
+  operator's filter, and stops being able to skip setup.** Two faults that only
+  looked like one, because each made the other invisible.
+
+  *Nothing routed anybody to setup.* `onboarding_completed` had been written
+  since Slice 1 and read by nothing, so a Google account seconds old landed on
+  Home — the whole 50-company catalog, with match counts — and was never shown
+  the screen that asks what it wants. `lib/guard.requirePage()` now redirects on
+  that column, with the three enumerated exemptions above. It is inside
+  `requirePage` rather than beside it so that a page added later is gated by
+  default, and `/preferences` is exempt because **deleting an account lives
+  there**: a person who signed up and changed their mind must not have erasure
+  held behind a setup screen.
+
+  *And the setup screen could not have been completed anyway.* Branch 3 of
+  `lib/link-user.ts` seeded every new row from `DEFAULT_PREFERENCES` — 43
+  keywords, over the `KEYWORD_CAP` of 25, so `PUT /api/preferences` refused the
+  save; and that save is the **only writer** of `onboarding_completed`. The seed
+  was refusing the one act that finishes onboarding. Each of the three parts was
+  individually right, which is why nothing in the repo could see it: a
+  typechecker proves the constant is a string array, a test proves the cap is
+  enforced, and neither carries an account from signup through to a completed
+  save. `NEW_ACCOUNT_SEED = {...DEFAULT_PREFERENCES, keywords: []}` is the fix —
+  a spread rather than a hand-copied literal, because `DEFAULT_PREFERENCES`
+  keeps its own meaning as the Python-mirrored parity anchor and re-typing three
+  of its four fields is how the copy nothing compares drifts.
+
+  Only `keywords` is emptied, and the other two are a decision rather than an
+  omission. `cities` is refused empty by the same route and three cities are the
+  entire scope of the product today; `exclusions` is a *narrowing* list, so
+  blanking it would widen a new person's first digest to the manager, sales and
+  recruiter titles `max_level` cannot catch. Both are on the screen the moment
+  somebody disagrees. `is_active` stays FALSE, unchanged.
+
+  `npm run onboarding-check` is the proof and it is shaped by what the other
+  checks cannot do. It calls `linkUser` itself with a synthetic Google user —
+  not a forged session; a plain object passed to a function, where `ui-check`
+  explains at length why it will not mint a cookie — then reads the row branch 3
+  wrote, asks the gate's own predicate, saves one keyword through
+  `savePreferences`, and asks the predicate again. Real rows deleted in a
+  `finally` rather than a rolled-back transaction, because `savePreferences`
+  binds the pool and could not see an uncommitted account; the operator's row is
+  snapshotted before and after, `updated_at` included. 24 assertions, all green
+  against the live database.
+
+  The textual guards were **mutation-checked, and the first draft of one failed
+  that check**: it looked for `onboardingCompleted` anywhere in `guard.ts`, and
+  deleting the entire redirect left the import behind, so the gate could be
+  removed wholesale with the test still green. It now names the call, the
+  redirect and the condition separately. Six deliberate breakages, six caught.
+
+  Deliberately **not** in this slice: the per-user watch list, the Home match
+  query, the matchers, the crawler, and the app shell — so the nav still shows
+  Home / Jobs / Add during onboarding and those tabs bounce back, which is the
+  gate being visible rather than a bug, and is listed under *Pending*.
+
+  `scripts/reset_unonboarded_keywords.py` is the manual half, in its own commit
+  after being run — the same expand-then-contract ordering 1g used. A seeding fix
+  reaches only accounts created after it, and the one account already sitting
+  mid-onboarding was seeded with the 43. Its guard is two clauses
+  (`onboarding_completed = FALSE` **and** `keywords` exactly equal to the seeded
+  list, in order) because either alone is wrong in a way nobody would notice: the
+  first would delete a list somebody had typed and not yet saved, the second
+  would clear the filter of an account that kept the defaults on purpose.
+
 **Pending**
 
+- **The nav does not know about the onboarding gate.** During setup the chrome
+  still shows Home / Jobs / Add, and clicking any of them bounces back to
+  `/onboarding`. Correct, and visible rather than silent — but `app/layout.tsx`
+  reads no database at all today, so telling it would mean either a query per
+  navigation or threading the flag out of a page into its own layout. It belongs
+  with the shell work rather than with the gate.
+- **`scripts/reset_unonboarded_keywords.py` has to be run once**, or the account
+  already sitting mid-onboarding meets `/onboarding` holding 43 keywords and
+  must delete eighteen of them before it can save. Preview first (it writes
+  nothing without `--apply`).
 - **The Add flow can still turn `tracked` back ON, and can rename a company.**
   The residual half of Slice 1a, deliberately left. `POST /api/companies` →
   `lib/companies.upsertCompany` carries

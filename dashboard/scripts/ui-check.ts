@@ -179,7 +179,14 @@ async function gateIsShut() {
   // Pages redirect rather than 401 — a browser asking for HTML should be sent
   // somewhere it can sign in. /add and /preferences are in this list because
   // until 2a neither called requirePage() at all and both leaned on the matcher.
-  for (const path of ["/", "/jobs", "/preferences", "/add"]) {
+  //
+  // /onboarding joins them in Slice 1b, and it is the one worth stating why.
+  // That page is EXEMPT from the onboarding gate — it is where the gate sends
+  // people — and an exemption written slightly too wide is how a page ends up
+  // exempt from the SESSION gate as well. It must redirect to /signin with no
+  // cookie exactly like every other page, and the middleware matcher's holes
+  // must not have grown a fifth one.
+  for (const path of ["/", "/jobs", "/preferences", "/add", "/onboarding"]) {
     const res = await fetch(`${BASE}${path}`, { redirect: "manual" });
     const location = res.headers.get("location") ?? "";
     check(

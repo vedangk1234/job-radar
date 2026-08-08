@@ -1,5 +1,6 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 // From lib/labels, never lib/preferences: the latter imports postgres.js, and
@@ -35,14 +36,28 @@ import { ResumePanel } from "./ResumePanel";
  * keyword editor on this page, because two controls writing preferences.keywords
  * with different caps is a split-brain waiting to be discovered by whichever one
  * saves second.
+ *
+ * redirectOnSave IS THE WHOLE OF WHAT SLICE 1b ADDED, and it is one optional
+ * string rather than a mode. /onboarding passes "/" because a successful save
+ * there is the act that sets onboarding_completed, which is the act that opens
+ * the rest of the app — leaving somebody on the setup screen afterwards would
+ * mean the gate had lifted with nothing on the page saying so. /preferences
+ * passes nothing and is unchanged: navigating away from a settings screen when
+ * you press Save is how an edit you meant to keep tweaking gets lost.
+ *
+ * A path, not a callback, because this is a client component rendered by a
+ * server one and a function is not serialisable across that boundary.
  */
 export function PreferencesEditor({
   initial,
   resume,
+  redirectOnSave,
 }: {
   initial: Preferences;
   resume: StoredResume | null;
+  redirectOnSave?: string;
 }) {
+  const router = useRouter();
   const [cities, setCities] = useState<string[]>(initial.cities);
   const [keywords, setKeywords] = useState<string[]>(initial.keywords);
   const [exclusions, setExclusions] = useState<string[]>(initial.exclusions);
@@ -102,6 +117,18 @@ export function PreferencesEditor({
       setMaxLevel(data.preferences.max_level);
       setUpdatedAt(data.preferences.updated_at);
       setMessage({ kind: "ok", text: data.message });
+
+      // ONLY ON A SUCCESSFUL SAVE, and only because the row now says so. The
+      // response carries onboarding_completed straight from the UPDATE's
+      // RETURNING, so this navigates on what the database recorded rather than
+      // on the request having been sent. refresh() first: the destination is a
+      // server component behind the same gate, and it has to re-read the flag
+      // that just changed rather than serve a cached render from before it did.
+      if (redirectOnSave && data.preferences.onboarding_completed) {
+        router.refresh();
+        router.replace(redirectOnSave);
+        return;
+      }
     } catch (err) {
       setMessage({ kind: "bad", text: err instanceof Error ? err.message : String(err) });
     } finally {

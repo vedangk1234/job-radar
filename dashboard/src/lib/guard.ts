@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { redirect } from "next/navigation";
 
 import { linkUser, UnverifiedEmailError } from "./link-user";
+import { onboardingCompleted } from "./preferences";
 import { getAuthUser } from "./supabase/server";
 
 /**
@@ -80,17 +81,60 @@ export async function requireSession(): Promise<
   }
 }
 
+/** Where a signed-in account that has not chosen a filter yet is sent. */
+export const ONBOARDING_PATH = "/onboarding";
+
 /**
  * The same gate for a page: redirect rather than 401, because a browser asking
  * for HTML should be sent somewhere it can sign in.
+ *
+ * AND, SINCE SLICE 1b, THE SECOND GATE: a signed-in account whose
+ * preferences.onboarding_completed is FALSE is sent to /onboarding instead of
+ * the page it asked for. Same shape as the email-verify redirect above — a fact
+ * read from the database on the handler side, answered with a redirect rather
+ * than an error, because the person is authenticated and there is somewhere for
+ * them to go.
+ *
+ * WHY IT LIVES IN requirePage() ITSELF AND NOT IN A requireOnboardedPage()
+ * BESIDE IT. tests/test_dashboard_auth.test_every_page_guards_itself already
+ * forces every page.tsx to call this function, so putting the gate here means a
+ * page added next month is gated by DEFAULT and forgetting about onboarding
+ * cannot open a hole. It is the same direction the middleware matcher chose for
+ * the same reason: an allow-nothing list with named holes, never a list of the
+ * things to protect.
+ *
+ * THE THREE HOLES, ENUMERATED HERE AND ASSERTED IN tests/test_dashboard_auth.py:
+ *
+ *   /onboarding — the redirect target. Gated, it would redirect to itself.
+ *   /preferences — because DELETING AN ACCOUNT LIVES THERE. A person who signed
+ *                  up and changed their mind must not have erasure held behind a
+ *                  setup screen; that is a right, not a feature. It is not a way
+ *                  round the gate either: the flag is flipped by a save, and a
+ *                  save on that screen IS onboarding — the same editor writing
+ *                  the same row through the same statement.
+ *   deleteAccountAction — the same argument, for the form post itself, so the
+ *                  delete can never be answered with "finish your setup first".
+ *
+ * NOT HERE: requireSession(). API routes are deliberately ungated, because
+ * PUT /api/preferences is the ONLY exit from onboarding — gating the routes
+ * would need a second exemption list whose first mistake seals the only door.
+ * The data routes are already scoped to the caller's own user id, so an account
+ * mid-onboarding can read nothing but its own empty answers.
+ *
+ * Sign-in and sign-out are untouched by construction rather than by exemption:
+ * /signin and /auth/callback call no guard at all, and signOutEverywhere is a
+ * server action that calls none either.
  */
-export async function requirePage(): Promise<Session> {
+export async function requirePage(
+  { allowUnfinishedOnboarding = false }: { allowUnfinishedOnboarding?: boolean } = {},
+): Promise<Session> {
   const user = await getAuthUser();
   if (!user) redirect("/signin");
 
+  let session: Session;
   try {
     const linked = await linkUser(user);
-    return { userId: linked.id, email: linked.email, authUserId: user.id };
+    session = { userId: linked.id, email: linked.email, authUserId: user.id };
   } catch (err) {
     if (err instanceof UnverifiedEmailError) {
       console.error("[auth] refused unverified email", err.message);
@@ -98,6 +142,16 @@ export async function requirePage(): Promise<Session> {
     }
     throw err;
   }
+
+  // AFTER the link and outside the try, both deliberately. After, because the
+  // flag is keyed by public.users.id and that id is what linkUser exists to
+  // produce. Outside, because redirect() works by throwing and a catch around it
+  // would swallow the redirect and report it as an unverified email.
+  if (!allowUnfinishedOnboarding && !(await onboardingCompleted(session.userId))) {
+    redirect(ONBOARDING_PATH);
+  }
+
+  return session;
 }
 
 function unauthorised(): NextResponse {

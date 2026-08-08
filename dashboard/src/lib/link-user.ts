@@ -1,7 +1,7 @@
 import type { User } from "@supabase/supabase-js";
 
 import { sql } from "./db";
-import { DEFAULT_PREFERENCES } from "./labels";
+import { NEW_ACCOUNT_SEED } from "./labels";
 
 /**
  * Supabase identity -> public.users row. The one place the two tables meet.
@@ -190,16 +190,30 @@ export async function linkUser(user: User): Promise<LinkedUser> {
       // the row is not a nicety, it is the difference between an account that
       // works and an account that errors on its first page load.
       //
-      // Seeded from lib/labels.DEFAULT_PREFERENCES, which mirrors
-      // notify/match.py's DEFAULT_* constants, so a new user's filter is the
-      // same filter a fresh install has always started with.
+      // SEEDED FROM NEW_ACCOUNT_SEED AND NOT FROM DEFAULT_PREFERENCES, since
+      // Slice 1b. The two differ in exactly one field: this row starts with NO
+      // keywords. Handing a new account the operator's 43 gave them somebody
+      // else's filter AND put them over KEYWORD_CAP, which the first save
+      // refuses — and that first save is the only thing that marks a person as
+      // having chosen a filter. The seed was therefore refusing the act that
+      // finishes onboarding. See lib/labels.NEW_ACCOUNT_SEED.
+      //
+      // THIS IS BRANCH 3 AND ONLY BRANCH 3, which is what makes "no existing
+      // account is affected" a property of where the statement sits rather than
+      // a promise. Branch 1 returns before reaching here and branch 2 adopts a
+      // row that already has its own filter; neither writes preferences at all.
+      //
+      // EVERY COLUMN PHASE 3 STEP 0 ADDED IS ABSENT FROM THIS INSERT and takes
+      // its schema default. That is what leaves a new account behind the
+      // onboarding gate in lib/guard.ts rather than past it, and
+      // tests/test_phase3_columns.py asserts this file never names the flag.
       await tx`
         INSERT INTO preferences (user_id, cities, keywords, exclusions, max_level)
         VALUES (${created.id},
-                ${DEFAULT_PREFERENCES.cities}::text[],
-                ${DEFAULT_PREFERENCES.keywords}::text[],
-                ${DEFAULT_PREFERENCES.exclusions}::text[],
-                ${DEFAULT_PREFERENCES.max_level})
+                ${NEW_ACCOUNT_SEED.cities}::text[],
+                ${NEW_ACCOUNT_SEED.keywords}::text[],
+                ${NEW_ACCOUNT_SEED.exclusions}::text[],
+                ${NEW_ACCOUNT_SEED.max_level})
         ON CONFLICT DO NOTHING
       `;
       console.log(

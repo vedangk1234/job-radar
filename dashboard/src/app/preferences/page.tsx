@@ -27,7 +27,15 @@ export default async function PreferencesPage({
   // alone while reading the database on the server, which is exactly the case
   // the belt-and-braces rule in lib/guard.ts exists for. It also now needs the
   // user id, so the omission could not survive the sub-phase in any event.
-  const { userId, email } = await requirePage();
+  //
+  // ONE OF THE THREE HOLES IN SLICE 1b's ONBOARDING GATE, AND THE REASON IS THE
+  // SECTION AT THE BOTTOM OF THIS FILE. Deleting an account is the DPDP right to
+  // erasure and it lives here; a person who signed up, thought better of it and
+  // wants their rows gone must not be told to finish setting up their filter
+  // first. It opens no way round the gate — onboarding_completed is set by a
+  // save, and a save here is the same editor writing the same row through the
+  // same statement /onboarding uses.
+  const { userId, email } = await requirePage({ allowUnfinishedOnboarding: true });
   const [preferences, resume, footprint, params] = await Promise.all([
     loadPreferences(userId),
     // The row only — the file itself is never read here. A page render must not

@@ -12,6 +12,7 @@
     "parity": "tsx scripts/parity-check.ts",
     "match-parity": "tsx scripts/match-parity.ts",
     "badge-check": "tsx scripts/badge-check.ts",
+    "onboarding-check": "tsx scripts/onboarding-check.ts",
     "delete-check": "tsx scripts/delete-check.ts",
     "resume-check": "tsx scripts/resume-check.ts",
     "skills-check": "tsx scripts/skills-check.ts",

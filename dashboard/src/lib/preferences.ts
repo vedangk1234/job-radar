@@ -60,6 +60,33 @@ export async function loadPreferences(userId: string): Promise<Preferences> {
 }
 
 /**
+ * Has this person chosen their own filter yet? The whole of what the onboarding
+ * gate in lib/guard.requirePage reads.
+ *
+ * ONE COLUMN, ONE INDEXED LOOKUP, and it is a separate statement rather than a
+ * join bolted onto lib/link-user.ts branch 1. That query is the steady-state
+ * path of every authenticated request and would have carried the flag for free —
+ * but linkUser is documented as the single highest-risk function in the app, its
+ * three branches are the thing a reader has to hold in their head, and
+ * requireSession() (every API route) has no use for the answer. The read costs
+ * one hit on preferences_one_per_user_idx, on page renders only.
+ *
+ * NO ROW MEANS FALSE, WHICH SENDS THEM TO ONBOARDING RATHER THAN PAST IT. That
+ * is the closed default, and it is also the honest one: an account with no
+ * preferences row has certainly not chosen a filter. It does not paper over the
+ * missing row — every screen calls loadPreferences immediately afterwards and
+ * that is where the two-way diagnosis above lives. This function's job is to
+ * decide a redirect, so it answers the question it was asked and leaves the
+ * explaining to the loader.
+ */
+export async function onboardingCompleted(userId: string): Promise<boolean> {
+  const [row] = await sql<{ onboarding_completed: boolean }[]>`
+    SELECT onboarding_completed FROM preferences WHERE user_id = ${userId}
+  `;
+  return row?.onboarding_completed ?? false;
+}
+
+/**
  * Replace this user's preferences row wholesale.
  *
  * The UPDATE is scoped by user_id, so it can only ever touch the caller's own
