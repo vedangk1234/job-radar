@@ -202,7 +202,32 @@ export async function parseResume(file: File): Promise<ParsedResume> {
     );
   }
 
-  const text = kind === "pdf" ? await pdfText(bytes) : await docxText(bytes);
+  // THE PARSER GETS ITS OWN COPY, AND `bytes` IS NEVER HANDED TO ONE.
+  //
+  // This is a bug fix with a 502 behind it. pdf.js — under unpdf — takes
+  // OWNERSHIP of the typed array it is given and TRANSFERS its ArrayBuffer, so
+  // the moment getDocumentProxy() has run, the view it was handed is backed by a
+  // detached buffer of length zero. Everything downstream still looked fine:
+  // parseResume returned, the text was real, the keywords were extracted. Then
+  // lib/resume.saveResume passed the same view to Supabase Storage, supabase-js
+  // called ArrayBuffer.prototype.slice on it, and the upload died with "Cannot
+  // perform ArrayBuffer.prototype.slice on a detached ArrayBuffer" — reported to
+  // the person as "your resume could not be saved just now", a message about a
+  // transient storage fault for a failure that was neither transient nor
+  // storage's. Every PDF upload had failed since the feature shipped.
+  //
+  // ONE READ OF THE FILE, ONE PRISTINE BUFFER, A COPY PER CONSUMER. `bytes`
+  // above is the single read — file.arrayBuffer() is called exactly once in this
+  // codebase and this is it — and it stays untouched for the upload, which is the
+  // consumer that cannot make its own copy because it is handed the result. The
+  // parsers are the consumers that can be given one, so they are.
+  //
+  // docxText copies again internally (Buffer.from) and did not have this bug;
+  // it takes the copy anyway so the rule is one rule rather than a fact about
+  // which of two parsers happens to be polite. A copy of a file capped at 5 MB
+  // is not a cost worth reasoning about per-parser.
+  const forParser = new Uint8Array(bytes);
+  const text = kind === "pdf" ? await pdfText(forParser) : await docxText(forParser);
   const trimmed = text.replace(/\s+/g, " ").trim();
 
   if (trimmed.length < MIN_TEXT_CHARS) {
@@ -224,6 +249,7 @@ export async function parseResume(file: File): Promise<ParsedResume> {
     // lib/skills matches multi-word terms across whitespace, and the collapsed
     // copy above exists only to count characters honestly.
     text,
+    // The untouched original, never given to a parser. See the copy above.
     bytes,
     size: file.size,
   };
