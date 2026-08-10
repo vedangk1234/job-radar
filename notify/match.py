@@ -7,7 +7,7 @@ anything away. Store loosely, notify tightly; this is the tight end.
 
 The six tests are independent and combine with AND:
 
-    city_ok              the stored city label is in preferences.cities
+    city_ok              the stored city label is one this account asked for
     keyword_ok           the title matches at least one keyword
     excluded             the title matches at least one exclusion            (negated)
     level_excluded       the title states a seniority level above max_level  (negated)
@@ -152,6 +152,64 @@ from typing import Any, Iterable, Mapping, Sequence
 # not match. Re-add 'india-unclear' from the preferences screen to get the old
 # behaviour back — the row is the source of truth and this is only its mirror.
 DEFAULT_CITIES = ("blr", "pune", "hyd")
+
+# THE CITY GATE'S NEW INPUTS — Phase 3, cities Slice B.
+#
+# selected_cities and all_india arrived empty in Step 0 and are read here for the
+# first time. `cities` above is NOT renamed and NOT deleted: it is the legacy
+# column, it is still what the DEPLOYED digest reads, and it is still written on
+# every save. See `Preferences.effective_cities` for how the two combine and for
+# the sentence naming the slice that deletes the fallback.
+#
+# DEFAULT_ALL_INDIA IS FALSE, and that is the closed default rather than a
+# neutral one. TRUE would mean a database with no preferences row at all emails
+# every Indian posting on the board — the widest possible filter, arrived at by
+# omission, which is the exact shape of failure the unconfigured experience range
+# was given "matches nothing" to avoid.
+DEFAULT_SELECTED_CITIES: tuple[str, ...] = ()
+DEFAULT_ALL_INDIA = False
+
+# The one label that is never India. Named once, here, because two rules read it
+# and both mean the same thing by it: all_india is "anywhere except this", and a
+# remote posting is allowed to ignore the city gate but is not allowed to ignore
+# the country.
+#
+# STATED AS A COMPLEMENT RATHER THAN AS THE 25-ITEM MEMBERSHIP LIST IT IS
+# EQUIVALENT TO, and the argument is fetchers.normalize.india_funnel's verbatim:
+# a hand-written set of Indian labels works at 26 labels and becomes a trap at 27,
+# because adding a city and forgetting to add it there silently NARROWS the rule
+# for every all-India account, with nothing raising anywhere. There is exactly one
+# label the question answers no to, so that is the one this file names.
+NON_INDIA_LABEL = "non-india"
+
+# THE LABELS AN EXPLICIT CITY SELECTION MAY NEVER MATCH — the fail-closed half of
+# this slice, and the only place the city gate is not vocabulary-blind.
+#
+# `india-unclear` means "we could not tell": bare "Remote", bare "India", or a
+# state that contains a city on the list. It is a statement about OUR confidence,
+# not about the posting's location, and a person who ticked `chennai` did not ask
+# to be told about postings that might be anywhere. So it matches all-India
+# accounts — who have said the country is enough — and nobody else.
+#
+# `non-india` is here for the sharper reason: it is the one label all_india
+# excludes by definition, and an explicit branch that could match it would mean
+# the narrow filter admitting rows the wide one refuses. That is not a preference,
+# it is an ordering violation.
+#
+# `other-india` is deliberately NOT here. It is a CONFIDENT statement that the
+# posting is in India, at a named place outside the 23 — Lucknow, Mohali, Patna —
+# so ticking it is a coherent thing to want ("anywhere else in India") and it
+# carries none of the vagueness that disqualifies india-unclear.
+#
+# ENFORCED IN THREE PLACES, because the failure is silent in both directions: the
+# editor does not offer these two, PUT /api/preferences refuses them in
+# selected_cities, and this set is what makes it a PROPERTY rather than a promise
+# for a row edited by hand in psql.
+CITY_SELECTION_NEVER_MATCHES = frozenset({"india-unclear", NON_INDIA_LABEL})
+
+# jobs.work_mode, when the parser that fills it exists. NULL on every one of the
+# 9,703 stored rows today — see is_remote below, which is why this is inert.
+REMOTE_WORK_MODE = "remote"
 
 # Grounded in the resume rather than in what a job board happens to call things:
 # every term here is a role title, a stack, or a discipline actually worth
@@ -356,7 +414,7 @@ class Preferences:
     preferences relies on to deduplicate identical filters — the three fields
     added in Slice 2 are an int, an int and a bool, so that still holds.
 
-    SEVEN FIELDS, AND THE ONE THAT IS DELIBERATELY ABSENT.
+    NINE FIELDS SINCE CITIES SLICE B, AND THE ONE THAT IS DELIBERATELY ABSENT.
     preferences.years_of_experience_held is NOT here, and it is not an oversight.
     It is informational — how much experience the person HAS, which the profile
     screen collects and shows — and it must never filter anything. Keeping it off
@@ -370,15 +428,56 @@ class Preferences:
     meaningful value on those columns: "this account has not configured a range".
     See experience_excluded for what that resolves to, and why it is not the
     seeded default.
+
+    THREE CITY FIELDS RATHER THAN ONE, FOR EXACTLY ONE SLICE. `cities` is the
+    legacy column, `selected_cities` is what a person ticked, `all_india` is the
+    switch that ignores both. effective_cities resolves the first two; the
+    contract slice deletes `cities` and this paragraph with it.
     """
 
     cities: tuple[str, ...] = DEFAULT_CITIES
+    selected_cities: tuple[str, ...] = DEFAULT_SELECTED_CITIES
+    all_india: bool = DEFAULT_ALL_INDIA
     keywords: tuple[str, ...] = DEFAULT_KEYWORDS
     exclusions: tuple[str, ...] = DEFAULT_EXCLUSIONS
     max_level: int = DEFAULT_MAX_LEVEL
     exp_range_low: int | None = DEFAULT_EXP_RANGE_LOW
     exp_range_high: int | None = DEFAULT_EXP_RANGE_HIGH
     show_no_experience_jobs: bool = DEFAULT_SHOW_NO_EXPERIENCE_JOBS
+
+    @property
+    def effective_cities(self) -> tuple[str, ...]:
+        """The city list the gate actually reads: the new column, else the old one.
+
+        THE MIGRATION-WINDOW FALLBACK, AND IT HAS AN EXPIRY DATE. Slice B moves the
+        gate from `cities` to `selected_cities`, and the two columns are populated
+        by different things: `selected_cities` by
+        scripts/backfill_onboarding_prefs.py and by every save through
+        PUT /api/preferences since this slice, `cities` by every save ever made.
+        A row that predates the backfill has the second and not the first, and
+        reading only the new column would silently empty that account's digest —
+        the "quiet week rather than an error" failure this project spends its
+        guards on.
+
+        SO WHY IS THIS NOT THE "FILTER NOBODY CHOSE" MISTAKE Slices 1b and 1c
+        removed? Because it is not a fallback to somebody ELSE'S answer. It is a
+        fallback to THIS account's own previous answer, sitting in the column that
+        answer was written to. The failure those slices fixed was handing a
+        stranger the operator's three cities; this hands a person their own.
+
+        IT CANNOT RE-OPEN THE BLANK-ACCOUNT HOLE, which is the thing to check
+        before believing the paragraph above. A brand-new account has BOTH columns
+        empty (NEW_ACCOUNT_SEED writes `cities: []`, and selected_cities takes its
+        schema default of '{}'), so the fallback resolves to () and the gate
+        matches nothing — fail-closed, exactly as specified, with no special case.
+
+        THE CONTRACT SLICE DELETES THIS. Once PUT has written selected_cities for
+        every account that has ever saved, `cities` is vestigial: the next slice
+        stops writing it, drops the column, and this property collapses to a field
+        read. It is written as one expression in one place precisely so that
+        deletion is a deletion rather than an audit.
+        """
+        return self.selected_cities or self.cities
 
     @staticmethod
     def _as_tuple(value: Any, fallback: Sequence[str]) -> tuple[str, ...]:
@@ -448,6 +547,26 @@ class Preferences:
         except (TypeError, ValueError):
             return None
 
+    @classmethod
+    def _as_tuple_column(
+        cls, row: Mapping[str, Any], key: str, fallback: Sequence[str]
+    ) -> tuple[str, ...]:
+        """_as_tuple, but reading a column that may not be in the row at all.
+
+        Needed for selected_cities and nothing else. The four original list columns
+        are indexed directly because a row without them is not a database this code
+        can run against; selected_cities is different only in that a caller may
+        legitimately hand over a row from before Slice B — the SQLite mirror in a
+        test, a --dry-run against an un-migrated database — and the honest answer
+        there is the fallback, which is empty, which makes effective_cities defer to
+        the legacy column. A KeyError in the middle of a digest run is not.
+        """
+        try:
+            value = row[key]
+        except (KeyError, IndexError, TypeError):
+            return tuple(fallback)
+        return cls._as_tuple(value, fallback)
+
     @staticmethod
     def _as_bool(row: Mapping[str, Any], key: str, fallback: bool) -> bool:
         """Read show_no_experience_jobs, which is NOT NULL and so may fall back.
@@ -477,6 +596,10 @@ class Preferences:
             return cls()
         return cls(
             cities=cls._as_tuple(row["cities"], DEFAULT_CITIES),
+            selected_cities=cls._as_tuple_column(
+                row, "selected_cities", DEFAULT_SELECTED_CITIES
+            ),
+            all_india=cls._as_bool(row, "all_india", DEFAULT_ALL_INDIA),
             keywords=cls._as_tuple(row["keywords"], DEFAULT_KEYWORDS),
             exclusions=cls._as_tuple(row["exclusions"], DEFAULT_EXCLUSIONS),
             max_level=cls._as_level(row, DEFAULT_MAX_LEVEL),
@@ -491,11 +614,45 @@ class Preferences:
 # --- the four tests -------------------------------------------------------
 
 
+def is_remote(job: Mapping[str, Any]) -> bool:
+    """The posting is fully remote, per the stored jobs.work_mode label.
+
+    READ, NEVER RECOMPUTED — the same contract `city`, `is_pm_role` and
+    `min_experience` follow. The evidence is a description or a location string;
+    the conclusion is the column.
+
+    THIS FUNCTION RETURNS FALSE FOR EVERY JOB IN THE DATABASE TODAY, and that is
+    a fact worth stating rather than a hedge. jobs.work_mode is NULL on all 9,703
+    stored rows (9,703 of 9,703, checked against live Postgres when this was
+    written) because the parser that fills it does not exist yet — it is the next
+    slice. `or ""` turns that NULL into the empty string, which is not
+    REMOTE_WORK_MODE, so every job is treated as NOT remote.
+
+    So the remote branch in city_ok below is CORRECT AND INERT. It is built now,
+    against the column's specified values, so that the work-mode slice turns it on
+    by populating the column rather than by editing the rule — which is the same
+    expand-then-contract ordering jobs.seeded and the experience columns followed,
+    and the reason neither of those needed the matcher touched twice.
+
+    NULL READS AS NOT-REMOTE RATHER THAN AS UNKNOWN-MEANS-KEEP, which is the
+    opposite of what min_experience does with its NULL, and the asymmetry is
+    deliberate. The remote branch RELAXES a gate: reading "we have not parsed this
+    yet" as "fully remote" would drop the city filter for the entire board, which
+    is the widest possible failure reached by the emptiest possible evidence.
+    city_ok has no inclusion bias, and this is that rule applied to a second
+    column.
+    """
+    return (job.get("work_mode") or "") == REMOTE_WORK_MODE
+
+
 def city_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
-    """The job's stored city label is one we asked for.
+    """The job's location is one this account asked for. Three branches.
 
     The label was computed at crawl time by fetchers.normalize.city_label and
     written to the row; it is read here, never recomputed.
+
+        remote or all-India  ->  anywhere except non-india
+        an explicit list     ->  membership, minus the two labels that never match
 
     The gate is strict and has to be: a label not in the list fails, and so does
     a NULL one — `or ""` turns an unlabelled row into the empty string, which is
@@ -503,8 +660,44 @@ def city_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
     This is the one test in the file with NO inclusion bias, because unlike a
     silent description a location string is always present and always readable:
     if the label is not one we asked for, that is an answer and not a gap.
+
+    THE TWO RELAXING BRANCHES SHARE A LINE, AND THAT IS THE POINT. all_india and
+    a remote posting are different questions — "I do not care which city" and
+    "this job has no city" — and they have the same answer: any label except
+    non-india. Writing it once means the country floor cannot be enforced in one
+    and forgotten in the other, which is the shape of every leak in this file's
+    history.
+
+    WHY non-india IS EXCLUDED FROM THE RELAXING BRANCHES BUT NOT TESTED AT THE
+    TOP. A person who explicitly ticks a city gets a plain membership test, which
+    is what keeps the gate vocabulary-blind and what makes "the operator's
+    blr/pune/hyd is reproduced exactly" true by inspection rather than by
+    argument. The country floor belongs to RELAXATION — it is the thing that stops
+    "I do not mind where" meaning "including Berlin".
+
+    CITY_SELECTION_NEVER_MATCHES IS THE ONE PLACE THIS GATE KNOWS A LABEL BY NAME,
+    and it is checked before the membership test rather than filtered out of the
+    list, so a row edited by hand in psql cannot get past it either. See that
+    constant for why india-unclear and non-india are on it and other-india is not.
+
+    WHAT THIS DELIBERATELY DOES NOT READ is the preferences column holding which
+    working arrangements an account WANTS. That is a filter of its own and belongs
+    to the work-mode slice, with the parser that makes it answerable; naming it
+    here is not just premature but is caught by tests/test_phase3_columns.py, whose
+    sweep reads prose as well as code on the argument that a column named in a
+    comment is where the next edit starts. This branch is only about a remote
+    posting being exempt from a CITY test, which is a statement about geography
+    rather than about preference.
     """
-    return (job.get("city") or "") in prefs.cities
+    city = job.get("city") or ""
+
+    if is_remote(job) or prefs.all_india:
+        return city != NON_INDIA_LABEL
+
+    if city in CITY_SELECTION_NEVER_MATCHES:
+        return False
+
+    return city in prefs.effective_cities
 
 
 def keyword_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
@@ -675,7 +868,22 @@ def explain(job: Mapping[str, Any], prefs: Preferences) -> MatchReport:
     is_pm = pm_excluded(job)
 
     if not city_ok(job, prefs):
-        reason = f"city {job.get('city')!r} not in preferences"
+        # THREE WAYS TO FAIL ONE GATE, worded so the report names the branch that
+        # actually fired. Same discipline as the experience reasons below, and the
+        # same constraint: dashboard/src/lib/match.explain states these strings
+        # character for character, because match-parity prints them when the two
+        # languages disagree and a reason that reads differently makes a real
+        # drift harder to see than no reason at all.
+        city = job.get("city") or ""
+        if prefs.all_india or is_remote(job):
+            reason = f"all-India, but {job.get('city')!r} is not in India"
+        elif city in CITY_SELECTION_NEVER_MATCHES:
+            reason = (
+                f"city {job.get('city')!r} never matches an explicit city "
+                f"selection — it is covered by the all-India switch"
+            )
+        else:
+            reason = f"city {job.get('city')!r} not in preferences"
     elif not keywords_hit:
         reason = "no keyword in title"
     elif exclusions_hit:

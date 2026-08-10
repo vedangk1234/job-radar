@@ -67,6 +67,7 @@ type Row = {
   company: string;
   title: string;
   city: string | null;
+  work_mode: string | null;
   min_experience: number | null;
   is_pm_role: boolean;
   desc_checked: boolean;
@@ -84,7 +85,7 @@ type Row = {
  *
  * SEVERAL FILTERS PER RUN SINCE PHASE 3 SLICE 2, in ONE subprocess. The
  * interesting variants (see VARIANTS below) all run against the same job list, so
- * paying for the interpreter and the import four times would buy nothing.
+ * paying for the interpreter and the import once per variant would buy nothing.
  */
 const PY = `
 import json, sys
@@ -132,12 +133,14 @@ async function main() {
   `;
   if (!user) throw new Error("MY_EMAIL matches no row in public.users — run scripts/seed_user.py");
 
-  // The same seven columns notify/store.PREFERENCES_SQL selects. Selecting fewer
-  // would hand both matchers an undefined range, which is not a state any real
-  // loader can produce — the check would then be comparing two implementations on
-  // an input neither will ever see.
+  // The same nine columns notify/store.PREFERENCES_SQL selects — nine since cities
+  // Slice B added the city gate's two and kept the legacy one for the fallback.
+  // Selecting fewer would hand both matchers an undefined range or an undefined
+  // city answer, which is not a state any real loader can produce — the check would
+  // then be comparing two implementations on an input neither will ever see.
   const [prefsRow] = await sql<Preferences[]>`
-    SELECT cities, keywords, exclusions, max_level,
+    SELECT cities, selected_cities, all_india,
+           keywords, exclusions, max_level,
            exp_range_low, exp_range_high, show_no_experience_jobs
       FROM preferences WHERE user_id = ${user.id}
   `;
@@ -160,7 +163,7 @@ async function main() {
   // and so cannot embed that fragment. Nothing decides on it here, and
   // `npm run badge-check` is what runs the production predicate itself.
   const jobs = await sql<Row[]>`
-    SELECT j.canonical_id, c.name AS company, j.title, j.city,
+    SELECT j.canonical_id, c.name AS company, j.title, j.city, j.work_mode,
            j.min_experience, j.is_pm_role, j.desc_checked, j.desc_fetch_failed,
            EXISTS (
              SELECT 1
@@ -222,12 +225,41 @@ async function main() {
         show_no_experience_jobs: true,
       },
     },
+
+    /*
+     * THE CITY VARIANTS — cities Slice B, and the same argument the experience
+     * matrix makes one field over. The live row is a three-city selection, which is
+     * ONE of the gate's three branches; running only it would prove the port did
+     * not regress and prove nothing about all-India or about the fail-closed rule.
+     *
+     * These differ from the live row ONLY in the city fields, so any disagreement
+     * is attributable to the gate rather than to a keyword or a range.
+     */
+    {
+      label: "all-India",
+      note: "every Indian label, incl. the two buckets — must EXCLUDE non-india only",
+      prefs: { ...prefsRow, all_india: true, selected_cities: [] },
+    },
+    {
+      label: "no city answer",
+      note: "neither a selection nor the switch — must match NOTHING, fail-closed",
+      prefs: { ...prefsRow, all_india: false, selected_cities: [], cities: [] },
+    },
+    {
+      label: "Mumbai umbrella",
+      note: "what ticking 'All Mumbai areas' stores — the save-time expansion, as a filter",
+      prefs: {
+        ...prefsRow,
+        all_india: false,
+        selected_cities: ["mumbai", "navi-mumbai", "mumbai-suburban", "thane"],
+      },
+    },
   ];
 
   const pythonMatched = python({ variants: VARIANTS, jobs }).matched;
   let drifted = 0;
 
-  console.log("prefs matrix — the same open rows under four experience filters:");
+  console.log("prefs matrix — the same open rows under seven filters (experience, then city):");
   const perVariant: Set<string>[] = [];
 
   for (const [i, variant] of VARIANTS.entries()) {
@@ -273,9 +305,39 @@ async function main() {
     process.exitCode = 1;
   }
 
+  // The same treatment for the city gate's fail-closed branch, and for the same
+  // reason: two implementations agreeing on a wrong answer would pass a comparison.
+  // "A blank city answer matches nothing" is the PROPERTY, and a fallback to the
+  // legacy column or to the install's three cities would make both sides agree on
+  // ~38 instead.
+  const noCityAnswer = perVariant[5].size;
+  if (noCityAnswer !== 0) {
+    console.error(
+      `\nA BLANK CITY ANSWER MATCHED ${noCityAnswer} job(s). Neither a selection nor ` +
+        `the all-India switch must match nothing — see notify/match.city_ok.`,
+    );
+    process.exitCode = 1;
+  }
+
+  /*
+   * THE REMOTE BRANCH IS NOT EXERCISED BY ANY VARIANT ABOVE, and printing that is
+   * the point. jobs.work_mode is filled by a parser that does not exist yet, so
+   * every row arrives NULL and notify.match.is_remote is False for all of them — a
+   * green matrix is evidence about the CITY gate and no evidence whatever about the
+   * relaxation. tests/test_phase3_columns.py::test_the_remote_branch_is_built_but_
+   * inert is what covers it, over synthetic rows, because the database cannot.
+   */
+  const parsedWorkMode = jobs.filter((j) => j.work_mode !== null).length;
+  console.log(
+    `\nwork_mode: ${parsedWorkMode} of ${jobs.length} rows non-NULL — the remote branch is ` +
+      (parsedWorkMode === 0
+        ? "NOT exercised by live data (inert until the work-mode slice)"
+        : "now reachable from live data"),
+  );
+
   // The live row's verdict is what the rest of the report describes: the per-company
   // breakdown, the "For you" total, and the number this script exists to be
-  // comparable with (preview_digest.py). The other three variants are checked above
+  // comparable with (preview_digest.py). The other variants are checked above
   // and deliberately do not appear below — they are hypotheticals, not this
   // account's inbox.
   const fromTs = perVariant[0];

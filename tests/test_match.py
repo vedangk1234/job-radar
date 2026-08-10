@@ -124,16 +124,37 @@ def test_a_null_city_is_not_a_pass():
         assert not is_match(j, PREFS)
 
 
-def test_the_unclear_label_is_still_available_to_anyone_who_wants_it():
-    """Strictness is the DEFAULT, not a rule the preferences row cannot change.
+def test_the_unclear_label_is_reachable_through_all_india_and_only_through_it():
+    """Cities Slice B moved which FIELD turns 'india-unclear' back on.
 
-    The filter is data, and this is the whole reason it is: re-adding
-    'india-unclear' from the preferences screen brings the old behaviour back on
-    the very next digest, with no redeploy and no commit.
+    THIS TEST USED TO ASSERT THE OPPOSITE HALF OF IT, and the reversal is the
+    slice rather than a regression. It read: strictness is the default, not a rule
+    the preferences row cannot change — so `cities=(..., "india-unclear")` brought
+    the old lenient behaviour back on the next digest. That is still true of the
+    PRINCIPLE and no longer true of the FIELD.
+
+    'india-unclear' means "we could not tell where this job is" — a statement about
+    our confidence, not about a location. A person who ticked `blr` did not ask to
+    be told about postings that might be anywhere, so an explicit city selection
+    can never match it (notify.match.CITY_SELECTION_NEVER_MATCHES), and the switch
+    that says "the country is enough for me" is what does. The filter is still
+    data; the answer is `all_india` now.
+
+    Both directions are asserted, because only the pair is the rule: the first
+    alone would pass if the label matched everybody, and the second alone would
+    pass if it matched nobody.
     """
-    lenient = Preferences(cities=("blr", "pune", "hyd", "india-unclear"))
     j = job("Backend Engineer", city="india-unclear", location="Remote - India")
-    assert is_match(j, lenient)
+
+    all_india = Preferences(selected_cities=(), all_india=True)
+    assert is_match(j, all_india)
+
+    # Even naming it outright does not get it past the gate — the check is on the
+    # LABEL rather than on the list, so a row edited by hand in psql cannot buy
+    # its way in either.
+    named = Preferences(selected_cities=("blr", "pune", "hyd", "india-unclear"))
+    assert not city_ok(j, named)
+    assert not is_match(j, named)
 
 
 # --- word boundaries ------------------------------------------------------

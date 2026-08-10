@@ -22,6 +22,8 @@
  */
 export type Preferences = {
   cities: string[];
+  selected_cities: string[];
+  all_india: boolean;
   keywords: string[];
   exclusions: string[];
   max_level: number;
@@ -135,14 +137,51 @@ export const CITY_LABELS = [
 export type CityLabel = (typeof CITY_LABELS)[number];
 
 /**
- * The three that are cities somebody might plausibly want but which no board in
- * this database has ever written, kept only so the preferences UI can group the
- * vocabulary. Purely presentational; nothing filters on it.
+ * THE LABELS AN EXPLICIT CITY SELECTION MAY CONTAIN — 24 of the 26.
+ *
+ * `india-unclear` and `non-india` are deliberately absent, and this constant is
+ * the FIRST of the three layers that keep them out (the editor renders from these
+ * groups, PUT /api/preferences validates against this list, and
+ * notify.match.CITY_SELECTION_NEVER_MATCHES is the property rather than the
+ * promise). Read that constant for the argument; the short version is that
+ * india-unclear is a statement about our confidence rather than about a location,
+ * so it belongs to the all-India switch, and non-india is the one label all-India
+ * excludes by definition — an explicit selection able to match it would mean the
+ * narrow filter admitting rows the wide one refuses.
+ *
+ * `other-india` IS here. It is a confident statement that the posting is in India
+ * at a named place outside the 23, so ticking it means "anywhere else in India",
+ * which is a coherent thing to want.
+ *
+ * NOT A SECOND VOCABULARY. CITY_LABELS above is still the full 26 and is still
+ * what tests/test_city_vocabulary.py mirrors against fetchers/normalize — the
+ * labeller can produce all of them and jobs.city holds all of them. This is the
+ * subset a PERSON may choose, which is a different question, and keeping the two
+ * constants separate is what stops "we stopped offering a label" from silently
+ * becoming "we stopped labelling with it".
+ *
+ * `umbrella` is the tick-one-get-all control. It is PRESENTATION AND A SAVE-TIME
+ * EXPANSION, never a stored value: ticking it selects its members and
+ * selected_cities stores the members, so notify/match.py never learns that
+ * "Mumbai region" is a thing. See PUT /api/preferences for why the expansion
+ * happens at the route as well as in the browser.
  */
-export const CITY_LABEL_GROUPS: ReadonlyArray<{ heading: string; labels: readonly string[] }> = [
+export const CITY_LABEL_GROUPS: ReadonlyArray<{
+  heading: string;
+  labels: readonly string[];
+  umbrella?: string;
+}> = [
   { heading: "Target cities", labels: ["blr", "hyd", "pune"] },
-  { heading: "Mumbai region", labels: ["mumbai", "navi-mumbai", "mumbai-suburban", "thane"] },
-  { heading: "Delhi NCR", labels: ["new-delhi", "gurugram", "noida"] },
+  {
+    heading: "Mumbai region",
+    umbrella: "All Mumbai areas",
+    labels: ["mumbai", "navi-mumbai", "mumbai-suburban", "thane"],
+  },
+  {
+    heading: "Delhi NCR",
+    umbrella: "All of Delhi/NCR",
+    labels: ["new-delhi", "gurugram", "noida"],
+  },
   {
     heading: "Other listed cities",
     labels: [
@@ -151,8 +190,23 @@ export const CITY_LABEL_GROUPS: ReadonlyArray<{ heading: string; labels: readonl
       "mangaluru", "mysuru", "belagavi",
     ],
   },
-  { heading: "Buckets", labels: ["other-india", "non-india", "india-unclear"] },
+  { heading: "Elsewhere in India", labels: ["other-india"] },
 ];
+
+/** Every label a person may put in selected_cities, flattened from the groups. */
+export const SELECTABLE_CITY_LABELS: readonly string[] = CITY_LABEL_GROUPS.flatMap(
+  (group) => group.labels,
+);
+
+/**
+ * Tick the umbrella, get these. Derived from the groups rather than restated, so
+ * a city added to a group above cannot be forgotten here.
+ */
+export const CITY_UMBRELLAS: ReadonlyArray<{ label: string; members: readonly string[] }> =
+  CITY_LABEL_GROUPS.filter((g) => g.umbrella).map((g) => ({
+    label: g.umbrella as string,
+    members: g.labels,
+  }));
 
 /**
  * The hand-tags companies.category is allowed to hold, per db/schema.sql.
@@ -190,6 +244,15 @@ export type Category = (typeof CATEGORIES)[number];
  */
 export const DEFAULT_PREFERENCES = {
   cities: ["blr", "pune", "hyd"],
+  // The city gate's new inputs, mirroring notify/match.DEFAULT_SELECTED_CITIES and
+  // DEFAULT_ALL_INDIA. BOTH ARE BLANK, and the blank is what makes this constant
+  // still describe the install's filter: an empty selected_cities defers to
+  // `cities` above (notify.match.Preferences.effective_cities), so the fallback
+  // filter a database with no preferences row runs on is the same three cities it
+  // has always been. all_india FALSE is the closed default — TRUE reached by
+  // omission would be the widest possible filter, chosen by nobody.
+  selected_cities: [],
+  all_india: false,
   keywords: [
     "software engineer", "software developer", "software development engineer", "sde",
     "associate software engineer", "member of technical staff", "mts",

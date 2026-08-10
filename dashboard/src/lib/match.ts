@@ -66,6 +66,8 @@
  */
 export type Preferences = {
   cities: readonly string[];
+  selected_cities: readonly string[];
+  all_india: boolean;
   keywords: readonly string[];
   exclusions: readonly string[];
   max_level: number;
@@ -74,15 +76,37 @@ export type Preferences = {
   show_no_experience_jobs: boolean;
 };
 
-/** Anything with the columns the rules read. Both job shapes in the app satisfy it. */
+/**
+ * Anything with the columns the rules read. Both job shapes in the app satisfy it.
+ *
+ * `work_mode` joined the list in cities Slice B and is OPTIONAL for the reason the
+ * rest are: a caller that has not selected it hands over `undefined`, which
+ * `isRemote` reads as not-remote — the same answer the column's NULL gives, which
+ * is the answer for every row in the database today. lib/jobs.jobColumns does
+ * select it, so the app's own rows carry the real value the moment the parser
+ * fills it in.
+ */
 export type MatchableJob = {
   title?: string | null;
   city?: string | null;
+  work_mode?: string | null;
   min_experience?: number | null;
   is_pm_role?: boolean | null;
   desc_checked?: boolean | null;
   desc_fetch_failed?: boolean | null;
 };
+
+/** notify/match.NON_INDIA_LABEL. The one label that is never India. */
+export const NON_INDIA_LABEL = "non-india";
+
+/** notify/match.CITY_SELECTION_NEVER_MATCHES — read that constant for the argument. */
+export const CITY_SELECTION_NEVER_MATCHES: ReadonlySet<string> = new Set([
+  "india-unclear",
+  NON_INDIA_LABEL,
+]);
+
+/** notify/match.REMOTE_WORK_MODE. */
+export const REMOTE_WORK_MODE = "remote";
 
 /*
  * MAX_MIN_EXPERIENCE USED TO BE EXPORTED FROM HERE AND IS GONE.
@@ -231,8 +255,47 @@ export function detectLevel(title: string | null | undefined): number | null {
 
 // --- the six tests ---------------------------------------------------------
 
+/**
+ * The city list the gate actually reads — notify.match.Preferences.effective_cities.
+ *
+ * The new column when it has anything, the legacy one otherwise. A migration-window
+ * fallback to THIS account's own previous answer, not to somebody else's; the
+ * contract slice deletes it along with `cities`. See the Python for the full
+ * argument, including why it cannot re-open the blank-account hole.
+ */
+export function effectiveCities(prefs: Preferences): readonly string[] {
+  return prefs.selected_cities.length ? prefs.selected_cities : prefs.cities;
+}
+
+/**
+ * The posting is fully remote, per the stored jobs.work_mode label.
+ *
+ * FALSE FOR EVERY JOB IN THE DATABASE TODAY — work_mode is NULL on all 9,703
+ * stored rows, because the parser that fills it is the next slice. So the remote
+ * branch in cityOk is correct and INERT, built now so the work-mode slice turns it
+ * on by populating a column rather than by editing a rule. `?? ""` reads NULL and
+ * undefined alike as not-remote, deliberately: the branch RELAXES a gate, and
+ * treating "not parsed yet" as "fully remote" would drop the city filter for the
+ * whole board on the emptiest possible evidence.
+ */
+export function isRemote(job: MatchableJob): boolean {
+  return (job.work_mode ?? "") === REMOTE_WORK_MODE;
+}
+
+/**
+ * Three branches — see notify.match.city_ok, which carries the argument.
+ *
+ *   remote or all-India  ->  anywhere except non-india
+ *   an explicit list     ->  membership, minus the two labels that never match
+ */
 export function cityOk(job: MatchableJob, prefs: Preferences): boolean {
-  return prefs.cities.includes(job.city ?? "");
+  const city = job.city ?? "";
+
+  if (isRemote(job) || prefs.all_india) return city !== NON_INDIA_LABEL;
+
+  if (CITY_SELECTION_NEVER_MATCHES.has(city)) return false;
+
+  return effectiveCities(prefs).includes(city);
 }
 
 export function keywordOk(job: MatchableJob, prefs: Preferences): boolean {
@@ -341,8 +404,19 @@ export function explain(job: MatchableJob, prefs: Preferences): { matched: boole
   const years = minExperienceOf(job);
 
   let reason: string;
-  if (!cityOk(job, prefs)) reason = `city ${JSON.stringify(job.city)} not in preferences`;
-  else if (!keywordsHit.length) reason = "no keyword in title";
+  if (!cityOk(job, prefs)) {
+    // Three ways to fail one gate, worded as notify/match.explain words them —
+    // match-parity prints this string when the two disagree, and a reason that
+    // reads differently from the Python's makes a real drift harder to see.
+    const city = job.city ?? "";
+    if (prefs.all_india || isRemote(job))
+      reason = `all-India, but ${JSON.stringify(job.city)} is not in India`;
+    else if (CITY_SELECTION_NEVER_MATCHES.has(city))
+      reason =
+        `city ${JSON.stringify(job.city)} never matches an explicit city ` +
+        `selection — it is covered by the all-India switch`;
+    else reason = `city ${JSON.stringify(job.city)} not in preferences`;
+  } else if (!keywordsHit.length) reason = "no keyword in title";
   else if (exclusionsHit.length) reason = `excluded by ${exclusionsHit.join(", ")}`;
   else if (level !== null && level > prefs.max_level)
     reason = `level ${level} above max_level ${prefs.max_level}`;

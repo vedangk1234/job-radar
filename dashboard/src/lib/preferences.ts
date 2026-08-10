@@ -18,7 +18,15 @@ import { CITY_LABELS, type Preferences } from "./labels";
  * postgres.js into the browser bundle.
  */
 
-export { CITY_LABELS, KEYWORD_CAP, LEVEL_LABELS, type Preferences } from "./labels";
+export {
+  CITY_LABELS,
+  CITY_LABEL_GROUPS,
+  CITY_UMBRELLAS,
+  KEYWORD_CAP,
+  LEVEL_LABELS,
+  SELECTABLE_CITY_LABELS,
+  type Preferences,
+} from "./labels";
 
 /**
  * The two ways this can find nothing, and why they must not share a message.
@@ -64,7 +72,8 @@ async function explainMissingRow(): Promise<never> {
  */
 export async function loadPreferences(userId: string): Promise<Preferences> {
   const [row] = await sql<Preferences[]>`
-    SELECT cities, keywords, exclusions, max_level,
+    SELECT cities, selected_cities, all_india,
+           keywords, exclusions, max_level,
            exp_range_low, exp_range_high, years_of_experience_held,
            show_no_experience_jobs,
            updated_at, onboarding_completed
@@ -134,11 +143,27 @@ export async function onboardingCompleted(userId: string): Promise<boolean> {
  *
  * years_of_experience_held IS nullable here, deliberately. It never filters, so
  * "not stated" is a legitimate permanent answer rather than a broken filter.
+ *
+ * `cities` IS WRITTEN ALONGSIDE selected_cities, AND IT IS VESTIGIAL ON PURPOSE
+ * FOR EXACTLY ONE SLICE. Cities Slice B moved the gate onto selected_cities +
+ * all_india in both matchers; the DEPLOYED digest is still running the previous
+ * commit, which reads `cities`. Dual-writing is what makes this slice a no-op
+ * against production during the window between the commit and the deploy, and
+ * what makes reverting it a no-op too — the same expand-then-contract ordering
+ * jobs.notified followed through 1d-1g, where the write outlived its last reader
+ * by design rather than by neglect.
+ *
+ * The route above derives it: the expanded selection, or the 25 India labels when
+ * all_india is on, so an all-India account rolled back onto the old matcher gets
+ * the closest honest approximation rather than an empty digest. The CONTRACT slice
+ * removes the parameter, the column and this paragraph together.
  */
 export async function savePreferences(
   userId: string,
   next: {
     cities: string[];
+    selected_cities: string[];
+    all_india: boolean;
     keywords: string[];
     exclusions: string[];
     max_level: number;
@@ -151,6 +176,8 @@ export async function savePreferences(
   const [row] = await sql<Preferences[]>`
     UPDATE preferences
        SET cities                   = ${next.cities}::text[],
+           selected_cities          = ${next.selected_cities}::text[],
+           all_india                = ${next.all_india},
            keywords                 = ${next.keywords}::text[],
            exclusions               = ${next.exclusions}::text[],
            max_level                = ${next.max_level},
@@ -161,7 +188,8 @@ export async function savePreferences(
            onboarding_completed     = TRUE,
            updated_at               = now()
      WHERE user_id = ${userId}
-    RETURNING cities, keywords, exclusions, max_level,
+    RETURNING cities, selected_cities, all_india,
+              keywords, exclusions, max_level,
               exp_range_low, exp_range_high, years_of_experience_held,
               show_no_experience_jobs,
               updated_at, onboarding_completed

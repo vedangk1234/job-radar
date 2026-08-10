@@ -346,7 +346,14 @@ async function main() {
     // though the row arrived carrying them.
     console.log("\n§6 the first save — a person answering, from a blank row");
     const saved = await savePreferences(newUserId, {
-      cities: ["blr"],
+      // CITIES SLICE B: `cities` is the legacy column, still written so the
+      // deployed digest keeps working, and `selected_cities` is the gate. The
+      // route derives the first from the second; this calls the writer directly,
+      // one layer below it, so it passes both — and passes them EQUAL, which is
+      // what the route produces for an account that is not all-India.
+      cities: ["blr", "mumbai"],
+      selected_cities: ["blr", "mumbai"],
+      all_india: false,
       keywords: ["backend engineer"],
       exclusions: ["intern"],
       max_level: 3,
@@ -362,9 +369,42 @@ async function main() {
 
     check(saved.keywords.length === 1, "it stored the one keyword the person chose");
     check(
-      saved.cities.join() === "blr" && saved.exclusions.join() === "intern" && saved.max_level === 3,
+      saved.cities.join() === "blr,mumbai" &&
+        saved.exclusions.join() === "intern" &&
+        saved.max_level === 3,
       "and their cities, exclusions and max_level — every field on the row is now theirs",
       `got [${saved.cities.join(", ")}] / [${saved.exclusions.join(", ")}] / ${saved.max_level}`,
+    );
+
+    /*
+     * CITIES SLICE B — the columns the city gate now reads, asserted against the
+     * live database rather than against the TypeScript that wrote them.
+     *
+     * `selected_cities` is the one that decides. It arrived '{}' from the schema
+     * default (§4 above asserts that), and a save is the only thing that fills it,
+     * so this is the assertion that the gate has an answer for an onboarded
+     * account — the city half of "onboarded implies configured".
+     *
+     * A CITY THE OLD VOCABULARY COULD NOT SPELL is chosen on purpose. `mumbai` did
+     * not exist as a label before Slice A, so a save that stored it proves the
+     * 26-label vocabulary reaches the column a person actually edits, rather than
+     * only the one the labeller writes.
+     */
+    check(
+      saved.selected_cities.join() === "blr,mumbai",
+      "selected_cities holds what they picked — the column the city gate reads",
+      `got [${saved.selected_cities.join(", ")}]`,
+    );
+    check(
+      saved.all_india === false,
+      "and all_india is FALSE, so the gate reads that selection rather than ignoring it",
+      `got ${saved.all_india}`,
+    );
+    check(
+      saved.selected_cities.join() === saved.cities.join(),
+      "the legacy `cities` column agrees with it, so a rollback to the deployed " +
+        "matcher gives this account the same filter rather than an empty digest",
+      `selected=[${saved.selected_cities.join(", ")}] legacy=[${saved.cities.join(", ")}]`,
     );
     check(
       saved.exp_range_low === 1 && saved.exp_range_high === 4,

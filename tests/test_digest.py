@@ -169,19 +169,23 @@ async def test_candidates_query_respects_the_queue_but_preview_can_ignore_it(dig
 
 async def test_preferences_are_read_from_the_database_not_hardcoded(digest_conn):
     """Edit the row, and the very next run obeys it. That is the Step 5 contract."""
-    await digest_conn.add_job("berlin", title="Backend Engineer", location="Berlin, Germany")
+    # A CITY THIS ACCOUNT HAS NOT ASKED FOR, and it is Chennai rather than Berlin
+    # since cities Slice B. The test needs a job the filter drops and then keeps
+    # once the row changes, and Berlin used to serve because `non-india` was a
+    # selectable label — it is not any more (an explicit selection able to match it
+    # would mean the narrow filter admitting rows the wide one refuses, see
+    # notify.match.CITY_SELECTION_NEVER_MATCHES). Chennai makes exactly the same
+    # point about the row deciding, using a label a person can actually choose.
+    await digest_conn.add_job("chennai-job", title="Backend Engineer", location="Chennai, India")
     assert await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend()) is not None
-    assert await queue_ids(digest_conn) == {"berlin"}  # dropped on city
+    assert await queue_ids(digest_conn) == {"chennai-job"}  # dropped on city
 
-    # `non-india` was spelled `other` until the 25-city rewrite, which split
-    # that label into "an Indian city we did not list" and "not India". Berlin
-    # is the second one.
     await digest_conn.set_preferences(
-        cities=["blr", "non-india"], keywords=["backend"], exclusions=["senior"]
+        cities=["blr", "chennai"], keywords=["backend"], exclusions=["senior"]
     )
     run = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend())
 
-    assert [j["canonical_id"] for j in run.matched] == ["berlin"]
+    assert [j["canonical_id"] for j in run.matched] == ["chennai-job"]
     assert await queue_ids(digest_conn) == set()
 
 

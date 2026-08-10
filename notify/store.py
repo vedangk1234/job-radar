@@ -84,8 +84,16 @@ from .match import Preferences
 # tests/test_phase3_columns.py asserts textually that no matcher in either
 # language names it. Three independent reasons it cannot reach a verdict, none of
 # which is somebody remembering.
+#
+# NINE COLUMNS SINCE CITIES SLICE B, and `cities` is still one of them ON PURPOSE.
+# selected_cities and all_india are the new gate; `cities` is the legacy column
+# the fallback in notify.match.Preferences.effective_cities reads when an account
+# predates scripts/backfill_onboarding_prefs.py. Selecting all three is what makes
+# that fallback reachable — and it is the one place in this file where a column is
+# selected for a reader that will be DELETED rather than added to, which is why
+# the sentence naming the contract slice lives on the property rather than here.
 PREFERENCES_SQL = (
-    "SELECT cities, keywords, exclusions, max_level, "
+    "SELECT cities, selected_cities, all_india, keywords, exclusions, max_level, "
     "exp_range_low, exp_range_high, show_no_experience_jobs "
     "FROM preferences WHERE user_id = $1"
 )
@@ -120,13 +128,22 @@ UNOWNED_PREFERENCES_SQL = "SELECT count(*) FROM preferences WHERE user_id IS NUL
 # candidate test is an OR over all of them — but a run whose output moves between
 # invocations for no reason is harder to compare against yesterday's.
 #
-# THE SAME SEVEN COLUMNS AS PREFERENCES_SQL, which is not a coincidence to be
+# THE SAME NINE COLUMNS AS PREFERENCES_SQL, which is not a coincidence to be
 # tidied later: both build a notify.match.Preferences, so a column one of them
 # selects and the other does not is a filter that means two things depending on
 # which entry point loaded it. The enrichment union would then narrow on a rule
 # the digest does not apply, or the reverse.
+#
+# CITIES SLICE B IS THE FIRST TIME THAT WARNING HAD TEETH. Had only PREFERENCES_SQL
+# gained selected_cities, every account's enrichment filter would have fallen back
+# to the legacy `cities` column while its digest read the new one — so an account
+# that moved from blr to mumbai would have its Mumbai matches enter the digest with
+# desc_checked = FALSE, which means min_experience NULL, which means KEEP. That is
+# the Step 7c leak arriving by a third route, and the only thing preventing it is
+# that these two statements are edited together.
 ACTIVE_PREFERENCES_SQL = """
-SELECT p.cities, p.keywords, p.exclusions, p.max_level,
+SELECT p.cities, p.selected_cities, p.all_india,
+       p.keywords, p.exclusions, p.max_level,
        p.exp_range_low, p.exp_range_high, p.show_no_experience_jobs
   FROM preferences p
   JOIN public.users u ON u.id = p.user_id

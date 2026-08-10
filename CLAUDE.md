@@ -285,7 +285,8 @@ Step 0 added nine more; five are wired up, four are still inert:
 | `exp_range_low`, `exp_range_high` | **live** since Slice 2 — the looking range. Nullable, and NULL means *not configured*, which matches nothing |
 | `show_no_experience_jobs` | **live** since Slice 2 — what a NULL `jobs.min_experience` means for this account |
 | `years_of_experience_held` | stored, editable, **read by no matcher, ever** — informational only |
-| `selected_cities`, `all_india`, `work_modes`, `salary_bands` | still inert, still covered by `tests/test_phase3_columns.py`'s sweep |
+| `selected_cities`, `all_india` | **live** since cities Slice B — the city gate. `cities` is now the legacy fallback for a row that predates the backfill, and the contract slice drops it |
+| `work_modes`, `salary_bands` | still inert, still covered by `tests/test_phase3_columns.py`'s sweep |
 
 It lives in the database and not in a Python constant precisely so the dashboard
 can `UPDATE` it and the very next digest obeys — no redeploy, no commit.
@@ -651,7 +652,7 @@ no clock, no environment — so the whole notify decision is testable without a
 connection.
 
 ```
-is_match  =  city_ok
+is_match  =  city_ok                     (YOUR cities, or all of India)
          AND keyword_ok
          AND NOT excluded            (a word in the title)
          AND NOT level_excluded      (a level notation in the title)
@@ -722,21 +723,57 @@ matcher in either language.
 
 `city_ok` is the one test with no inclusion bias, and the asymmetry is the
 point. A description can be absent and a level can go unstated, but a location
-string is always present and always readable — so a label outside
-`preferences.cities` is an answer rather than a gap, and a NULL label is a bug
-rather than a doubt. `or ""` turns an unlabelled row into the empty string,
-which is in no preferences list, so "we never labelled it" can never read as a
-pass. The seeded default is three cities exactly; `india-unclear` used to be
-there too and is not any more (see *City labelling*). Re-adding it from the
-preferences screen restores the old behaviour on the next digest — the filter is
-data, which is the whole reason it is.
+string is always present and always readable — so a label outside the selection
+is an answer rather than a gap, and a NULL label is a bug rather than a doubt.
+`or ""` turns an unlabelled row into the empty string, which is in no selection,
+so "we never labelled it" can never read as a pass.
 
-The gate is **vocabulary-blind**, in both languages, and that is why growing the
-label set from 5 to 26 changed neither matcher: `city_ok` is
-`(job.get("city") or "") in prefs.cities` and `cityOk` is
-`prefs.cities.includes(job.city ?? "")`, so the labels are opaque strings on
-both sides and the SQL half (`j.city = ANY(preferences.cities)`) reads the same
-array. Twenty new labels that appear in nobody's `cities` can match nothing.
+**Since cities Slice B the gate is three branches over two columns**, and it is
+the one filter here that reads what a person TICKED rather than a list they typed:
+
+```
+remote posting, or all_india  ->  anywhere except non-india
+otherwise                     ->  membership of selected_cities, minus two labels
+```
+
+The two relaxing branches share a line deliberately: "I do not care which city"
+and "this job has no city" are different questions with the same answer, and
+writing the country floor once is what stops it being enforced in one and
+forgotten in the other. All-India is stated as the **complement** of `non-india`
+rather than as the 25-item list it equals, for the reason `india_funnel` is —
+a hand-written set of Indian labels works at 26 and becomes a trap at 27.
+
+**The fail-closed half.** `india-unclear` and `non-india` can never match an
+explicit selection (`CITY_SELECTION_NEVER_MATCHES`). The first means "we could not
+tell where this job is" — a statement about our confidence rather than about a
+location — so a person who ticked `chennai` does not get it, and the all-India
+switch, which says the country is enough, does. The second is the label all-India
+excludes by definition, and a selection able to match it would mean the narrow
+filter admitting rows the wide one refuses. `other-india` is deliberately NOT on
+that list: it is a confident statement that the posting is in India at a named
+place outside the 23, so ticking it is coherent. The rule is enforced three times
+— the picker does not offer them, `PUT /api/preferences` refuses them, and the
+matcher re-checks the label, which is what makes it a property rather than a
+promise for a row edited by hand.
+
+**A blank city answer matches nothing.** Neither a selection nor the switch is the
+brand-new account, and it is the same fail-closed choice the unconfigured
+experience range gets — and unreachable for an onboarded account by the same
+construction, since `PUT` refuses it and is the only writer of these columns and
+of `onboarding_completed`.
+
+**`preferences.cities` is still written and no longer decides.** It is the legacy
+column, kept for exactly one slice as the fallback `effective_cities` reads when
+`selected_cities` is empty — a row that predates the backfill has its answer there
+and reading only the new column would silently empty that account's digest. It is
+a fallback to *this* account's own previous answer, not to somebody else's, which
+is what distinguishes it from the seeded-defaults failure Slices 1b and 1c
+removed. The contract slice stops writing it and drops it.
+
+The explicit branch is still **vocabulary-blind**, which is why growing the label
+set from 5 to 26 changed neither matcher: it is a plain membership test over
+opaque strings on both sides, and the SQL half reads the same array. The two
+excluded labels are the single exception, named once in each language.
 
 **Word boundaries, not substrings.** Every term compiles to a `\b`-anchored
 regex. The naive `term in title.lower()` is wrong in both directions and fails
@@ -765,11 +802,14 @@ only what survives the mask may be read as a level. The bias is deliberate and
 one-directional: an unrecognised level costs one line in a digest, a misread
 experience range costs the job.
 
-**Preferences are DB-backed and dashboard-editable**: `keywords`, `cities`,
-`exclusions`, `max_level`, and since Slice 2 `exp_range_low` / `exp_range_high` /
-`show_no_experience_jobs` / `years_of_experience_held`. The API rejects an empty
-`cities` or `keywords` list and an incomplete experience range, because each of the
-three would match no job at all. `exclusions` may be empty (a real choice) and so
+**Preferences are DB-backed and dashboard-editable**: `keywords`, `exclusions`,
+`max_level`, since Slice 2 `exp_range_low` / `exp_range_high` /
+`show_no_experience_jobs` / `years_of_experience_held`, and since cities Slice B
+`selected_cities` / `all_india`. The API rejects an empty city answer, an empty
+`keywords` list and an incomplete experience range, because each of the three would
+match no job at all. It also refuses a body carrying **both** a city selection and
+`all_india` — the two are alternatives, and silently dropping half of a body that
+states both is how a filter gets quietly rewritten. `exclusions` may be empty (a real choice) and so
 may `years_of_experience_held` (it filters nothing).
 
 ### Enrichment
@@ -1448,12 +1488,13 @@ disagreement:
 | Command | Checks |
 |---|---|
 | `npm run parity` | `lib/ats.ts` + `lib/workday.ts` against `fetchers/resolve.py`, over fixed inputs |
-| `npm run match-parity` | `lib/match.ts` against `notify/match.py`, over every open row in the live database, under **four** filters |
+| `npm run match-parity` | `lib/match.ts` against `notify/match.py`, over every open row in the live database, under **seven** filters |
 
 Run `match-parity` after touching either matcher; its total is directly
 comparable to `python scripts/preview_digest.py --dry-run --ignore-notified`.
 
-**Four filters rather than one, since Slice 2, and the reason generalises.** The
+**Seven filters rather than one, since Slice 2 and cities Slice B, and the reason
+generalises.** The
 live `preferences` row is `(0, 2)` with the no-experience toggle on — which is the
 one branch of the new experience rule that reproduces the *old* rule. Running only
 it would have proven the port did not regress and proven nothing whatever about
@@ -1465,8 +1506,27 @@ the rule under test. The last one is additionally asserted to be **empty** rathe
 than merely equal across languages — both sides agreeing on a wrong answer would
 pass a comparison, and "an unset range matches nothing" is the property.
 
-Current: **7,882 live rows × 4 filters, no disagreement**; the live row's total is
-38, unmoved by the slice, and the variants report 45 / 18 / 0.
+Cities Slice B added three more on the same argument, one field over: the live row
+is a three-city selection, which is one of the city gate's three branches, so
+running only it would say nothing about all-India or about the fail-closed rule.
+The **no city answer** variant is asserted EMPTY for the same reason the
+unconfigured range is — both languages agreeing on a wrong answer would pass a
+comparison, and "a blank city answer matches nothing" is the property.
+
+Current: **7,869 live rows × 7 filters, no disagreement**; the live row's total is
+38, unmoved by either slice, and the variants report 45 / 18 / 0 / 343 / 0 / 0.
+
+**The all-India variant's 343 is a measurement rather than a target**, and it is
+the number that says the Slice A relabel has not reached this database. All-India
+is "any label except `non-india`", and no live row carries `non-india` yet — the
+deployed crawler is still the pre-Slice-A one, so the board is still labelled
+`other` / `blr` / `hyd` / `pune` / `india-unclear`. So the city gate currently
+admits every open row for an all-India account, foreign postings included, and the
+keyword and experience filters are all that narrow 7,869 to 343. See *Pending*.
+
+`match-parity` also prints how many rows carry a non-NULL `work_mode`. It is 0,
+and the line exists to stop a green matrix being read as coverage of the remote
+branch, which no live row can reach.
 
 Two more checks answer questions parity cannot. Neither is about drift between
 the two languages; both are about a thing being *true against the real database*.
@@ -2416,7 +2476,116 @@ Newest last. Append here as the project evolves.
   that seeds a filter and expects an ordinary unenriched job to match would have
   failed for a reason about the fixture.
 
+- **2026-08-10 — Phase 3, cities Slice B. The selection becomes the filter.**
+  Slice A grew the job side from 5 labels to 26 and deliberately left the matcher
+  alone. This is the other half: `preferences.selected_cities` and
+  `preferences.all_india` — created empty by Step 0, inert ever since — are now the
+  city gate, in both languages and in the SQL prefilter.
+
+  **No migration and no DDL.** The columns existed and
+  `scripts/backfill_onboarding_prefs.py` had already written
+  `selected_cities = {blr,pune,hyd}` onto the operator's row, so this slice is pure
+  code — the second one in a row that handed over no manual database step, and the
+  expand half of Step 0 paying off twice.
+
+  Three branches over two columns, replacing one membership test:
+
+  ```
+  remote posting, or all_india  ->  anywhere except non-india
+  otherwise                     ->  membership of selected_cities, minus two labels
+  ```
+
+  **`cities` is kept, still written, and no longer decides.** It is the fallback
+  `Preferences.effective_cities` reads when `selected_cities` is empty, which is
+  the state of any row that predates the backfill; reading only the new column
+  would have silently emptied such an account's digest. It is a fallback to *this*
+  account's own previous answer rather than to somebody else's, which is what
+  makes it different in kind from the seeded-defaults failure 1b and 1c removed —
+  and it cannot re-open the blank-account hole, because a new row has both columns
+  empty. Dual-writing is also what makes the slice a no-op against the deployed
+  digest, which still reads `cities`. The contract slice drops all of it.
+
+  **Fail-closed, which is the decision this slice turns on.** `india-unclear` and
+  `non-india` can never match an explicit selection. The first is a statement about
+  our confidence rather than about a location, so it belongs to the all-India
+  switch; the second is what all-India excludes by definition, and a selection able
+  to match it would mean the narrow filter admitting rows the wide one refuses.
+  `other-india` is NOT excluded — it names a real Indian place. Enforced three
+  times (the picker does not offer them, the route refuses them, the matcher
+  re-checks the label), because only the third holds for a row edited by hand.
+
+  **Umbrellas expand at SAVE time.** Ticking "All Mumbai areas" stores the four
+  members, so neither matcher learns that a region is a thing and the gate stays
+  vocabulary-blind — the property that let the label set grow from 5 to 26 without
+  either matcher changing. The cost is on the record: a city added to a group later
+  does not reach accounts that already saved. The editor re-derives the umbrella as
+  "all members ticked" and renders indeterminate, so such an account is visibly one
+  save away from current rather than silently stale.
+
+  **The remote branch is built and INERT, and this is the part not to misread.**
+  A fully-remote posting is exempt from the city gate (never from the country
+  floor). `jobs.work_mode` is NULL on all 9,703 stored rows because the parser is
+  the next slice, so `is_remote` is False for every job and the branch cannot fire.
+  It is built now so the work-mode slice turns it on by populating a column rather
+  than by editing a rule. `match-parity` prints `0 of 7,869 rows non-NULL` so a
+  green matrix is never read as coverage of it, and
+  `test_the_remote_branch_is_built_but_inert` asserts both halves over synthetic
+  rows — that the branch works, and that an unparsed row cannot reach it. NULL
+  reads as not-remote rather than as unknown-means-keep: the branch RELAXES a gate,
+  so the inclusion bias that governs descriptions is exactly wrong here.
+
+  **Behaviour unchanged, and measured.** `match-parity` reports **38 before and 38
+  after** over 7,869 live rows × 7 filters, and `preview_digest --dry-run
+  --ignore-notified` independently agrees at 38 (blr 33 / hyd 3 / pune 2). The
+  operator's `selected_cities` equals their `cities`, so the gate reduces to
+  today's membership test either way — which is why the reproduction holds whether
+  it reads the new column or the fallback.
+
+  Three parity variants added: all-India, a blank city answer (**asserted empty**,
+  like the unconfigured range — both languages agreeing on a wrong answer would
+  pass a comparison), and the Mumbai umbrella's stored expansion.
+
+  `lib/jobs.cityClause` is the SQL half and has one load-bearing character:
+  `IS DISTINCT FROM` rather than `<>`. `j.city <> 'non-india'` is NULL when the
+  city is NULL, so the row is excluded, while the matcher's `?? ""` keeps it —
+  the prefilter narrower than the rule it prefilters for, which is the one thing
+  that file may not be. Zero live rows have a NULL city, so it would have shipped
+  green.
+
+  1308 tests pass (26 new in `tests/test_city_selection.py`), typecheck clean,
+  `ui-check` +20 assertions over the shipped picker, `onboarding-check` and
+  `badge-check` green. Five mutations run and five caught — and the first pass
+  found a real hole: two tests parametrized over
+  `CITY_SELECTION_NEVER_MATCHES` silently shrank when the constant did, so the
+  membership is now pinned literally.
+
+  Deliberately **not** here: the work-mode parser, `work_modes`, `salary_bands`,
+  the watch-list picker, and the Slice A relabel — see *Pending*.
+
 **Pending**
+
+- **The Slice A relabel has never been applied to live Postgres, and the deployed
+  crawler is nine commits behind.** `main` is ahead of `origin/main` by ten
+  commits, and GitHub Actions runs the pushed tree — so the hourly crawl is still
+  the pre-Slice-A labeller, still writing the old five labels. Live `jobs.city` is
+  `other` 7,273 / `blr` 1,782 / `hyd` 283 / `india-unclear` 242 / `pune` 123, and
+  `other` is a label neither runtime's vocabulary admits any more. The Slice A
+  entry above describes a relabel that ran against a dry run, not against this
+  database.
+
+  Two consequences, and the second is the sharp one. **21 of the 26 labels match
+  zero live rows**, so ticking `mumbai` or `noida` returns nothing although those
+  jobs demonstrably exist — inside `other`. And **all-India is wrong in the
+  dangerous direction**: it is the complement of `non-india`, no live row carries
+  `non-india`, so it admits the entire open board including every foreign posting
+  sitting in `other`. `match-parity`'s all-India variant reports 343 against the
+  live row's 38, and that gap is the measurement.
+
+  It cannot be fixed by relabelling alone: `crawler/store.UPSERT_SEEN` sets
+  `city = $5` in its `ON CONFLICT DO UPDATE`, so the deployed old labeller rewrites
+  every re-sighted row within one hourly cycle. The order is **push, then relabel**
+  — and `relabel_cities.py`'s two gates (residue, blast radius) are what say
+  whether the relabel is safe to apply when it runs.
 
 - **The nav does not know about the onboarding gate.** During setup the chrome
   still shows Home / Jobs / Add, and clicking any of them bounces back to

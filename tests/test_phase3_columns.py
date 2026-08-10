@@ -101,12 +101,37 @@ NEW_COLUMNS = [name for name, *_ in PREFERENCE_COLUMNS] + [name for name, _ in J
 # alternative — dropping the test now that it has fired — would retire the whole
 # guarantee on the day the first column was wired, which is the day it starts
 # being worth something.
+#
+# PHASE 3, CITIES SLICE B ADDS TWO MORE, and they are the first pair whose wiring
+# is a REPLACEMENT rather than an addition. selected_cities and all_india are the
+# city gate now (notify.match.city_ok and its port); `cities` is the legacy column
+# they replaced, still selected and still written for one slice so the deployed
+# digest and a rollback both keep working. The CONTRACT slice drops it.
+#
+# jobs.work_mode JOINS THEM WITH AN ASTERISK, and it is the one entry here that is
+# named by a matcher without being able to decide anything. The remote branch in
+# notify.match.city_ok is built now and is INERT: the parser that fills the column
+# is the next slice, so work_mode is NULL on all 9,703 stored rows and
+# notify.match.is_remote returns False for every one of them.
+#
+# It has to be exempted from the sweep either way — match.py names it, so the sweep
+# would fail — and the guarantee that exemption gives up is replaced rather than
+# dropped, by two things that are both STRONGER than "no file mentions the name":
+# test_the_job_write_paths_name_none_of_the_new_job_columns below (unchanged, and
+# still the reason the column is honestly NULL — nothing can write it), and
+# test_the_remote_branch_is_built_but_inert (new, behavioural: it asserts the
+# branch exists AND that an unparsed row cannot reach it). The second is what
+# fails the day somebody starts filling the column in without this file being
+# updated to say so.
 WIRED_UP = {
     "onboarding_completed",
     "exp_range_low",
     "exp_range_high",
     "show_no_experience_jobs",
     "years_of_experience_held",
+    "selected_cities",
+    "all_india",
+    "work_mode",
 }
 
 STILL_UNWIRED = [c for c in NEW_COLUMNS if c not in WIRED_UP]
@@ -333,6 +358,47 @@ def test_the_queue_still_names_no_experience_column_at_all() -> None:
         )
 
 
+def test_the_remote_branch_is_built_but_inert() -> None:
+    """jobs.work_mode decides nothing yet, and this is what says so behaviourally.
+
+    THIS REPLACES THE SWEEP COVERAGE work_mode's WIRED_UP EXEMPTION GIVES UP, and it
+    is a stronger claim than the one it replaces. The sweep could only say "no
+    deciding file names this column". That was true until cities Slice B built the
+    remote branch, and it was never the thing anybody actually cared about — what
+    matters is whether the column can change a verdict, and until the parser slice
+    it cannot, because every stored row is NULL.
+
+    Both halves are asserted, and only the pair is the rule:
+
+      * the branch EXISTS and is correct — a row explicitly marked remote skips a
+        city gate it would otherwise fail. This is what the work-mode slice turns
+        on by filling the column in, and asserting it now is what makes that slice
+        a data change rather than a rule change.
+      * an UNPARSED row cannot reach it. NULL, absent and any other work_mode all
+        read as not-remote, so today's board is judged exactly as it was before
+        this branch existed.
+
+    The second half is the one that would fail if somebody made NULL mean "unknown,
+    so relax the gate" — the inclusion bias this project applies to descriptions and
+    deliberately does NOT apply to location. See notify.match.is_remote.
+    """
+    prefs = Preferences(selected_cities=("blr",), keywords=("backend",))
+    elsewhere = {"title": "Backend Engineer", "city": "chennai"}
+
+    # The branch exists: marked remote, the city gate is relaxed.
+    assert is_match({**elsewhere, "work_mode": "remote"}, prefs)
+
+    # And it is unreachable for every row the database actually holds.
+    for unparsed in (None, "", "onsite", "hybrid"):
+        assert not is_match({**elsewhere, "work_mode": unparsed}, prefs), unparsed
+    assert not is_match(elsewhere, prefs), "a row with no work_mode key at all"
+
+    # Still India-only. A remote posting is exempt from the CITY gate, never from
+    # the country floor — the two relaxing branches share that line in city_ok
+    # precisely so it cannot be enforced in one and forgotten in the other.
+    assert not is_match({"title": "Backend Engineer", "city": "non-india", "work_mode": "remote"}, prefs)
+
+
 def test_the_informational_column_reaches_no_matcher() -> None:
     """years_of_experience_held may be stored and shown, and never consulted.
 
@@ -367,21 +433,31 @@ def test_the_informational_column_reaches_no_matcher() -> None:
         )
 
 
-def test_the_matcher_value_object_carries_exactly_the_seven_deciding_fields() -> None:
+def test_the_matcher_value_object_carries_exactly_the_nine_deciding_fields() -> None:
     """The last gate: even a loader that selected a new column could not use it.
 
     notify.match.Preferences is frozen and is the only thing is_match reads, so this
-    list IS the filter. It was four fields through Phase 2 and is seven since Slice
-    2; an eighth appearing means a column reached the matcher, whatever the SQL says.
+    list IS the filter. It was four fields through Phase 2, seven since Slice 2, and
+    nine since cities Slice B; a tenth appearing means a column reached the matcher,
+    whatever the SQL says.
 
     THE EXACT LIST, NOT A COUNT, and the order is asserted too — a count would pass
     if somebody swapped years_of_experience_held in for show_no_experience_jobs,
     which is the one substitution that would be both easy to make and wrong in the
     way that matters.
+
+    `cities` IS STILL HERE AND IS NO LONGER THE GATE. Slice B moved the decision to
+    selected_cities + all_india and kept the legacy column as the fallback for a row
+    that predates the backfill — see Preferences.effective_cities, which is also
+    where the sentence naming the slice that deletes it lives. When that happens
+    this list goes to eight, and the deletion will fail here first, which is the
+    point of asserting the exact list.
     """
     names = [f.name for f in dataclasses.fields(Preferences)]
     assert names == [
         "cities",
+        "selected_cities",
+        "all_india",
         "keywords",
         "exclusions",
         "max_level",

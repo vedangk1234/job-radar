@@ -560,6 +560,90 @@ async function main() {
   );
 
   /*
+   * THE CITY PICKER — Phase 3, cities Slice B.
+   *
+   * The reason ui-check exists applies to this slice more than to most: the
+   * matchers are covered by match-parity and pytest, and neither of those can tell
+   * a rendered control from a designed one. An All-India switch that decides the
+   * filter but never reaches the markup is the Step 5c failure exactly.
+   */
+  console.log("\nPreferences — the city picker");
+  check(
+    configured.includes("All over India"),
+    "the All over India switch is on the screen",
+    "the switch that ignores the city list entirely did not render",
+  );
+  check(
+    configured.includes("All Mumbai areas") && configured.includes("All of Delhi/NCR"),
+    "and both umbrella controls, so a region is one tick rather than four",
+  );
+  for (const label of ["blr", "mumbai", "navi-mumbai", "noida", "other-india", "belagavi"]) {
+    check(
+      configured.includes(`>${label}<`),
+      `the ${label} checkbox exists — Slice A's vocabulary reached the picker`,
+    );
+  }
+  check(
+    !configured.includes(">india-unclear<") && !configured.includes(">non-india<"),
+    "and india-unclear / non-india are NOT offered — they can never match an explicit " +
+      "selection, so a checkbox for them would be the silent-empty failure",
+    "a label the route refuses is on screen as a tickable control",
+  );
+  check(
+    /could not pin to a city/.test(configured),
+    "the hint says where the unclear postings went instead — the All-India switch",
+  );
+  check(
+    (configured.match(/checked/g) ?? []).length >= 3,
+    "this account's three stored cities are ticked",
+    "the stored selection did not reach the checkboxes",
+  );
+
+  /*
+   * THE MIGRATION FALLBACK, ON SCREEN. An account that has not saved since Slice B
+   * has its answer in the legacy `cities` column and nothing in selected_cities,
+   * and the editor has to render THAT — agreeing with the gate, which reads the
+   * same fallback. Rendering blank would mean the first Save silently wrote an
+   * empty selection over three cities somebody chose.
+   */
+  const legacyOnly = withRouter(
+    createElement(lib.PreferencesEditor, {
+      initial: { ...prefs, selected_cities: [], cities: ["chennai", "kolkata"] },
+      resume: null,
+    }),
+  );
+  check(
+    (legacyOnly.match(/checked/g) ?? []).length >= 2 &&
+      !legacyOnly.includes("Pick a city to save"),
+    "a pre-Slice-B row renders its legacy cities as ticked rather than as blank",
+    "the editor and the matcher disagree about what this account's filter currently is",
+  );
+
+  /*
+   * ALL-INDIA DISABLES THE GRID RATHER THAN HIDING IT, so a person can see what
+   * their selection was and what turning the switch off returns them to.
+   */
+  const allIndia = withRouter(
+    createElement(lib.PreferencesEditor, {
+      initial: { ...prefs, all_india: true, selected_cities: [] },
+      resume: null,
+    }),
+  );
+  check(
+    allIndia.includes("<fieldset disabled"),
+    "with All over India on, the city grid is disabled",
+    "the grid stayed live, so a person could set two answers that contradict each other",
+  );
+  check(
+    allIndia.includes(">blr<"),
+    "and still visible — disabled, not hidden, so the selection underneath is legible",
+  );
+  check(
+    !allIndia.includes("Pick a city to save"),
+    "and Save is not blocked on an empty selection, because All over India IS the answer",
+  );
+
+  /*
    * THE UNCONFIGURED ROW — a brand-new account, before onboarding. Two things must
    * be true at once and they pull in opposite directions: the range must be BLANK
    * (nothing was chosen, and a pre-filled 0-2 would be the operator's answer
@@ -573,6 +657,12 @@ async function main() {
       initial: {
         ...prefs,
         cities: [],
+        // Both halves of the city answer are blank, which is what a brand-new row
+        // actually holds: NEW_ACCOUNT_SEED writes `cities: []` and selected_cities
+        // takes its schema default of '{}'. Leaving the operator's selection in the
+        // spread would make this "a new account" in name only.
+        selected_cities: [],
+        all_india: false,
         keywords: [],
         exclusions: [],
         exp_range_low: null,
@@ -601,6 +691,11 @@ async function main() {
     (blank.match(/type="checkbox"[^>]*checked/g) ?? []).length >= 1,
     "the no-minimum toggle is pre-checked ON despite the column being FALSE — a suggested answer",
     "the toggle rendered unchecked, so a new account would hide 99% of the board by default",
+  );
+  check(
+    /An empty city list matches nothing/.test(blank),
+    "and the blank city answer is named inline — fail-closed, said out loud rather than implied",
+    "a new account sees no city checkbox ticked and nothing explaining why nothing would match",
   );
 
   // --- the ordering rule --------------------------------------------------

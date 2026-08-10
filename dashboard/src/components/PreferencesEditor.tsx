@@ -6,14 +6,18 @@ import { useState } from "react";
 // From lib/labels, never lib/preferences: the latter imports postgres.js, and
 // importing a VALUE from it here would pull the driver into the client bundle.
 import {
-  CITY_LABEL_GROUPS,
   KEYWORD_CAP,
   LEVEL_LABELS,
+  SELECTABLE_CITY_LABELS,
   type Preferences,
   type StoredResume,
 } from "@/lib/labels";
+import { CityPicker } from "./CityPicker";
 import { KeywordChips } from "./KeywordChips";
 import { ResumePanel } from "./ResumePanel";
+
+/** The 24 labels the picker offers, as a set — see CityPicker for the two it omits. */
+const SELECTABLE = new Set(SELECTABLE_CITY_LABELS);
 
 /**
  * Editor for the one preferences row. Replaces editing the filter by hand in
@@ -58,7 +62,28 @@ export function PreferencesEditor({
   redirectOnSave?: string;
 }) {
   const router = useRouter();
-  const [cities, setCities] = useState<string[]>(initial.cities);
+
+  /*
+   * THE CITY ANSWER IS TWO FIELDS SINCE SLICE B, and the initial value of the
+   * first one carries the migration fallback the matchers carry.
+   *
+   * `initial.selected_cities` is empty for an account that has not saved since
+   * this slice, and its answer is sitting in `initial.cities` — the legacy column
+   * — which is exactly what notify.match.Preferences.effective_cities reads. The
+   * screen has to agree with the gate about what this person's filter currently
+   * IS, or a save would silently rewrite it: render blank, and the first Save
+   * writes an empty selection over three cities somebody chose.
+   *
+   * The two excluded labels are filtered out on the way in for the same reason.
+   * A legacy `cities` holding `india-unclear` (the old seeded default did) would
+   * otherwise render a checkbox this editor no longer offers, and the route would
+   * refuse the save with no control on screen to fix it.
+   */
+  const [selectedCities, setSelectedCities] = useState<string[]>(() => {
+    const stored = initial.selected_cities.length ? initial.selected_cities : initial.cities;
+    return stored.filter((c) => SELECTABLE.has(c));
+  });
+  const [allIndia, setAllIndia] = useState<boolean>(initial.all_india);
   const [keywords, setKeywords] = useState<string[]>(initial.keywords);
   const [exclusions, setExclusions] = useState<string[]>(initial.exclusions);
   const [maxLevel, setMaxLevel] = useState<number>(initial.max_level);
@@ -106,10 +131,24 @@ export function PreferencesEditor({
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
 
+  /*
+   * `initialSelectedCities` rather than `initial.selected_cities`, because the
+   * state above is seeded through the legacy fallback: an account that has not
+   * saved since Slice B renders its `cities` in the picker, and comparing that
+   * against an empty `selected_cities` would mark a screen nobody touched as
+   * dirty. The dirty check has to compare against what was RENDERED.
+   */
+  const initialSelectedCities = (
+    initial.selected_cities.length ? initial.selected_cities : initial.cities
+  ).filter((c) => SELECTABLE.has(c));
+
   const dirty =
-    JSON.stringify([cities, keywords, exclusions, maxLevel, expLow, expHigh, yearsHeld, showNoExp]) !==
     JSON.stringify([
-      initial.cities,
+      selectedCities, allIndia, keywords, exclusions, maxLevel, expLow, expHigh, yearsHeld, showNoExp,
+    ]) !==
+    JSON.stringify([
+      initialSelectedCities,
+      initial.all_india,
       initial.keywords,
       initial.exclusions,
       initial.max_level,
@@ -120,6 +159,15 @@ export function PreferencesEditor({
     ]);
 
   const overCap = keywords.length > KEYWORD_CAP;
+
+  /*
+   * The city answer is missing when neither half of it was given. Gated on the
+   * button for the same reason `rangeInvalid` is: the route refuses it regardless
+   * — that is where the rule lives — and this is about saying why before somebody
+   * presses. Note it is NOT "selectedCities is empty": with All over India on, an
+   * empty selection is the correct and complete answer.
+   */
+  const noCityAnswer = !allIndia && !selectedCities.length;
 
   /*
    * The same rule PUT /api/preferences enforces, restated for the button. The
@@ -187,7 +235,12 @@ export function PreferencesEditor({
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          cities,
+          // `cities` is deliberately NOT sent. It is still written — the deployed
+          // digest reads it — but the route DERIVES it from the answer below, so
+          // there is one city answer on the wire rather than two that could
+          // disagree. See api/preferences/route.ts.
+          selected_cities: allIndia ? [] : selectedCities,
+          all_india: allIndia,
           keywords,
           exclusions,
           max_level: maxLevel,
@@ -202,7 +255,8 @@ export function PreferencesEditor({
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
-      setCities(data.preferences.cities);
+      setSelectedCities(data.preferences.selected_cities);
+      setAllIndia(data.preferences.all_india);
       setKeywords(data.preferences.keywords);
       setExclusions(data.preferences.exclusions);
       setMaxLevel(data.preferences.max_level);
@@ -327,47 +381,12 @@ export function PreferencesEditor({
         </div>
       </div>
 
-      <div className="panel">
-        <h2>Cities</h2>
-        <p className="hint">
-          Which <code>city_label</code> values may be sent. A posting is labelled with the city
-          it names; <code>other-india</code> is an Indian place outside this list (Lucknow,
-          Mohali, Patna), <code>non-india</code> is everywhere else, and{" "}
-          <code>india-unclear</code> means only &ldquo;we could not tell&rdquo; &mdash;
-          &ldquo;Remote&rdquo;, bare &ldquo;India&rdquo;, or a state that contains a city on this
-          list. Unclear is off by default: it used to be on, and back when every named Indian
-          city fell into it too, it leaked 14 wrong-city jobs into one digest. That labelling is
-          fixed, so turning it back on now costs noise rather than correctness.
-        </p>
-        {CITY_LABEL_GROUPS.map((group) => (
-          <div key={group.heading} style={{ marginBottom: 10 }}>
-            <p className="hint" style={{ margin: "0 0 4px" }}>
-              {group.heading}
-            </p>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
-              {group.labels.map((label) => (
-                <label key={label} className="switch">
-                  <input
-                    type="checkbox"
-                    checked={cities.includes(label)}
-                    onChange={(e) =>
-                      setCities((cs) =>
-                        e.target.checked
-                          ? [...cs, label]
-                          : cs.filter((c) => c !== label),
-                      )
-                    }
-                  />
-                  <span className="mono">{label}</span>
-                </label>
-              ))}
-            </div>
-          </div>
-        ))}
-        {!cities.length ? (
-          <p className="msg bad">An empty city list matches nothing. Pick at least one.</p>
-        ) : null}
-      </div>
+      <CityPicker
+        selected={selectedCities}
+        onSelectedChange={setSelectedCities}
+        allIndia={allIndia}
+        onAllIndiaChange={setAllIndia}
+      />
 
       <ChipList
         title="Exclusions"
@@ -410,7 +429,7 @@ export function PreferencesEditor({
         <button
           className="primary"
           onClick={save}
-          disabled={busy || !dirty || overCap || rangeInvalid}
+          disabled={busy || !dirty || overCap || rangeInvalid || noCityAnswer}
         >
           {busy
             ? "Saving…"
@@ -420,9 +439,11 @@ export function PreferencesEditor({
                 } to save`
               : rangeInvalid
                 ? "Fix the experience range to save"
-                : dirty
-                  ? "Save preferences"
-                  : "No changes"}
+                : noCityAnswer
+                  ? "Pick a city to save"
+                  : dirty
+                    ? "Save preferences"
+                    : "No changes"}
         </button>
         <span className="muted small">
           Last saved {new Date(updatedAt).toLocaleString()}

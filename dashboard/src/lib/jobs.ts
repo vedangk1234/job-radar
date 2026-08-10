@@ -1,5 +1,11 @@
 import { sql } from "./db";
-import { isMatch, type Preferences } from "./match";
+import {
+  effectiveCities,
+  isMatch,
+  NON_INDIA_LABEL,
+  REMOTE_WORK_MODE,
+  type Preferences,
+} from "./match";
 
 /**
  * The jobs queries.
@@ -52,6 +58,7 @@ export type JobRow = {
   company_id: number;
   title: string;
   city: string | null;
+  work_mode: string | null;
   location: string | null;
   url: string;
   status: string;
@@ -109,7 +116,7 @@ export type JobView = UserJobRow & { matches: boolean };
  * nothing and asks nothing.
  */
 const jobColumns = () => sql`
-  j.canonical_id, j.company_id, j.title, j.city, j.location, j.url,
+  j.canonical_id, j.company_id, j.title, j.city, j.work_mode, j.location, j.url,
   j.status, j.min_experience, j.is_pm_role, j.desc_checked,
   j.desc_fetch_failed, j.first_seen_at, j.applied, j.applied_at
 `;
@@ -187,7 +194,7 @@ export async function openJobsForCompany(
  * only the half that translates without an argument:
  *
  *   status = 'open'                          the lifecycle test
- *   city = ANY(preferences.cities)           city_ok
+ *   the city clause below                    city_ok
  *   is_pm_role = FALSE                       NOT pm_excluded
  *   the experience clause below               NOT experience_excluded
  *
@@ -213,18 +220,63 @@ export async function matchCandidates(
   userId: string,
   companyId: number | null = null,
 ): Promise<UserJobRow[]> {
-  const cities = [...prefs.cities];
   return sql<UserJobRow[]>`
     SELECT ${jobColumns()},
            ${notifiedToUser(userId)}
       FROM jobs j
      WHERE j.status = 'open'
-       AND j.city = ANY(${cities}::text[])
+       AND ${cityClause(prefs)}
        AND j.is_pm_role = FALSE
        AND ${experienceClause(prefs)}
        AND (${companyId}::int IS NULL OR j.company_id = ${companyId}::int)
      ORDER BY j.first_seen_at DESC, j.title ASC
   `;
+}
+
+/**
+ * city_ok, in SQL — the transcription of lib/match.cityOk, branch for branch.
+ *
+ * Subject to the same rule experienceClause states below and for the same reason:
+ * IT MUST BE EXACTLY AS WIDE AS THE MATCHER AND NEVER NARROWER. Whatever this
+ * drops, isMatch never sees.
+ *
+ * `IS DISTINCT FROM`, NOT `<>`, AND THAT IS THE LOAD-BEARING CHARACTER IN THIS
+ * FUNCTION. `j.city <> 'non-india'` evaluates to NULL when j.city IS NULL, NULL is
+ * not TRUE, so the row is EXCLUDED. The matcher says the opposite: cityOk reads
+ * `job.city ?? ""`, and the empty string is not "non-india", so it KEEPS the row.
+ * That is the prefilter being narrower than the rule it prefilters for — the one
+ * thing this file may not be — and it would have shipped green, because zero live
+ * rows have a NULL city today. `IS DISTINCT FROM` is the NULL-safe form and is
+ * exactly what the TypeScript means.
+ *
+ * `j.work_mode = ${REMOTE_WORK_MODE}` needs no such treatment and it is worth
+ * saying why rather than leaving the asymmetry to be re-derived. NULL there makes
+ * the comparison NULL, which is not TRUE, so the row is not remote — which is
+ * precisely what isRemote's `?? ""` concludes. The two agree on NULL, so the
+ * ordinary operator is the honest one. Today that is every row in the table.
+ *
+ * THE EMPTY SELECTION IS NOT A THREE-VALUED-LOGIC ACCIDENT, unlike the case
+ * experienceClause carves out below. `x = ANY('{}'::text[])` is FALSE for every
+ * row by the definition of membership in an empty set, not by NULL propagation —
+ * so "a blank account matches nothing" is stated by the same expression that
+ * states everything else, and needs no separate branch to say it out loud.
+ */
+function cityClause(prefs: Preferences) {
+  // All-India ignores the selection entirely — the exclusivity is in the rule,
+  // not only in the UI that sets it.
+  if (prefs.all_india) return sql`j.city IS DISTINCT FROM ${NON_INDIA_LABEL}`;
+
+  // The two labels an explicit selection may never match are not filtered out of
+  // the array here: PUT /api/preferences refuses them and the editor does not
+  // offer them, so a row carrying one is already outside what this app can
+  // produce. What keeps the SQL honest for such a row is that lib/match.cityOk
+  // re-checks it in TypeScript afterwards — the prefilter is allowed to be WIDER
+  // than the matcher, and this is the direction that is safe.
+  const cities = [...effectiveCities(prefs)];
+  return sql`(
+    j.city = ANY(${cities}::text[])
+    OR (j.work_mode = ${REMOTE_WORK_MODE} AND j.city IS DISTINCT FROM ${NON_INDIA_LABEL})
+  )`;
 }
 
 /**

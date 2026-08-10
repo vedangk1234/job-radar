@@ -652,6 +652,20 @@ class FakeConn:
     # pre-Slice-2 rule exactly: a test that says nothing about experience gets the
     # behaviour it had before the column existed. A test that wants to exercise the
     # new rule passes the values it means.
+    # THE TWO CITY COLUMNS SLICE B ADDED DEFAULT TO "NOT MIGRATED", AND THAT IS
+    # DELIBERATELY THE OPPOSITE CHOICE FROM THE THREE EXPERIENCE ONES ABOVE.
+    #
+    # Those needed explicit values because their schema defaults describe a filter
+    # that matches nothing, so an unnamed row would have failed every test for a
+    # reason about the fixture. selected_cities has the same blank default and does
+    # NOT have that problem, because notify.match.Preferences.effective_cities
+    # falls back to `cities` when it is empty — which is exactly the state a real
+    # account that has not saved since Slice B is in.
+    #
+    # So `selected_cities=()` here means "this fixture is a pre-Slice-B row", every
+    # existing caller passing `cities=[...]` keeps the behaviour it had, and the
+    # fallback is exercised by the whole suite rather than by one test that
+    # remembers to. A test that wants the NEW column passes it.
     async def set_preferences(
         self,
         cities: Sequence[str] = DEFAULT_CITIES,
@@ -662,6 +676,8 @@ class FakeConn:
         exp_range_low: int | None = DEFAULT_EXP_RANGE_LOW,
         exp_range_high: int | None = DEFAULT_EXP_RANGE_HIGH,
         show_no_experience_jobs: bool = DEFAULT_SHOW_NO_EXPERIENCE_JOBS,
+        selected_cities: Sequence[str] = (),
+        all_india: bool = False,
     ) -> None:
         """Seed the preferences row, TEXT[] columns encoded as JSON.
 
@@ -675,6 +691,10 @@ class FakeConn:
         other real state: a brand-new account before it has onboarded. It matches
         nothing, deliberately — see notify.match.experience_excluded.
 
+        `selected_cities=()` writes the PRE-SLICE-B row: the city answer is in the
+        legacy `cities` column and the gate reaches it through the fallback. See
+        the comment above for why that is the default here.
+
         Still clears the table first, so a test that calls it twice replaces the
         filter rather than colliding with itself. A SECOND user's filter goes
         through add_preferences_for, which does not clear — see there.
@@ -682,8 +702,9 @@ class FakeConn:
         await self.execute("DELETE FROM preferences")
         await self.execute(
             "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, "
-            "user_id, exp_range_low, exp_range_high, show_no_experience_jobs) "
-            "VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "user_id, exp_range_low, exp_range_high, show_no_experience_jobs, "
+            "selected_cities, all_india) "
+            "VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             json.dumps(list(cities)),
             json.dumps(list(keywords)),
             json.dumps(list(exclusions)),
@@ -693,6 +714,8 @@ class FakeConn:
             exp_range_low,
             exp_range_high,
             int(bool(show_no_experience_jobs)),
+            json.dumps(list(selected_cities)),
+            int(bool(all_india)),
         )
 
 
@@ -706,6 +729,8 @@ class FakeConn:
         exp_range_low: int | None = DEFAULT_EXP_RANGE_LOW,
         exp_range_high: int | None = DEFAULT_EXP_RANGE_HIGH,
         show_no_experience_jobs: bool = DEFAULT_SHOW_NO_EXPERIENCE_JOBS,
+        selected_cities: Sequence[str] = (),
+        all_india: bool = False,
     ) -> None:
         """A SECOND user's filter. Adds a row; deletes nothing.
 
@@ -719,8 +744,9 @@ class FakeConn:
         next_id = int(await self.fetchval("SELECT COALESCE(max(id), 0) + 1 FROM preferences"))
         await self.execute(
             "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, "
-            "user_id, exp_range_low, exp_range_high, show_no_experience_jobs) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            "user_id, exp_range_low, exp_range_high, show_no_experience_jobs, "
+            "selected_cities, all_india) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             next_id,
             json.dumps(list(cities)),
             json.dumps(list(keywords)),
@@ -731,6 +757,8 @@ class FakeConn:
             exp_range_low,
             exp_range_high,
             int(bool(show_no_experience_jobs)),
+            json.dumps(list(selected_cities)),
+            int(bool(all_india)),
         )
 
 
