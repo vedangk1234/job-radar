@@ -132,7 +132,7 @@ that re-applying the schema can never reset a value the dashboard has edited.
 | `canonical_id` | primary key. `{ats}:{company_id}:{native_id}`, or `hash:` + sha256 of company + normalised title + location for boards that expose no id |
 | `title`, `url` | as published |
 | `location` | the vendor's raw string, kept verbatim |
-| `city` | computed label: `blr` \| `pune` \| `hyd` \| `india-unclear` \| `other` |
+| `city` | computed label, one of 26: 23 cities plus `other-india` \| `non-india` \| `india-unclear`. `TEXT`, no `CHECK` — see *City labelling* |
 | `source_posted_at` | advisory only, **never** trusted for "new" |
 | `first_seen_at` | the authoritative "new" timestamp — our own observation |
 | `last_seen_at` | most recent fetch that contained it |
@@ -731,6 +731,13 @@ there too and is not any more (see *City labelling*). Re-adding it from the
 preferences screen restores the old behaviour on the next digest — the filter is
 data, which is the whole reason it is.
 
+The gate is **vocabulary-blind**, in both languages, and that is why growing the
+label set from 5 to 26 changed neither matcher: `city_ok` is
+`(job.get("city") or "") in prefs.cities` and `cityOk` is
+`prefs.cities.includes(job.city ?? "")`, so the labels are opaque strings on
+both sides and the SQL half (`j.city = ANY(preferences.cities)`) reads the same
+array. Twenty new labels that appear in nobody's `cities` can match nothing.
+
 **Word boundaries, not substrings.** Every term compiles to a `\b`-anchored
 regex. The naive `term in title.lower()` is wrong in both directions and fails
 silently: `go` is inside "Goa" and "Django", `api` inside "Rapid" and "Capital",
@@ -824,73 +831,171 @@ read it" is visible in the table instead of being a thing someone has to remembe
 
 ### City labelling
 
-`fetchers/normalize.city_label` returns `blr` | `pune` | `hyd` |
-`india-unclear` | `other`. Precedence: a named target city wins, then a **named
-Indian place that is not one of them** (`other`), then a country/state/region
-signal that names no city (`india-unclear`), then a confident non-India anchor
-(`other`), then vagueness — "Remote", "Multiple Locations" — which resolves to
-`india-unclear`. An empty location is `india-unclear`; an unlabelled posting on
-an Indian company's board is more likely Indian than not.
+`fetchers/normalize.city_label` returns one of **26 labels** — 23 cities and
+three buckets:
+
+```
+blr  hyd  pune                                    the three legacy spellings
+mumbai  navi-mumbai  mumbai-suburban  thane       the Mumbai region
+new-delhi  gurugram  noida                        the NCR
+chennai  kolkata  ahmedabad  indore  nagpur  nashik
+chhatrapati-sambhajinagar  coimbatore  madurai
+hubballi  mangaluru  mysuru  belagavi
+other-india   non-india   india-unclear           the buckets
+```
+
+Precedence: a named city wins, then a **named Indian place that is not one of
+the 23** (`other-india`), then a country/state/region signal that names no city
+(`india-unclear`), then a confident non-India anchor (`non-india`), then
+vagueness — "Remote", "Multiple Locations" — which resolves to `india-unclear`.
+An empty location is `india-unclear`; an unlabelled posting on an Indian
+company's board is more likely Indian than not.
+
+`fetchers/normalize.CITY_LABELS` is the vocabulary as a tuple, mirrored in
+`dashboard/src/lib/labels.CITY_LABELS`. The runtimes share no code, so the list
+exists twice; `tests/test_city_vocabulary.py` parses the TypeScript file and
+asserts the two are identical, in the same order. A label one side can produce
+that the other rejects is a filter that silently matches nothing.
 
 Matching is generous on purpose: a missed Bangalore posting is a job never seen,
 a false positive is one line of noise. When a string is **ambiguous** the bias
-is `india-unclear` rather than `other`, because `india-unclear` stays in the
-funnel and `other` drops out of it.
+is `india-unclear`, because that label can stay in a funnel and a confident one
+cannot.
 
-**Ambiguous is not the same as "Indian, elsewhere", and conflating them leaked
-jobs.** Every India signal used to share one bucket, so "Lucknow" and "Remote"
-got the same label — even though one is a confident statement that the posting
-is not in any of the three cities and the other is no statement at all. With
-`india-unclear` in `preferences.cities`, an InMobi "SDE 2" in Lucknow read as a
-match, and so did Noida, Mohali and Gurgaon rows: 14 of 61. A string that names
-an Indian place we did not ask for is now `other`, for the same reason "London"
-is — the uncertainty the inclusion bias protects is simply not present.
+**Two conflations were removed, one at a time, and each had leaked something.**
 
-The three home states are the deliberate exception and stay `india-unclear`:
-Karnataka contains Bengaluru, Maharashtra contains Pune, Telangana contains
-Hyderabad, so a posting labelled with only one of them may well be in a city we
-want. "Uttar Pradesh" cannot be, and is `other`.
+The first was *ambiguous* versus *Indian, elsewhere*. Every India signal used to
+share one bucket, so "Lucknow" and "Remote" got the same label — even though one
+is a confident statement that the posting is not in a city we want and the other
+is no statement at all. With `india-unclear` in `preferences.cities`, an InMobi
+"SDE 2" in Lucknow read as a match, and so did Noida, Mohali and Gurgaon rows:
+14 of 61.
 
-`other` therefore now answers "not one of my cities" rather than "not India",
-and one call site needed the older question kept: the Workday **unfiltered
-fallback**, which trims an unscoped tenant's board before storing it. It asks
-`normalize.india_funnel` instead — target city, Indian elsewhere, or vague — so
-it goes on storing the Mumbai rows it always did. Had it been left reading
-`city_label(...) != "other"` it would have silently begun dropping them, which
-would be the crawler filtering jobs: exactly what *store loosely* forbids.
+The second was *Indian, elsewhere* versus *not India*, and it lasted until the
+25-city rewrite. `city_label` collapsed three different verdicts into one label
+called `other`: an Indian city we had not asked for, a confidently foreign
+posting, and a string no rule recognised. One label, three facts — fine while
+the only question anyone asks is "is this one of my three cities?", and fatal
+the moment somebody asks "show me everything in India", because `other` can
+answer neither yes nor no to it. `_classify` had always computed the
+distinction; the rewrite stopped throwing it away one line before returning it.
 
-Beyond full city names, the markers include:
+**The three legacy spellings were kept, and that is what made the rewrite safe
+to run against live data.** `blr`, `hyd` and `pune` are what every account's
+`preferences.cities` holds, in both runtimes, plus `notify.match.DEFAULT_CITIES`
+and the `db/schema.sql` seed. Renaming them to `bengaluru`/`hyderabad` would
+have meant rewriting every filter inside the same transaction as the relabel,
+with a window in which a half-applied migration empties every digest. Leaving
+them alone instead makes something more valuable true: they are scanned **first**
+in `_CITY_MARKERS`, they lost no marker, and they gained none that moves a
+stored row — so no string that labelled one of them can be stolen by one of the
+twenty new cities, and no new label appears in any preferences row. The only
+rows the vocabulary can move are rows that were already outside every filter.
+Proven rather than argued: over all 1,654 distinct location strings, **0 rows
+left those three labels and 0 entered them**; the live pass relabelled 9,171
+rows and `npm run match-parity` returned 38 before and after, as did
+`preview_digest.py` (blr 33 / hyd 3 / pune 2).
 
-- **Office/airport codes** — `blr`, `hyd`, `pnq`, and `ind pun`/`in pun`. One
-  Workday tenant writes every Bangalore posting as "IND-BLR-<building>", which
+Precedence carries a second rule. A label whose marker **contains** another
+label's must be scanned first: "Navi Mumbai" contains the token `mumbai`, so
+navi-mumbai, mumbai-suburban and thane sit above mumbai. Otherwise every Navi
+Mumbai posting would label `mumbai` and the distinction the city dropdown needs
+would be destroyed at write time, where no query can recover it.
+
+**Which states count as ambiguous is relative to the city list, and six changed
+sides.** "Is this state ambiguous?" means "does it contain a city somebody can
+ask for?" — so Karnataka, Maharashtra and Telangana were the only three while
+the vocabulary was three cities, and Tamil Nadu (Chennai, Coimbatore, Madurai),
+Uttar Pradesh (Noida), Gujarat (Ahmedabad), West Bengal (Kolkata), Haryana
+(Gurugram) and Madhya Pradesh (Indore) joined them when it grew. This file used
+to say *"'Uttar Pradesh' cannot be [a target city], and is `other`"*; that was
+true of a three-city vocabulary and is false of this one. The flip only bites
+when the state is **all** the string says — "Kalyani, WEST BENGAL" names a town,
+and the other-india table answers first.
+
+`india_funnel` is the one call site that needs "is this plausibly India at all?"
+rather than "which city is this?" — the Workday **unfiltered fallback**, which
+trims an unscoped tenant's board before storing it. It is now defined as a
+**complement**: everything except `non-india`. It used to be membership of a
+hand-written set of Indian labels, which worked at five labels and becomes a
+trap at twenty-six — adding a 24th city and forgetting to add it to that set
+would make the crawler silently stop **storing** that city, jobs vanishing
+before they are ever written down. There is exactly one label the question
+answers no to, so that is the one the function names.
+
+**Every marker is in the file because a real posting carries it.** The canonical
+modern name of each of the 23 cities is always present — it is the label's own
+name, not a guess about spelling. Everything else (an old name, a variant, a
+misspelling, an airport code) had to be found by
+`scripts/survey_all_locations.py` and carries the row count it was found with:
+
+- **Office/airport codes** — `blr`, `hyd`, `pnq`, `ind pun`/`in pun`. One Workday
+  tenant writes every Bangalore posting as "IND-BLR-<building>" (178 rows), which
   matched nothing and labelled `other`: **135 real Bengaluru jobs were being
-  discarded by a string format.** A three-letter token is safe here because
-  `norm()` has already turned every hyphen, comma and slash into a space and
-  `_hit` anchors on word boundaries, so `blr` matches inside "IND-BLR-Divyasree"
-  and cannot match inside a longer word. `ind pun` is anchored as a whole phrase
-  so it matches "IND-PUN-Kharadi" and **not** "IND-Punjab-Mohali".
-- **One misspelling** — `banglore`, which one Greenhouse board writes on every
-  posting from that office (3 rows). It is the only near-miss in the entire
-  table: a fuzzy pass over every 4+ letter token in all 1197 stored rows found
-  nothing else. Hyderabad and Pune are spelled correctly on every board here, so
-  neither gets a misspelling marker — one that matches nothing is
-  false-positive surface bought with no recall.
+  discarded by a string format.** A three-letter token is safe because `norm()`
+  has already turned every hyphen, comma and slash into a space and `_hit`
+  anchors on word boundaries. `ind pun` is anchored as a whole phrase so it
+  matches "IND-PUN-Kharadi" and **not** "IND-Punjab-Mohali".
+- **Misspellings** — `banglore` (3 rows, PhonePe) and `hyderbad` (5 rows,
+  Commvault). The second is worth being honest about: all five of its rows read
+  "Bangalore, India; Hyderbad, India", so `blr` outranks it and it relabels
+  nothing today. It is in because the spelling is attested and the next posting
+  may not carry Bangalore alongside.
+- **Post-`norm` forms** — `zu rich`, `sa o paulo`, `que bec`, `mu nchen`. `norm`
+  runs NFKD and then strips everything outside `\w\s`, and a combining accent is
+  not a word character, so it becomes a **space** rather than vanishing. The
+  markers are written in the only form `_hit` will ever see, which is the same
+  reason `ind pun` is spelled that way.
 
-Deliberately **rejected**, each after being checked against the data: `beng`
-(occurs only inside "Bengaluru", and standing alone is likelier to be Bengal);
-bare `pun` (an English word, and PUN is not Pune's IATA code — PNQ is);
-"bangalore urban" (already matches, since `_hit` anchors words rather than whole
-strings); and `bengalore`/`bangalor`/`banaglore` (plausible, but absent from the
-database and from fixtures — the rule for adding a marker is that a real posting
-was lost to it). The nearest trap in the data is real: "THA Bangkok One
-Bangkok", 3 rows. Anchoring whole non-word tokens is what makes it impossible
-for a "bang" prefix rule to relabel three Thai jobs as Bangalore.
+Deliberately **rejected**, each after being checked against the data: `beng` and
+bare `pun`; `bengalore`/`bangalor`/`banaglore`; **`hubli`, `mangalore`,
+`belgaum`** (real alternative names, named in the brief for the rewrite, and
+carried by zero rows — the same case, and the same answer); and **all fourteen
+airport codes for the new cities** (`bom`, `del`, `maa`, `ccu`, `amd`, `idr`,
+`nag`, …), which no board here writes and several of which are words. The
+nearest trap in the data is real: "THA Bangkok One Bangkok". Anchoring whole
+non-word tokens is what makes a "bang" prefix rule unable to relabel three Thai
+jobs as Bangalore.
 
-`scripts/survey_locations.py` is what answers "which spellings deserve a
-marker?" from the data instead of from English, and `scripts/relabel_cities.py`
-recomputes `jobs.city` for stored rows. The relabel pass hashes every column
+The one pair attested from somewhere other than the jobs table is
+`indiana`/`indianapolis`, and the rewrite is what made them matter. A Workday
+tenant's `locations` facet lists "Indiana - Indianapolis" — the reason `_hit`
+anchors at all — and the no-marker fallback moved from `other`, which the old
+funnel read as foreign, to `india-unclear`, which the funnel keeps. Without
+those two markers an unscoped tenant would have started storing its Indiana reqs.
+
+**`ncr` was a marker and it was a bug.** It sat in the Indian table on the
+assumption that NCR means Delhi's National Capital Region. The Philippines has
+one too, and LSEG writes it: "Makati City, NCR, Philippines" (11 rows), "Makati,
+NCR" (2), "Taguig, NCR" (2). All fifteen classified as Indian. Under the old
+collapse that was invisible — they landed in `other` beside genuinely foreign
+rows — and **the split is what would have made it visible**, by turning them into
+`other-india`. The marker is gone and `philippines` answers instead.
+
+`scripts/survey_all_locations.py` is what answers "which spellings deserve a
+marker?" from the data instead of from English. It prints every distinct
+location string with the verdict it gets **and the marker that produced it**, a
+token-frequency view, a fuzzy near-miss pass, and — the one that gates a
+migration — the **residue**: strings no marker in any table matched, which are
+therefore labelled by a fallback rather than by a rule. `normalize.explain_label`
+is what both it and the relabel ask, so a survey cannot certify a residue the
+relabel then refuses. (`scripts/survey_locations.py`, the older and narrower
+script, surveys only the two dropped buckets and is still the right tool for
+that question.)
+
+`scripts/relabel_cities.py` recomputes `jobs.city` for stored rows, and a
+vocabulary change does not reach the table without it. It hashes every column
 *except* `city` before and after and asserts they are identical, so "the UPDATE
-only touches city" is evidence rather than an argument.
+only touches city" is evidence rather than an argument. Since the rewrite it
+also reports, and **refuses to apply on**, two more things:
+
+| Gate | Refuses when | Because |
+|---|---|---|
+| residue | any row's label came from the fallback | nobody can review a verdict with no rule behind it |
+| blast radius | a job crosses any user's `preferences.cities` | a job moving **into** a filter has no `user_job_notifications` row, so nothing suppresses it and it goes out in the next digest as news, because a labeller changed |
+
+The apply path checks the same two gates the dry run reports, so "I read the
+report and approved it" and "the script agreed" cannot come apart.
 
 ### Re-deciding what a description said
 
@@ -2398,6 +2503,78 @@ Newest last. Append here as the project evolves.
   unchanged at 43/3/14/2 with `updated_at` unmoved. A second preview matches
   nothing. **No un-onboarded account now carries any part of the operator's
   filter**, which is what Slices 1b and 1c together set out to be true.
+
+- **2026-08-10 — Phase 3, cities Slice A. The city vocabulary goes from 5 labels
+  to 26, job-side only.** `jobs.city` could say `blr`, `hyd`, `pune`,
+  `india-unclear` or `other`, and `other` was three facts wearing one name: an
+  Indian city we had not listed, a confidently foreign posting, and a string no
+  rule recognised. That is fine while the only question is "is this one of my
+  three cities?" and useless the moment somebody asks "show me everything in
+  India". So the collapse came out — `_classify` had always computed the
+  distinction — and the city list grew to the 23 the dropdown will offer.
+
+  **Built survey-first, on purpose.** `scripts/survey_all_locations.py` (new,
+  read-only) dumped every distinct location string across 9,689 stored jobs with
+  the verdict it gets *and the marker that produced it*, plus a token-frequency
+  view, a fuzzy near-miss pass, and the **residue** — 590 rows across 150 strings
+  that matched no marker in any table. The alias table was then built from those
+  spellings rather than from English, and minimised computationally: each
+  candidate marker was dropped and the whole 1,654-string corpus re-labelled,
+  and it stayed only if a row's label changed. That killed 16 speculative Indian
+  markers and 47 redundant foreign ones. `hubli`, `mangalore` and `belgaum` were
+  named in the brief and rejected for carrying zero rows, as were all fourteen
+  airport codes for the new cities.
+
+  **Two bugs the survey found.** `ncr` sat in the Indian marker table and was
+  matching the *Philippines'* National Capital Region — 15 LSEG rows classified
+  as Indian, invisible while everything foreign shared `other` with Lucknow, and
+  about to become `other-india`. And Workday's `locationsText` bare count form
+  ("2 Locations") reached the no-marker fallback, caught by the new residue gate
+  against `tests/data` rather than by review.
+
+  **The three legacy spellings were kept and scanned first**, which is what made
+  this safe to run live: `blr`/`hyd`/`pune` are what every `preferences.cities`
+  holds, so renaming them would have meant rewriting every filter inside the
+  relabel's own transaction. Instead the only rows the vocabulary can move are
+  rows that were already outside every filter. Verified on the corpus before
+  touching anything — 0 rows leaving those three labels, 0 entering.
+
+  `india_funnel` was redefined as a **complement** (everything except
+  `non-india`) rather than membership of a hand-listed set, because forgetting a
+  24th city would make the Workday unscoped trim silently stop *storing* it.
+
+  `scripts/relabel_cities.py` gained the two gates the migration needed and
+  **refuses to apply on either**: a non-empty residue (a label from a fallback,
+  which nobody can review) and a non-zero blast radius (a job crossing any
+  user's `cities` — the entering direction has no `user_job_notifications` row,
+  so nothing suppresses it and it would go out as news because a labeller
+  changed).
+
+  **Run live:** dry run clean, then 9,171 rows relabelled, lifecycle fingerprint
+  MATCH over all 15 non-`city` columns. `npm run match-parity` returned **38
+  before and 38 after**, and `preview_digest.py --dry-run --ignore-notified`
+  the same 38 (blr 33 / hyd 3 / pune 2). Nothing moved.
+
+  Distribution after: `non-india` 6728, `blr` 1774, `hyd` 283, `noida` 271,
+  `india-unclear` 152, `pune` 123, `mumbai` 103, `other-india` 99, `gurugram` 88,
+  `chennai` 44, and a long tail; `thane`, `mumbai-suburban`, `nagpur`,
+  `madurai`, `mangaluru` and `belagavi` exist with zero rows because no board
+  here writes them.
+
+  TypeScript side: `CITY_LABELS` expanded to the same 26 in the same order (with
+  a new test that parses `labels.ts` and asserts the two lists match — the
+  runtimes share no code, so the list exists twice), `other` removed, and the
+  `cleanList(body.cities, { max: 20 })` **silent truncation** fixed to refuse —
+  26 labels against a cap of 20 meant an account ticking every box would have
+  had six dropped and been told the save succeeded.
+
+  Deliberately **not** in this slice: the city dropdown, `selected_cities`,
+  `all_india`, and the matcher's city logic. `preferences.cities`,
+  `DEFAULT_CITIES`, the schema seed and `discover.TARGET_CITIES` are all
+  untouched. 1279 tests pass (268 new in `tests/test_city_vocabulary.py`);
+  fifteen assertions that pinned the literal string `"other"` were rewritten to
+  the invariant they actually meant — a regression test pinned to a spelling
+  stops testing its regression the day the spelling changes.
 
 ---
 

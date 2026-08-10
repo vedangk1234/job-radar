@@ -70,7 +70,10 @@ def test_city_counts_uses_the_stored_labeller():
         job("5", location="Remote"),
     ]
     counts = city_counts(jobs)
-    assert counts == {"blr": 2, "hyd": 1, "other": 1, "india-unclear": 1}
+    # `non-india` rather than `other` since the 25-city rewrite split that
+    # label. The bar itself is unchanged and still reads only TARGET_CITIES —
+    # this test is about the counter agreeing with the crawler's labeller.
+    assert counts == {"blr": 2, "hyd": 1, "non-india": 1, "india-unclear": 1}
     assert city_hits(counts) == ["blr", "hyd"]
 
 

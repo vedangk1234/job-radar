@@ -173,8 +173,11 @@ async def test_preferences_are_read_from_the_database_not_hardcoded(digest_conn)
     assert await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend()) is not None
     assert await queue_ids(digest_conn) == {"berlin"}  # dropped on city
 
+    # `non-india` was spelled `other` until the 25-city rewrite, which split
+    # that label into "an Indian city we did not list" and "not India". Berlin
+    # is the second one.
     await digest_conn.set_preferences(
-        cities=["blr", "other"], keywords=["backend"], exclusions=["senior"]
+        cities=["blr", "non-india"], keywords=["backend"], exclusions=["senior"]
     )
     run = await run_digest(digest_conn, user_id=TEST_USER_ID, today=TODAY, sender=FakeResend())
 

@@ -64,7 +64,14 @@ export async function PUT(request: Request) {
     return badRequest("body was not JSON");
   }
 
-  const cities = cleanList(body.cities, { max: 20 });
+  // `max: 20` here was a silent truncation waiting for a vocabulary change, and
+  // the 25-city rewrite is that change: CITY_LABELS is 26 entries, so an account
+  // ticking every box would have had six of them dropped and been told the save
+  // succeeded. Cleaned in full and refused if over the cap, exactly like the
+  // keywords below — the argument in that comment is this one, and it applies
+  // here for the same reason. The cap is above the vocabulary rather than equal
+  // to it so adding a city is not also a schema-shaped edit to this file.
+  const cities = cleanList(body.cities, { max: 300 });
   const exclusions = cleanList(body.exclusions, { max: 300 });
 
   // NOT cleanList's `max`, and the difference is the whole point. That parameter
@@ -78,6 +85,12 @@ export async function PUT(request: Request) {
 
   if (!cities.length) {
     return badRequest("cities cannot be empty — an empty city list matches no job at all");
+  }
+  if (cities.length > CITY_LABELS.length) {
+    return badRequest(
+      `${cities.length} cities is more labels than exist. There are ` +
+        `${CITY_LABELS.length}; nothing has been changed.`,
+    );
   }
   const unknown = cities.filter((c) => !CITY_LABELS.includes(c as (typeof CITY_LABELS)[number]));
   if (unknown.length) {

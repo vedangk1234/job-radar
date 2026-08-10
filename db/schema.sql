@@ -27,7 +27,15 @@ CREATE TABLE IF NOT EXISTS jobs (
   company_id       INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   title            TEXT NOT NULL,
   location         TEXT,                 -- raw string, kept verbatim
-  city             TEXT,                 -- computed label: blr | pune | hyd | india-unclear | other
+  -- Computed label, 26 values: 23 cities plus other-india | non-india |
+  -- india-unclear. Deliberately TEXT with no CHECK and no enum — the vocabulary
+  -- lives in fetchers/normalize.CITY_LABELS, mirrored in
+  -- dashboard/src/lib/labels.CITY_LABELS, and a constraint here would mean a
+  -- migration every time a city is added while catching nothing a typo in
+  -- either list would not already cause (a label nothing matches is silently
+  -- empty, not an error). See scripts/relabel_cities.py, which is how a
+  -- vocabulary change reaches rows already stored.
+  city             TEXT,
   url              TEXT NOT NULL,
   source_posted_at TIMESTAMPTZ,          -- advisory only, never trusted for "new"
   first_seen_at    TIMESTAMPTZ NOT NULL, -- authoritative "new" timestamp (our own observation)

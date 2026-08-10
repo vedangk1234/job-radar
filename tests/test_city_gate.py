@@ -53,7 +53,15 @@ def test_the_inmobi_lucknow_row_is_excluded_on_city():
         "desc_checked": True,
         "desc_fetch_failed": False,
     }
-    assert job["city"] == "other"
+    # The label was `other` when this regression was written and is
+    # `other-india` since the 25-city rewrite split that bucket. What the test
+    # is actually about is the line below it — the row does not reach an inbox —
+    # so that is what it asserts now, and the label is checked for being outside
+    # the filter rather than for being a particular string. A regression test
+    # pinned to a spelling stops testing its regression the day the spelling
+    # changes.
+    assert job["city"] == "other-india"
+    assert job["city"] not in PREFS.cities
     assert not city_ok(job, PREFS)
     assert not is_match(job, PREFS)
 
@@ -71,9 +79,16 @@ def test_the_inmobi_lucknow_row_is_excluded_on_city():
         "Remote, United Arab Emirates",  # GitLab, likewise
     ],
 )
-def test_every_string_behind_the_14_leaked_matches_now_labels_other(location):
-    """Each of these was `india-unclear` and therefore a pass. None of them is."""
-    assert city_label(location) == "other"
+def test_every_string_behind_the_14_leaked_matches_is_still_excluded(location):
+    """Each of these was `india-unclear` and therefore a pass. None of them is.
+
+    Asserted as "does not pass the gate" rather than as "== other", because the
+    label these produce has now changed twice — `india-unclear` to `other` when
+    the leak was fixed, `other` to `noida` / `other-india` / `non-india` when the
+    vocabulary grew — while the thing being regression-tested never changed at
+    all. Pinning the spelling would have made this test fail for the rewrite and
+    stop protecting anything the moment somebody "fixed" it.
+    """
     assert not city_ok({"city": city_label(location)}, PREFS)
 
 
@@ -85,14 +100,14 @@ def test_every_string_behind_the_14_leaked_matches_now_labels_other(location):
     ["Mumbai", "New Delhi", "Gurugram", "Chennai", "Kolkata", "Mysuru", "Jaipur",
      "Tamil Nadu", "West Bengal", "Uttar Pradesh", "Kerala"],
 )
-def test_a_named_indian_place_outside_the_three_cities_is_other(location):
-    """`other` is "confidently not one of my cities", whoever's country it is in.
-
-    A posting in Chennai is exactly as certainly not-Bangalore as one in London,
-    and the label says so. The India-ness is not lost — see india_funnel below —
-    it just stops being the thing the filter reads.
+def test_a_named_indian_place_outside_the_three_cities_is_excluded(location):
+    """A posting in Chennai is exactly as certainly not-Bangalore as one in
+    London, and the label says so. The India-ness is not lost — see india_funnel
+    below, and since the 25-city rewrite it is not even implicit: Chennai labels
+    `chennai` and Jaipur labels `other-india`. What matters here is only that
+    none of them is one of the operator's three cities.
     """
-    assert city_label(location) == "other"
+    assert not city_ok({"city": city_label(location)}, PREFS)
 
 
 @pytest.mark.parametrize(
@@ -106,7 +121,15 @@ def test_a_string_that_names_no_city_is_still_unclear(location):
     The three states are here on purpose. Karnataka CONTAINS Bengaluru,
     Maharashtra contains Pune and Telangana contains Hyderabad, so a posting
     labelled only with one of them may well be in a city we want — which is
-    genuine ambiguity, unlike "Uttar Pradesh", which cannot be.
+    genuine ambiguity.
+
+    This test used to end "...unlike 'Uttar Pradesh', which cannot be." That is
+    no longer true and the sentence is gone rather than reworded: UP contains
+    Noida, which is a label somebody can now ask for, so UP is ambiguous in
+    exactly the way Karnataka is. Six states moved across that line when the
+    vocabulary grew; tests/test_city_vocabulary.py names all six. The rule did
+    not change — "does this state contain a city somebody can ask for?" — only
+    the list it is asked about.
     """
     assert city_label(location) == "india-unclear"
 

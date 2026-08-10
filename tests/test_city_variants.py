@@ -76,9 +76,15 @@ def test_the_misspelling_never_fires_inside_a_longer_word(location):
 
 
 def test_west_bengal_is_still_a_state_and_not_a_city():
-    """The fuzzy pass's only other near-miss. It is a real place, correctly not ours."""
-    assert city_label("Kolkata, West Bengal") == "other"
-    assert city_label("West Bengal, India") == "other"
+    """The fuzzy pass's only other near-miss, and it is still not Bangalore.
+
+    What changed with the vocabulary is what each string resolves to once
+    "Bengal is not Bengaluru" has been established: the first names Kolkata,
+    which is a label now, and the bare state contains Kolkata, which makes it
+    ambiguous rather than a confident elsewhere.
+    """
+    assert city_label("Kolkata, West Bengal") == "kolkata"
+    assert city_label("West Bengal, India") == "india-unclear"
 
 
 # --- what was deliberately left out ---------------------------------------
@@ -100,16 +106,21 @@ def test_the_district_forms_need_no_marker_of_their_own():
 
 
 @pytest.mark.parametrize(
-    "location", ["Hyderbad", "Hydrabad", "Puna", "Poona", "Bengalore", "Banaglore"]
+    "location", ["Hydrabad", "Puna", "Poona", "Bengalore", "Banaglore"]
 )
 def test_unevidenced_misspellings_are_not_markers(location):
     """No posting in this database is spelled any of these ways.
 
     Asserting the CURRENT behaviour, not endorsing it. Each of these is a
-    plausible typo, and every one of them is absent from all 1197 stored rows
+    plausible typo, and every one of them is absent from all 9,689 stored rows
     and from tests/data — so none earned a marker. If a board starts writing one,
-    scripts/survey_locations.py surfaces it and this test is the place the
+    scripts/survey_all_locations.py surfaces it and this test is the place the
     decision gets revisited.
+
+    "Hyderbad" was on this list and has come off it, which is the process
+    working rather than an exception to it: the survey found 5 real Commvault
+    rows spelled that way, so it stopped being unevidenced and became a marker.
+    See tests/test_city_vocabulary.py, which now owns that case.
     """
     assert city_label(location) not in ("blr", "hyd", "pune")
 
@@ -133,21 +144,22 @@ def test_unevidenced_misspellings_are_not_markers(location):
         ("IND-Hyderabad-CapitaLand", "hyd"),
         ("PUNE 05", "pune"),
         ("India, Pune", "pune"),
-        # A named Indian city outside the three is `other` — it says where the
-        # job is, and the answer is "not here". Only strings naming no city at
-        # all stay `india-unclear`.
-        ("Noida", "other"),
-        ("India - Mumbai", "other"),
-        ("IND-Mumbai-One World Center", "other"),
-        ("Mysore", "other"),
+        # A named Indian city outside the three says where the job is, and the
+        # answer is "not here". It used to be spelled `other`; six of these now
+        # carry the city's own name, one is `other-india`, and the foreign four
+        # are `non-india`. Only strings naming no city stay `india-unclear`.
+        ("Noida", "noida"),
+        ("India - Mumbai", "mumbai"),
+        ("IND-Mumbai-One World Center", "mumbai"),
+        ("Mysore", "mysuru"),
         ("Remote India", "india-unclear"),
-        ("Hubballi", "other"),
-        ("Nashik", "other"),
-        ("Varanasi", "other"),
-        ("San Francisco, California, United States", "other"),
-        ("Colombo Sri Lanka | 2 Locations", "other"),
-        ("PHL Taguig City CitiPlaza | 2 Locations", "other"),
-        ("Malaysia", "other"),
+        ("Hubballi", "hubballi"),
+        ("Nashik", "nashik"),
+        ("Varanasi", "other-india"),
+        ("San Francisco, California, United States", "non-india"),
+        ("Colombo Sri Lanka | 2 Locations", "non-india"),
+        ("PHL Taguig City CitiPlaza | 2 Locations", "non-india"),
+        ("Malaysia", "non-india"),
     ],
 )
 def test_existing_labels_are_unchanged(location, expected):

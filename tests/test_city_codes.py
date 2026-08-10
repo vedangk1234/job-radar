@@ -109,16 +109,18 @@ def test_the_full_name_is_still_anchored_too():
     any board produces, and loosening the anchor to catch it would re-open every
     substring hole this module is built to avoid.
     """
-    assert city_label("Hyderabadi Restaurant Group") == "other"
+    assert city_label("Hyderabadi Restaurant Group") != "hyd"
     assert city_label("Hyderabad") == "hyd"
 
 
 def test_beng_is_not_a_marker():
     """Rejected deliberately: "Beng" is likelier to be Bengal than Bangalore."""
     assert city_label("Beng") != "blr"
-    # West Bengal is a named Indian state containing none of the three cities,
-    # so it is `other` — a confident "not here", not an unknown.
-    assert city_label("West Bengal") == "other"
+    # West Bengal names no city. It used to be a confident "not here" because it
+    # contained none of the three; since the vocabulary grew it contains Kolkata,
+    # so it is genuinely ambiguous and labels india-unclear — the same rule
+    # Karnataka has always had, applied to a longer city list.
+    assert city_label("West Bengal") == "india-unclear"
     # ...while the full name it was a substring of still works.
     assert city_label("Bengaluru") == "blr"
 
@@ -144,17 +146,18 @@ def test_bare_pun_is_not_a_marker():
         ("IND-Hyderabad-CapitaLand", "hyd"),
         ("India, Pune", "pune"),
         ("PUNE 05", "pune"),
-        # A named Indian city that is not one of ours is `other`, the same as a
-        # named foreign one: both are confident statements about where the job
-        # is not. Only the strings that name no city stay unclear.
-        ("IND-Mumbai-One World Center", "other"),
+        # A named Indian city that is not one of ours is a confident statement
+        # about where the job is not, the same as a named foreign one. Both used
+        # to be spelled `other`; the 25-city rewrite gave the first its own name
+        # and the second `non-india`, which is the whole content of that change.
+        ("IND-Mumbai-One World Center", "mumbai"),
         ("Remote", "india-unclear"),
         ("", "india-unclear"),
-        ("San Francisco, California, United States", "other"),
-        ("London, UK", "other"),
-        ("GBR London 5 Canada Square | 2 Locations", "other"),
-        ("Colombo Sri Lanka | 2 Locations", "other"),
-        ("Singapore", "other"),
+        ("San Francisco, California, United States", "non-india"),
+        ("London, UK", "non-india"),
+        ("GBR London 5 Canada Square | 2 Locations", "non-india"),
+        ("Colombo Sri Lanka | 2 Locations", "non-india"),
+        ("Singapore", "non-india"),
     ],
 )
 def test_existing_labels_are_unchanged(location, expected):
@@ -166,7 +169,9 @@ def test_phrase_markers_still_match_when_anchored():
     """_hit anchoring phrases must not have broken the multi-word markers."""
     assert city_label("Electronics City, Karnataka") == "blr"
     assert city_label("HITEC City") == "hyd"
-    assert city_label("New Delhi") == "other"
-    assert city_label("Tamil Nadu") == "other"
-    assert city_label("San Francisco") == "other"
+    assert city_label("New Delhi") == "new-delhi"
+    # Tamil Nadu contains Chennai, Coimbatore and Madurai now, so it names no
+    # city AND cannot rule one out — which is what india-unclear is for.
+    assert city_label("Tamil Nadu") == "india-unclear"
+    assert city_label("San Francisco") == "non-india"
     assert city_label("Multiple Locations") == "india-unclear"

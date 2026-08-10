@@ -44,7 +44,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from db.connection import get_crawler_conn  # noqa: E402
-from fetchers.normalize import city_label  # noqa: E402
+from fetchers.normalize import city_label, explain_label  # noqa: E402
 
 LOAD = """
 SELECT j.canonical_id, j.location, j.city, j.title, c.name AS company
@@ -52,6 +52,17 @@ SELECT j.canonical_id, j.location, j.city, j.title, c.name AS company
   JOIN companies c ON c.id = j.company_id
  ORDER BY c.name, j.canonical_id
 """
+
+# Every filter this relabel could move a job into or out of. Read to compute the
+# blast radius below; never written.
+PREFS = """
+SELECT u.email, p.cities
+  FROM preferences p
+  JOIN public.users u ON u.id = p.user_id
+ ORDER BY u.email
+"""
+
+SPREAD = "SELECT city, count(*) AS n FROM jobs GROUP BY city ORDER BY n DESC, city"
 
 # `IS DISTINCT FROM` rather than `<>` so a row whose stored city is NULL is
 # still updated. Only the one column is named.
@@ -144,6 +155,105 @@ def report_fingerprint(before: tuple[str, dict[str, str]], after: tuple[str, dic
     return False
 
 
+def report_residue(rows) -> bool:
+    """Every string labelled by the FALLBACK rather than by a marker.
+
+    `fetchers.normalize.explain_label` returns None for the marker when no table
+    matched, which is the one case the label is a shrug rather than a decision.
+    A row here is not mislabelled exactly — it is UNADJUDICATED, and the
+    difference matters because nobody can review a verdict with no rule behind
+    it. scripts/survey_all_locations.py prints the same list from the other end.
+
+    True when the residue is empty, which is a precondition for applying.
+    """
+    residue: Counter[str] = Counter()
+    companies: dict[str, set[str]] = {}
+    for row in rows:
+        if explain_label(row["location"])[1] is None:
+            key = row["location"] if row["location"] is not None else "<NULL>"
+            residue[key] += 1
+            companies.setdefault(key, set()).add(row["company"])
+
+    print("\n" + "-" * 72)
+    print("RESIDUE  (strings no marker in any table matched)")
+    print("-" * 72)
+    if not residue:
+        print("  EMPTY — every stored row's label was decided by a rule.")
+        return True
+
+    print(f"  {len(residue)} distinct string(s), {sum(residue.values())} row(s)")
+    print("  Each one needs a marker before this pass may be applied.")
+    for text, n in residue.most_common():
+        print(f"    {n:>5}  {text}")
+        print(f"           {', '.join(sorted(companies[text]))[:100]}")
+    return False
+
+
+def report_blast_radius(changes, prefs) -> bool:
+    """Which jobs move INTO or OUT OF a real person's city filter.
+
+    This is the only report here that is about an inbox rather than about a
+    column, and it is the one worth reading twice.
+
+    ENTERING is the dangerous direction. A job whose label moves into somebody's
+    `cities` becomes a match, and it has no `user_job_notifications` row —
+    those are written when something is sent, and nothing was ever sent for a
+    job that did not match. So it is not suppressed by anything: it goes out in
+    the next digest, as news, because a labeller changed. LEAVING is milder but
+    still visible — a posting silently vanishes from Home.
+
+    Both should be zero for a vocabulary change that only renames buckets
+    outside every filter. Non-zero is not necessarily wrong, but it must be a
+    decision somebody made rather than a side effect nobody saw.
+    """
+    print("\n" + "-" * 72)
+    print("BLAST RADIUS  (rows crossing a real preferences.cities set)")
+    print("-" * 72)
+    if not prefs:
+        print("  no preferences rows found — nothing to compute against.")
+        return True
+
+    clean = True
+    for row in prefs:
+        cities = set(row["cities"] or ())
+        entering = [(r, new) for r, new in changes if r["city"] not in cities and new in cities]
+        leaving = [(r, new) for r, new in changes if r["city"] in cities and new not in cities]
+        flag = "" if not (entering or leaving) else "   <-- REVIEW"
+        print(f"  {row['email']}  cities={sorted(cities)}{flag}")
+        print(f"      entering (would be EMAILED next digest): {len(entering)}")
+        print(f"      leaving  (would vanish from Home):       {len(leaving)}")
+        for r, new in entering[:20]:
+            print(f"        + {r['city']} -> {new}   {(r['location'] or '')[:44]}   {r['title'][:40]}")
+        for r, new in leaving[:20]:
+            print(f"        - {r['city']} -> {new}   {(r['location'] or '')[:44]}   {r['title'][:40]}")
+        if entering or leaving:
+            clean = False
+    if clean:
+        print("\n  CLEAN — no job crosses any user's city filter in either direction.")
+    return clean
+
+
+def report_spread(before, after_counter, total: int) -> None:
+    """The whole distribution, before and beside after — not just the deltas.
+
+    The change report above says what moved; this says what the table looks
+    like, which is the thing worth eyeballing before agreeing to write it. A
+    label at zero is printed too: an empty bucket is information (nobody writes
+    that spelling) and an absent line is not.
+    """
+    print("\n" + "-" * 72)
+    print("CITY DISTRIBUTION  (stored now -> projected)")
+    print("-" * 72)
+    labels = sorted(set(before) | set(after_counter), key=lambda l: (-after_counter.get(l, 0), l))
+    print(f"    {'label':<28} {'before':>7} {'after':>7}   {'delta':>7}")
+    for label in labels:
+        b, a = before.get(label, 0), after_counter.get(label, 0)
+        mark = "" if b == a else "  *"
+        print(f"    {label or 'NULL':<28} {b:>7} {a:>7}   {a - b:>+7}{mark}")
+    print(f"    {'TOTAL':<28} {sum(before.values()):>7} {sum(after_counter.values()):>7}")
+    assert sum(after_counter.values()) == total
+
+
 async def main() -> int:
     dry_run = "--dry-run" in sys.argv[1:]
 
@@ -153,6 +263,7 @@ async def main() -> int:
         print(f"lifecycle fingerprint before: {before[0]} ({len(before[1])} rows)\n")
 
         rows = await conn.fetch(LOAD)
+        prefs = await conn.fetch(PREFS)
         print(f"recomputing city for {len(rows)} stored job(s)\n")
 
         changes = [
@@ -161,12 +272,20 @@ async def main() -> int:
             if city_label(r["location"]) != r["city"]
         ]
 
+        # The two gates, computed before anything else is printed so they are
+        # the same numbers whether or not there is a change to report.
+        stored_spread: Counter[str] = Counter((r["city"] or "NULL") for r in rows)
+        projected: Counter[str] = Counter(city_label(r["location"]) for r in rows)
+        report_spread(stored_spread, projected, len(rows))
+        residue_clean = report_residue(rows)
+        radius_clean = report_blast_radius(changes, prefs)
+
         if not changes:
-            print("Every stored row already carries the label the current rules give it.")
+            print("\nEvery stored row already carries the label the current rules give it.")
             # Still worth taking the second reading: on a re-run this is the
             # idempotence proof — nothing to write, and nothing written.
             report_fingerprint(before, await fingerprint(conn))
-            return 0
+            return 0 if residue_clean else 1
 
         # Report BEFORE writing, broken down the way the brief asks: by the label
         # rows moved INTO, and by company.
@@ -210,8 +329,24 @@ async def main() -> int:
         if dry_run:
             print(f"\n--dry-run: {len(changes)} row(s) left untouched.")
             # The dry run's own claim, checked: it must not have written either.
-            report_fingerprint(before, await fingerprint(conn))
-            return 0
+            fp_clean = report_fingerprint(before, await fingerprint(conn))
+            ok = residue_clean and radius_clean and fp_clean
+            print("\n" + ("DRY RUN CLEAN — safe to apply." if ok else "DRY RUN BLOCKED:"))
+            if not residue_clean:
+                print("  - the residue is not empty; some rows would be labelled by a fallback.")
+            if not radius_clean:
+                print("  - jobs cross a user's city filter; applying would change an inbox.")
+            if not fp_clean:
+                print("  - the dry run itself moved something. Do not apply.")
+            return 0 if ok else 1
+
+        # The apply path refuses on the same two gates the dry run reports, so
+        # "I read the dry run and approved it" and "the script agreed" cannot
+        # come apart — someone applying without having looked gets stopped by
+        # the same rule that would have stopped them if they had.
+        if not residue_clean or not radius_clean:
+            print("\nREFUSING TO APPLY — re-run with --dry-run and read the report above.")
+            return 1
 
         # A transaction so a half-applied relabel cannot exist. The pass is
         # idempotent anyway, but "ran it and it died at row 900" should not be a
@@ -225,9 +360,7 @@ async def main() -> int:
 
         print(f"\nupdated {written} row(s).")
 
-        spread = await conn.fetch(
-            "SELECT city, count(*) AS n FROM jobs GROUP BY city ORDER BY n DESC, city"
-        )
+        spread = await conn.fetch(SPREAD)
         print("city labels now: " + ", ".join(f"{r['city']}={r['n']}" for r in spread))
 
         # Prove the pass converged: nothing should be left to change.

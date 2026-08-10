@@ -6,7 +6,7 @@ import { useState } from "react";
 // From lib/labels, never lib/preferences: the latter imports postgres.js, and
 // importing a VALUE from it here would pull the driver into the client bundle.
 import {
-  CITY_LABELS,
+  CITY_LABEL_GROUPS,
   KEYWORD_CAP,
   LEVEL_LABELS,
   type Preferences,
@@ -330,32 +330,40 @@ export function PreferencesEditor({
       <div className="panel">
         <h2>Cities</h2>
         <p className="hint">
-          Which <code>city_label</code> values may be sent. <code>india-unclear</code> now means
-          only &ldquo;we could not tell&rdquo; &mdash; &ldquo;Remote&rdquo;, bare
-          &ldquo;India&rdquo;, or a state that contains one of the three cities. A posting that
-          names an Indian city we did not ask for (Lucknow, Noida, Mohali) is{" "}
-          <code>other</code>, the same as London. It is off by default because it used to be on
-          and leaked 14 wrong-city jobs into one digest; turning it back on costs noise, not
-          correctness.
+          Which <code>city_label</code> values may be sent. A posting is labelled with the city
+          it names; <code>other-india</code> is an Indian place outside this list (Lucknow,
+          Mohali, Patna), <code>non-india</code> is everywhere else, and{" "}
+          <code>india-unclear</code> means only &ldquo;we could not tell&rdquo; &mdash;
+          &ldquo;Remote&rdquo;, bare &ldquo;India&rdquo;, or a state that contains a city on this
+          list. Unclear is off by default: it used to be on, and back when every named Indian
+          city fell into it too, it leaked 14 wrong-city jobs into one digest. That labelling is
+          fixed, so turning it back on now costs noise rather than correctness.
         </p>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
-          {CITY_LABELS.map((label) => (
-            <label key={label} className="switch">
-              <input
-                type="checkbox"
-                checked={cities.includes(label)}
-                onChange={(e) =>
-                  setCities((cs) =>
-                    e.target.checked
-                      ? [...cs, label]
-                      : cs.filter((c) => c !== label),
-                  )
-                }
-              />
-              <span className="mono">{label}</span>
-            </label>
-          ))}
-        </div>
+        {CITY_LABEL_GROUPS.map((group) => (
+          <div key={group.heading} style={{ marginBottom: 10 }}>
+            <p className="hint" style={{ margin: "0 0 4px" }}>
+              {group.heading}
+            </p>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
+              {group.labels.map((label) => (
+                <label key={label} className="switch">
+                  <input
+                    type="checkbox"
+                    checked={cities.includes(label)}
+                    onChange={(e) =>
+                      setCities((cs) =>
+                        e.target.checked
+                          ? [...cs, label]
+                          : cs.filter((c) => c !== label),
+                      )
+                    }
+                  />
+                  <span className="mono">{label}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        ))}
         {!cities.length ? (
           <p className="msg bad">An empty city list matches nothing. Pick at least one.</p>
         ) : null}

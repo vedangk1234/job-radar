@@ -82,10 +82,77 @@ export type StoredResume = {
  * The only city labels fetchers/normalize.city_label can produce. A city in
  * preferences outside this set matches nothing, silently, forever — so a typo
  * is rejected at the edit rather than discovered three empty digests later.
+ *
+ * This is a MIRROR of fetchers/normalize.CITY_LABELS, in that order, and
+ * tests/test_city_vocabulary.py parses this file and asserts the two are
+ * identical. The list is duplicated rather than shared because the two runtimes
+ * share no code at all (see CLAUDE.md, "Two runtimes, one database") — so the
+ * duplication is a fact of the architecture and the test is what keeps it from
+ * becoming a lie.
+ *
+ * `other` was here until the 25-city rewrite and is deliberately gone: it used
+ * to mean three different things at once (an Indian city we had not listed, a
+ * confidently foreign posting, and a string no rule recognised), and the first
+ * two are now `other-india` and `non-india`. Nothing maps to `other` any more,
+ * so leaving it in the list would offer a filter that matches zero rows —
+ * exactly the silent-empty failure this constant exists to prevent.
  */
-export const CITY_LABELS = ["blr", "pune", "hyd", "india-unclear", "other"] as const;
+export const CITY_LABELS = [
+  // the three legacy spellings — see fetchers/normalize for why they are not
+  // `bengaluru` / `hyderabad`
+  "blr",
+  "hyd",
+  "pune",
+  // Mumbai region
+  "navi-mumbai",
+  "mumbai-suburban",
+  "thane",
+  "mumbai",
+  // NCR
+  "new-delhi",
+  "gurugram",
+  "noida",
+  // the rest
+  "chennai",
+  "kolkata",
+  "ahmedabad",
+  "indore",
+  "nagpur",
+  "nashik",
+  "chhatrapati-sambhajinagar",
+  "coimbatore",
+  "madurai",
+  "hubballi",
+  "mangaluru",
+  "mysuru",
+  "belagavi",
+  // the buckets
+  "other-india",
+  "non-india",
+  "india-unclear",
+] as const;
 
 export type CityLabel = (typeof CITY_LABELS)[number];
+
+/**
+ * The three that are cities somebody might plausibly want but which no board in
+ * this database has ever written, kept only so the preferences UI can group the
+ * vocabulary. Purely presentational; nothing filters on it.
+ */
+export const CITY_LABEL_GROUPS: ReadonlyArray<{ heading: string; labels: readonly string[] }> = [
+  { heading: "Target cities", labels: ["blr", "hyd", "pune"] },
+  { heading: "Mumbai region", labels: ["mumbai", "navi-mumbai", "mumbai-suburban", "thane"] },
+  { heading: "Delhi NCR", labels: ["new-delhi", "gurugram", "noida"] },
+  {
+    heading: "Other listed cities",
+    labels: [
+      "chennai", "kolkata", "ahmedabad", "indore", "nagpur", "nashik",
+      "chhatrapati-sambhajinagar", "coimbatore", "madurai", "hubballi",
+      "mangaluru", "mysuru", "belagavi",
+    ],
+  },
+  { heading: "Buckets", labels: ["other-india", "non-india", "india-unclear"] },
+];
 
 /**
  * The hand-tags companies.category is allowed to hold, per db/schema.sql.

@@ -66,11 +66,12 @@ async def test_seed_run_stores_every_job_as_back_catalogue(conn):
     assert await queued(conn) == set()  # zero would-be notifications
 
     # The city label is computed and stored, and is not used to drop anything:
-    # the "Mumbai, India" rows are stored exactly like the Bengaluru ones. They
-    # label `other` now rather than `india-unclear` — Mumbai is a named city and
-    # naming one is an answer — and STORING them anyway is the point of the
-    # assertion. Store loosely; the label decides nothing until the digest.
-    assert {r["city"] for r in rows.values()} == {"blr", "india-unclear", "other"}
+    # the "Mumbai, India" rows are stored exactly like the Bengaluru ones. Since
+    # the 25-city rewrite they label `mumbai` — first `india-unclear`, then
+    # `other` once naming a city counted as an answer, and now the city itself —
+    # and STORING them anyway is what the assertion is about, unchanged through
+    # all three. Store loosely; the label decides nothing until the digest.
+    assert {r["city"] for r in rows.values()} == {"blr", "india-unclear", "mumbai"}
     assert sum(1 for r in rows.values() if r["city"] != "blr") == 5
 
 
