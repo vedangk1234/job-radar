@@ -40,6 +40,7 @@ from notify.match import (
     DEFAULT_KEYWORDS,
     DEFAULT_MAX_LEVEL,
     DEFAULT_SHOW_NO_EXPERIENCE_JOBS,
+    DEFAULT_WORK_MODES,
 )
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -678,8 +679,18 @@ class FakeConn:
         show_no_experience_jobs: bool = DEFAULT_SHOW_NO_EXPERIENCE_JOBS,
         selected_cities: Sequence[str] = (),
         all_india: bool = False,
+        work_modes: Sequence[str] = DEFAULT_WORK_MODES,
     ) -> None:
         """Seed the preferences row, TEXT[] columns encoded as JSON.
+
+        `work_modes` DEFAULTS TO ALL THREE and must be named here rather than
+        left to the column, for the reason show_no_experience_jobs is: the SQLite
+        mirror declares it `NOT NULL DEFAULT '[]'`, and an unnamed row would
+        arrive with an EMPTY selection — which matches nothing — so every test
+        that seeds a filter and expects an ordinary job to match would fail for a
+        reason about the fixture. All three is also what the live row holds
+        (scripts/backfill_onboarding_prefs.py), so the fixture and production
+        agree about what "nothing is filtered on mode" looks like.
 
         `user_id=None` writes the row UNOWNED, which is the half-applied
         migration state: db/schema.sql applied, the backfill not yet run. It is
@@ -703,8 +714,8 @@ class FakeConn:
         await self.execute(
             "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, "
             "user_id, exp_range_low, exp_range_high, show_no_experience_jobs, "
-            "selected_cities, all_india) "
-            "VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            "selected_cities, all_india, work_modes) "
+            "VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             json.dumps(list(cities)),
             json.dumps(list(keywords)),
             json.dumps(list(exclusions)),
@@ -716,6 +727,7 @@ class FakeConn:
             int(bool(show_no_experience_jobs)),
             json.dumps(list(selected_cities)),
             int(bool(all_india)),
+            json.dumps(list(work_modes)),
         )
 
 
@@ -731,6 +743,7 @@ class FakeConn:
         show_no_experience_jobs: bool = DEFAULT_SHOW_NO_EXPERIENCE_JOBS,
         selected_cities: Sequence[str] = (),
         all_india: bool = False,
+        work_modes: Sequence[str] = DEFAULT_WORK_MODES,
     ) -> None:
         """A SECOND user's filter. Adds a row; deletes nothing.
 
@@ -745,8 +758,8 @@ class FakeConn:
         await self.execute(
             "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, "
             "user_id, exp_range_low, exp_range_high, show_no_experience_jobs, "
-            "selected_cities, all_india) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            "selected_cities, all_india, work_modes) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             next_id,
             json.dumps(list(cities)),
             json.dumps(list(keywords)),
@@ -759,6 +772,7 @@ class FakeConn:
             int(bool(show_no_experience_jobs)),
             json.dumps(list(selected_cities)),
             int(bool(all_india)),
+            json.dumps(list(work_modes)),
         )
 
 

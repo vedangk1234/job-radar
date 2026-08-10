@@ -31,9 +31,46 @@ export type Preferences = {
   exp_range_high: number | null;
   years_of_experience_held: number | null;
   show_no_experience_jobs: boolean;
+  work_modes: string[];
   updated_at: string;
   onboarding_completed: boolean;
 };
+
+/**
+ * THE THREE WORK ARRANGEMENTS A PERSON MAY TICK — the picker's vocabulary, and
+ * the mirror of notify.match.WORK_MODE_LABELS.
+ *
+ * Every label is offered, unlike CITY_LABEL_GROUPS which withholds two of the 26.
+ * The reason the city list has exclusions does not apply here: `india-unclear`
+ * and `non-india` are statements about our confidence and about a country, and
+ * neither has an analogue in a three-value enum where all three are things a
+ * person can coherently want.
+ *
+ * The blurbs are not decoration. `onsite` is what a NULL jobs.work_mode is read
+ * as (lib/match.DEFAULT_WORK_MODE), which means unticking it hides the large
+ * majority of the board — every posting whose description nobody has read. That
+ * is a surprising amount of consequence for one checkbox, so the screen says so.
+ */
+export const WORK_MODE_OPTIONS: ReadonlyArray<{
+  value: string;
+  label: string;
+  hint: string;
+}> = [
+  {
+    value: "onsite",
+    label: "On-site",
+    hint: "Also every job whose description we have not read — which is most of them. Unticking this hides almost the whole board.",
+  },
+  { value: "hybrid", label: "Hybrid", hint: "Some days in an office, some at home." },
+  {
+    value: "remote",
+    label: "Remote",
+    hint: "Fully remote. A remote job matches wherever it is in India, even outside the cities you picked.",
+  },
+];
+
+/** Every value a person may put in work_modes. */
+export const WORK_MODE_VALUES: readonly string[] = WORK_MODE_OPTIONS.map((o) => o.value);
 
 /**
  * The most keywords one account may save. Enforced in the browser AND in
@@ -282,6 +319,12 @@ export const DEFAULT_PREFERENCES = {
   exp_range_low: 0,
   exp_range_high: 2,
   show_no_experience_jobs: true,
+  // All three, mirroring notify/match.DEFAULT_WORK_MODES and what
+  // scripts/backfill_onboarding_prefs.py wrote onto the operator's row: nothing
+  // is filtered on arrangement. NOT the same as the COLUMN default, which is
+  // '{}' and means "nobody has ticked anything" — an empty selection matches no
+  // job at all. The distinction is the same one the experience range draws.
+  work_modes: ["onsite", "hybrid", "remote"],
 } as const;
 
 /**

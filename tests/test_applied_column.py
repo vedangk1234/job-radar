@@ -159,11 +159,17 @@ async def test_a_brand_new_row_arrives_not_applied(conn):
 
 
 async def test_enrichment_does_not_clear_an_applied_row(conn):
-    """Reading a description writes five facts over a row that may be ticked."""
+    """Reading a description writes six facts over a row that may be ticked.
+
+    Six since the work-mode slice, and the arity is checked here rather than
+    only in test_description.py because THIS is the test that guards ownership:
+    whatever else the enrichment write grows to name, it must never name
+    `applied` or `applied_at`.
+    """
     await conn.add_company(1, "Testco")
     await conn.add_job("j1", title="Backend Engineer", applied=True, applied_at=APPLIED_AT)
 
-    await save_description_facts(conn, [("j1", 6, True, False)])
+    await save_description_facts(conn, [("j1", 6, True, False, "remote")])
 
     after = await row(conn, "j1")
     assert after["min_experience"] == 6  # the write happened

@@ -123,6 +123,24 @@ NEW_COLUMNS = [name for name, *_ in PREFERENCE_COLUMNS] + [name for name, _ in J
 # branch exists AND that an unparsed row cannot reach it). The second is what
 # fails the day somebody starts filling the column in without this file being
 # updated to say so.
+#
+# THE WORK-MODE SLICE ADDS work_modes AND PROMOTES work_mode FROM ASTERISK TO
+# ORDINARY. jobs.work_mode is now WRITTEN — by notify/store.SAVE_DESCRIPTION_FACTS
+# _SQL, on the enrichment rail beside is_pm_role — and preferences.work_modes is
+# now READ, by notify.match.work_mode_ok and its port. Both decide.
+#
+# TWO GUARANTEES CHANGE HANDS HERE, and neither is dropped:
+#
+#   * test_the_job_write_paths_name_none_of_the_new_job_columns can no longer
+#     cover work_mode, because the whole point is that one statement now writes
+#     it. It narrows to salary_min/salary_max and gains an explicit assertion
+#     that the OTHER write path — crawler.store.UPSERT_SEEN — still does not name
+#     work_mode. That is the one that matters: the crawl must not be able to
+#     stamp an arrangement it has no evidence for on every re-sighting.
+#   * test_the_remote_branch_is_built_but_inert asserted a fact that has now
+#     deliberately stopped being true. It is replaced by
+#     test_the_remote_branch_is_live_and_still_india_only, which keeps every
+#     assertion that is still meaningful and drops only the inertness.
 WIRED_UP = {
     "onboarding_completed",
     "exp_range_low",
@@ -132,6 +150,7 @@ WIRED_UP = {
     "selected_cities",
     "all_india",
     "work_mode",
+    "work_modes",
 }
 
 STILL_UNWIRED = [c for c in NEW_COLUMNS if c not in WIRED_UP]
@@ -295,23 +314,60 @@ def test_no_decider_names_a_still_unwired_column(relative_path: str) -> None:
 
 
 def test_the_job_write_paths_name_none_of_the_new_job_columns() -> None:
-    """The crawl and enrichment statements cannot fill these in by accident.
+    """The crawl and enrichment statements cannot fill the SALARY pair in by accident.
 
     Same shape as tests/test_applied_column.py, and the same argument: ownership
     of a column is a property of the SQL that writes the table, not a convention
-    the write path has to remember. Until the parser step exists, the honest
-    value of all three is NULL, and these two statements are the only things that
-    could make it otherwise.
+    the write path has to remember. No parser writes salary_min or salary_max, so
+    the honest value of both is NULL and these two statements are the only things
+    that could make it otherwise.
+
+    work_mode LEFT THIS LIST IN THE WORK-MODE SLICE, because one of the two
+    statements now writes it on purpose. See the next test for the half of the
+    guarantee that survives and matters more.
     """
+    unwritten = [(c, t) for c, t in JOB_COLUMNS if c != "work_mode"]
+    assert [c for c, _ in unwritten] == ["salary_min", "salary_max"]
+
     for statement_name, statement in (
         ("crawler.store.UPSERT_SEEN", UPSERT_SEEN),
         ("notify.store.SAVE_DESCRIPTION_FACTS_SQL", SAVE_DESCRIPTION_FACTS_SQL),
     ):
-        for column, _ in JOB_COLUMNS:
+        for column, _ in unwritten:
             assert not re.search(rf"\b{re.escape(column)}\b", statement), (
                 f"{statement_name} names jobs.{column}, which no statement may write "
-                f"until the enrichment parser step"
+                f"until a parser step for it exists"
             )
+
+
+def test_only_the_enrichment_statement_may_write_work_mode() -> None:
+    """The CRAWL may not stamp a work arrangement. Only a description read may.
+
+    THIS IS THE GUARANTEE test_the_job_write_paths_... GAVE UP FOR work_mode, and
+    it is the sharper half. crawler.store.UPSERT_SEEN runs on every re-sighting of
+    every job, every hour, and it already rewrites `city` from the location string.
+    The tempting symmetry — "label the arrangement from the location too" — is
+    exactly what must not happen here, for two reasons that compound:
+
+      * it has no evidence. A location of "Bangalore, India" says nothing about
+        whether the role is remote, and "Remote - US" is a place, not a policy.
+      * it would OVERWRITE the description-derived verdict every hour, so a job
+        correctly read as remote on Monday would be silently un-remoted by
+        Tuesday's crawl, and the digest would change for a reason nothing records.
+
+    So work_mode is written in exactly one statement, on the rail where the
+    evidence is, and that is asserted against the statement text rather than left
+    as a convention.
+    """
+    assert not re.search(r"\bwork_mode\b", UPSERT_SEEN), (
+        "crawler.store.UPSERT_SEEN names jobs.work_mode. The crawl has no evidence "
+        "about a work arrangement and re-runs hourly — writing it there would "
+        "overwrite every verdict the description reader established."
+    )
+    assert re.search(r"\bwork_mode\s*=\s*\$\d", SAVE_DESCRIPTION_FACTS_SQL), (
+        "notify.store.SAVE_DESCRIPTION_FACTS_SQL no longer writes jobs.work_mode. "
+        "It is the only statement that may."
+    )
 
 
 def test_the_filter_queries_name_none_of_the_still_unwired_columns() -> None:
@@ -322,10 +378,10 @@ def test_the_filter_queries_name_none_of_the_still_unwired_columns() -> None:
     ones whose text would have to change for a digest to come out different.
 
     STILL_UNWIRED RATHER THAN EVERY COLUMN, since Slice 2. PREFERENCES_SQL now
-    names the three experience columns on purpose, so iterating the full list would
-    fail on the very wiring this slice exists to do. The four remaining preference
-    columns (selected_cities, all_india, work_modes, salary_bands) are still
-    forbidden here, which is the half of the guarantee that has not expired.
+    names the experience columns, the city columns and work_modes on purpose, so
+    iterating the full list would fail on the very wiring each slice existed to
+    do. `salary_bands` is the last preference column still forbidden here, which
+    is the half of the guarantee that has not expired.
     """
     for statement_name, statement in (
         ("notify.store.PREFERENCES_SQL", PREFERENCES_SQL),
@@ -358,45 +414,52 @@ def test_the_queue_still_names_no_experience_column_at_all() -> None:
         )
 
 
-def test_the_remote_branch_is_built_but_inert() -> None:
-    """jobs.work_mode decides nothing yet, and this is what says so behaviourally.
+def test_the_remote_branch_is_live_and_still_india_only() -> None:
+    """The relaxation fires now, and it did not grow a way past the country floor.
 
-    THIS REPLACES THE SWEEP COVERAGE work_mode's WIRED_UP EXEMPTION GIVES UP, and it
-    is a stronger claim than the one it replaces. The sweep could only say "no
-    deciding file names this column". That was true until cities Slice B built the
-    remote branch, and it was never the thing anybody actually cared about — what
-    matters is whether the column can change a verdict, and until the parser slice
-    it cannot, because every stored row is NULL.
+    THIS REPLACES test_the_remote_branch_is_built_but_inert, which asserted a fact
+    the work-mode slice deliberately ended. Every assertion below was in that test
+    and still holds; what is gone is the claim that no stored row could reach the
+    branch, because notify/description.py now writes the column.
 
-    Both halves are asserted, and only the pair is the rule:
+    What is asserted:
 
-      * the branch EXISTS and is correct — a row explicitly marked remote skips a
-        city gate it would otherwise fail. This is what the work-mode slice turns
-        on by filling the column in, and asserting it now is what makes that slice
-        a data change rather than a rule change.
-      * an UNPARSED row cannot reach it. NULL, absent and any other work_mode all
-        read as not-remote, so today's board is judged exactly as it was before
-        this branch existed.
-
-    The second half is the one that would fail if somebody made NULL mean "unknown,
-    so relax the gate" — the inclusion bias this project applies to descriptions and
-    deliberately does NOT apply to location. See notify.match.is_remote.
+      * the branch WORKS — a row marked remote skips a city gate it would fail.
+      * a row nobody has read is NOT remote. NULL, absent, empty, onsite and
+        hybrid all fail the equality, so the board's unenriched majority is judged
+        exactly as it was before. This is the half that would break if somebody
+        made NULL mean "unknown, so relax" — the inclusion bias this project
+        applies to descriptions and deliberately does NOT apply to location.
+      * the country floor still holds. A remote posting is exempt from the CITY
+        gate and never from the country; the two relaxing branches share that line
+        in city_ok precisely so it cannot be enforced in one and forgotten in the
+        other. This is the assertion that would have caught the 20 foreign remote
+        postings the live board would otherwise have admitted.
+      * ticking `remote` is required to see one. The relaxation cannot smuggle a
+        remote posting past the city gate for an account that did not ask for
+        remote work — that falls out of the AND in title_stage_ok rather than
+        needing a rule of its own, and this is what says so.
     """
     prefs = Preferences(selected_cities=("blr",), keywords=("backend",))
     elsewhere = {"title": "Backend Engineer", "city": "chennai"}
 
-    # The branch exists: marked remote, the city gate is relaxed.
     assert is_match({**elsewhere, "work_mode": "remote"}, prefs)
 
-    # And it is unreachable for every row the database actually holds.
-    for unparsed in (None, "", "onsite", "hybrid"):
-        assert not is_match({**elsewhere, "work_mode": unparsed}, prefs), unparsed
+    for not_remote in (None, "", "onsite", "hybrid"):
+        assert not is_match({**elsewhere, "work_mode": not_remote}, prefs), not_remote
     assert not is_match(elsewhere, prefs), "a row with no work_mode key at all"
 
-    # Still India-only. A remote posting is exempt from the CITY gate, never from
-    # the country floor — the two relaxing branches share that line in city_ok
-    # precisely so it cannot be enforced in one and forgotten in the other.
-    assert not is_match({"title": "Backend Engineer", "city": "non-india", "work_mode": "remote"}, prefs)
+    assert not is_match(
+        {"title": "Backend Engineer", "city": "non-india", "work_mode": "remote"}, prefs
+    )
+
+    onsite_only = Preferences(
+        selected_cities=("blr",), keywords=("backend",), work_modes=("onsite",)
+    )
+    assert not is_match({**elsewhere, "work_mode": "remote"}, onsite_only), (
+        "an account that did not tick `remote` was shown a remote posting, and the "
+        "city gate was relaxed to do it"
+    )
 
 
 def test_the_informational_column_reaches_no_matcher() -> None:
@@ -433,13 +496,13 @@ def test_the_informational_column_reaches_no_matcher() -> None:
         )
 
 
-def test_the_matcher_value_object_carries_exactly_the_nine_deciding_fields() -> None:
+def test_the_matcher_value_object_carries_exactly_the_ten_deciding_fields() -> None:
     """The last gate: even a loader that selected a new column could not use it.
 
     notify.match.Preferences is frozen and is the only thing is_match reads, so this
-    list IS the filter. It was four fields through Phase 2, seven since Slice 2, and
-    nine since cities Slice B; a tenth appearing means a column reached the matcher,
-    whatever the SQL says.
+    list IS the filter. It was four fields through Phase 2, seven since Slice 2,
+    nine since cities Slice B and ten since the work-mode slice; an eleventh
+    appearing means a column reached the matcher, whatever the SQL says.
 
     THE EXACT LIST, NOT A COUNT, and the order is asserted too — a count would pass
     if somebody swapped years_of_experience_held in for show_no_experience_jobs,
@@ -464,6 +527,7 @@ def test_the_matcher_value_object_carries_exactly_the_nine_deciding_fields() -> 
         "exp_range_low",
         "exp_range_high",
         "show_no_experience_jobs",
+        "work_modes",
     ], f"notify.match.Preferences carries {names}"
 
     assert "years_of_experience_held" not in names, (

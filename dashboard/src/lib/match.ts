@@ -74,6 +74,7 @@ export type Preferences = {
   exp_range_low: number | null;
   exp_range_high: number | null;
   show_no_experience_jobs: boolean;
+  work_modes: readonly string[];
 };
 
 /**
@@ -105,8 +106,23 @@ export const CITY_SELECTION_NEVER_MATCHES: ReadonlySet<string> = new Set([
   NON_INDIA_LABEL,
 ]);
 
-/** notify/match.REMOTE_WORK_MODE. */
+/** notify/match.REMOTE_WORK_MODE. The one value the city relaxation cares about. */
 export const REMOTE_WORK_MODE = "remote";
+
+/** notify/match.WORK_MODE_LABELS. Mirrored in lib/labels.WORK_MODE_OPTIONS. */
+export const WORK_MODE_LABELS = ["onsite", "hybrid", "remote"] as const;
+
+/**
+ * notify/match.DEFAULT_WORK_MODE — what a NULL jobs.work_mode is READ as.
+ *
+ * Never written back. NULL means "nobody has established this posting's
+ * arrangement", which is most of the board and always will be, since a
+ * description is only fetched for a job some filter already wants. Collapsing
+ * that to onsite is a filtering decision made here, at the comparison; writing
+ * it into the column would record a conclusion as an observation and lose the
+ * read/unread distinction — jobs.notified, one table over. Read the Python.
+ */
+export const DEFAULT_WORK_MODE = "onsite";
 
 /*
  * MAX_MIN_EXPERIENCE USED TO BE EXPORTED FROM HERE AND IS GONE.
@@ -270,16 +286,33 @@ export function effectiveCities(prefs: Preferences): readonly string[] {
 /**
  * The posting is fully remote, per the stored jobs.work_mode label.
  *
- * FALSE FOR EVERY JOB IN THE DATABASE TODAY — work_mode is NULL on all 9,703
- * stored rows, because the parser that fills it is the next slice. So the remote
- * branch in cityOk is correct and INERT, built now so the work-mode slice turns it
- * on by populating a column rather than by editing a rule. `?? ""` reads NULL and
- * undefined alike as not-remote, deliberately: the branch RELAXES a gate, and
- * treating "not parsed yet" as "fully remote" would drop the city filter for the
- * whole board on the emptiest possible evidence.
+ * LIVE as of the work-mode slice — notify/description.py writes the column for
+ * every job whose description is read, so the branch in cityOk that cities
+ * Slice B built now fires. `?? ""` reads NULL and undefined alike as not-remote,
+ * deliberately: the branch RELAXES a gate, and treating "not parsed yet" as
+ * "fully remote" would drop the city filter for the whole board on the emptiest
+ * possible evidence.
  */
 export function isRemote(job: MatchableJob): boolean {
   return (job.work_mode ?? "") === REMOTE_WORK_MODE;
+}
+
+/** notify/match.work_mode_of — the stored arrangement, NULL read as onsite. */
+export function workModeOf(job: MatchableJob): string {
+  return (job.work_mode ?? "").trim().toLowerCase() || DEFAULT_WORK_MODE;
+}
+
+/**
+ * This posting's arrangement is one this account said it would accept.
+ *
+ * Blank matches nothing — the fourth member of the family that includes an
+ * unconfigured experience range and a blank city answer, and unreachable for an
+ * onboarded account because PUT /api/preferences refuses an empty selection and
+ * is the only writer of this column and of onboarding_completed. See
+ * notify.match.work_mode_ok for the argument.
+ */
+export function workModeOk(job: MatchableJob, prefs: Preferences): boolean {
+  return prefs.work_modes.includes(workModeOf(job));
 }
 
 /**
@@ -311,10 +344,21 @@ export function levelExcluded(job: MatchableJob, prefs: Preferences): boolean {
   return level !== null && level > prefs.max_level;
 }
 
-/** city AND keyword AND NOT excluded AND NOT level — the four title tests. */
+/**
+ * city AND work mode AND keyword AND NOT excluded AND NOT level — the five free
+ * tests. "Free" means "reads a column, costs no request", which is what the seam
+ * has always meant; work_mode joined them in the work-mode slice on that basis.
+ *
+ * notify/match.py additionally carries `worth_a_description`, a WIDER seam used
+ * only by crawler/enrich.py to decide what earns a network request. It is
+ * deliberately not ported: it reads the location string through
+ * fetchers.normalize.india_funnel, the dashboard never enriches anything, and
+ * the city labeller is not ported either (see CLAUDE.md, "Parity").
+ */
 export function titleStageOk(job: MatchableJob, prefs: Preferences): boolean {
   return (
     cityOk(job, prefs) &&
+    workModeOk(job, prefs) &&
     keywordOk(job, prefs) &&
     !excluded(job, prefs) &&
     !levelExcluded(job, prefs)
@@ -416,6 +460,14 @@ export function explain(job: MatchableJob, prefs: Preferences): { matched: boole
         `city ${JSON.stringify(job.city)} never matches an explicit city ` +
         `selection — it is covered by the all-India switch`;
     else reason = `city ${JSON.stringify(job.city)} not in preferences`;
+  } else if (!workModeOk(job, prefs)) {
+    // Two ways to fail one test, worded exactly as notify/match.explain words
+    // them — match-parity prints these strings on a disagreement.
+    if (!prefs.work_modes.length) reason = "no work arrangement is selected";
+    else
+      reason =
+        `work mode ${JSON.stringify(workModeOf(job))} is not one of ` +
+        prefs.work_modes.map((m) => JSON.stringify(m)).join(", ");
   } else if (!keywordsHit.length) reason = "no keyword in title";
   else if (exclusionsHit.length) reason = `excluded by ${exclusionsHit.join(", ")}`;
   else if (level !== null && level > prefs.max_level)

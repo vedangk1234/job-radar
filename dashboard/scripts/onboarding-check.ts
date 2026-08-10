@@ -365,9 +365,20 @@ async function main() {
       exp_range_high: 4,
       years_of_experience_held: 3,
       show_no_experience_jobs: false,
+      // The work-mode slice's one. Deliberately NOT all three — that is the
+      // install's own answer (DEFAULT_WORK_MODES), and passing it would let a
+      // save that ignored the field go unnoticed, exactly as (0, 2) would for
+      // the range above. Hybrid+remote is a value only a person could choose.
+      work_modes: ["hybrid", "remote"],
     });
 
     check(saved.keywords.length === 1, "it stored the one keyword the person chose");
+    check(
+      saved.work_modes.join() === "hybrid,remote",
+      "and their work arrangement — the column a blank row leaves empty, which " +
+        "matches nothing until this save",
+      `got [${saved.work_modes.join(", ")}]`,
+    );
     check(
       saved.cities.join() === "blr,mumbai" &&
         saved.exclusions.join() === "intern" &&

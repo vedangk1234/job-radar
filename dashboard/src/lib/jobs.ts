@@ -1,5 +1,6 @@
 import { sql } from "./db";
 import {
+  DEFAULT_WORK_MODE,
   effectiveCities,
   isMatch,
   NON_INDIA_LABEL,
@@ -226,6 +227,7 @@ export async function matchCandidates(
       FROM jobs j
      WHERE j.status = 'open'
        AND ${cityClause(prefs)}
+       AND ${workModeClause(prefs)}
        AND j.is_pm_role = FALSE
        AND ${experienceClause(prefs)}
        AND (${companyId}::int IS NULL OR j.company_id = ${companyId}::int)
@@ -277,6 +279,31 @@ function cityClause(prefs: Preferences) {
     j.city = ANY(${cities}::text[])
     OR (j.work_mode = ${REMOTE_WORK_MODE} AND j.city IS DISTINCT FROM ${NON_INDIA_LABEL})
   )`;
+}
+
+/**
+ * work_mode_ok, in SQL — the transcription of lib/match.workModeOk.
+ *
+ * `COALESCE(j.work_mode, 'onsite')` IS THE LOAD-BEARING EXPRESSION HERE, and it
+ * is this function's version of cityClause's `IS DISTINCT FROM`. Written the
+ * obvious way —
+ *
+ *     j.work_mode = ANY(${modes}::text[])
+ *
+ * — a NULL work_mode makes the comparison NULL, NULL is not TRUE, and the row is
+ * EXCLUDED. lib/match.workModeOf says the opposite: it reads NULL as 'onsite',
+ * which is in the operator's selection, so it KEEPS the row. That is the
+ * prefilter being narrower than the rule it prefilters for — the one thing this
+ * file may not be — and it would not have shipped subtly: work_mode is NULL on
+ * every row of the live board that no description read has reached, so Home
+ * would have gone from 38 jobs to a handful overnight.
+ *
+ * The empty selection is FALSE by the definition of membership in an empty set,
+ * exactly as cityClause's is, and needs no separate branch to say so.
+ */
+function workModeClause(prefs: Preferences) {
+  const modes = [...prefs.work_modes];
+  return sql`COALESCE(j.work_mode, ${DEFAULT_WORK_MODE}) = ANY(${modes}::text[])`;
 }
 
 /**

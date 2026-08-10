@@ -92,9 +92,15 @@ from .match import Preferences
 # that fallback reachable — and it is the one place in this file where a column is
 # selected for a reader that will be DELETED rather than added to, which is why
 # the sentence naming the contract slice lives on the property rather than here.
+#
+# TEN COLUMNS SINCE THE WORK-MODE SLICE. work_modes is the multi-select of
+# arrangements this account will accept, read by notify.match.work_mode_ok. It is
+# the fourth member of the family that matches NOTHING when blank — with the
+# unconfigured experience range and the blank city answer — and PUT
+# /api/preferences refuses to save an empty one for exactly that reason.
 PREFERENCES_SQL = (
     "SELECT cities, selected_cities, all_india, keywords, exclusions, max_level, "
-    "exp_range_low, exp_range_high, show_no_experience_jobs "
+    "exp_range_low, exp_range_high, show_no_experience_jobs, work_modes "
     "FROM preferences WHERE user_id = $1"
 )
 
@@ -141,10 +147,19 @@ UNOWNED_PREFERENCES_SQL = "SELECT count(*) FROM preferences WHERE user_id IS NUL
 # desc_checked = FALSE, which means min_experience NULL, which means KEEP. That is
 # the Step 7c leak arriving by a third route, and the only thing preventing it is
 # that these two statements are edited together.
+#
+# THE WORK-MODE SLICE IS THE SECOND TIME THAT WARNING HAD TEETH, and it bites
+# harder than the cities one did. work_modes is read by title_stage_ok, which is
+# what narrows this very pass — so had only PREFERENCES_SQL gained the column,
+# enrichment would union over filters whose work_modes was the empty fallback,
+# every candidate test would answer False, and the pass would read NOTHING at
+# all. A silent, total stop rather than a leak; the same edit-them-together rule
+# catches both.
 ACTIVE_PREFERENCES_SQL = """
 SELECT p.cities, p.selected_cities, p.all_india,
        p.keywords, p.exclusions, p.max_level,
-       p.exp_range_low, p.exp_range_high, p.show_no_experience_jobs
+       p.exp_range_low, p.exp_range_high, p.show_no_experience_jobs,
+       p.work_modes
   FROM preferences p
   JOIN public.users u ON u.id = p.user_id
  WHERE u.is_active = TRUE
@@ -290,12 +305,22 @@ VALUES ($1, now(), $2)
 # worth recording — the alternative is re-fetching the same dead endpoint on
 # every run for as long as the posting stays open. desc_fetch_failed is what
 # keeps that from meaning "and never look again": see ENRICHMENT_TARGETS_SQL.
+#
+# work_mode JOINED THE LIST IN THE WORK-MODE SLICE, and it is the one column here
+# that is deliberately allowed to be written as NULL. The other four always carry
+# a value once a row has been looked at; this one is NULL whenever the read failed
+# or the vendor and the prose both said nothing readable. That NULL is a FACT —
+# "nobody has established this posting's arrangement" — and notify.match.
+# work_mode_of reads it as onsite for filtering WITHOUT writing onsite down. One
+# column, one fact: the jobs.notified lesson, applied before the mistake instead
+# of after it.
 SAVE_DESCRIPTION_FACTS_SQL = """
 UPDATE jobs
    SET min_experience    = $2,
        is_pm_role        = $3,
        desc_checked      = TRUE,
        desc_fetch_failed = $4,
+       work_mode         = $5,
        desc_checked_at   = now()
  WHERE canonical_id = $1
 """
@@ -433,9 +458,9 @@ async def fetch_enrichment_targets(
 
 
 async def save_description_facts(
-    conn, facts: Iterable[tuple[str, int | None, bool, bool]]
+    conn, facts: Iterable[tuple[str, int | None, bool, bool, str | None]]
 ) -> int:
-    """Persist (canonical_id, min_experience, is_pm_role, fetch_failed) per job.
+    """Persist (canonical_id, min_experience, is_pm_role, fetch_failed, work_mode).
 
     Returns how many rows were handed to the database. Not in a transaction, and
     it does not need to be: each row is independent, every write is idempotent,
@@ -451,7 +476,8 @@ async def save_description_facts(
     them would be the only cost of not writing them here.
     """
     records = [
-        (cid, years, bool(is_pm), bool(failed)) for cid, years, is_pm, failed in facts
+        (cid, years, bool(is_pm), bool(failed), mode)
+        for cid, years, is_pm, failed, mode in facts
     ]
     if not records:
         return 0

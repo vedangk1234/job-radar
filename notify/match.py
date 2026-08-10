@@ -137,6 +137,14 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Iterable, Mapping, Sequence
 
+# The ONE import this module makes outside the standard library, and it is pure:
+# fetchers.normalize is string rules and tables, no I/O of any kind, so "nothing
+# here reads the database, the clock, or the environment" still holds. It is used
+# by worth_a_description alone — the crawl's seam, never a verdict — which is why
+# it does not need a TypeScript counterpart. See that function, and see the
+# "the city label is not ported" note in CLAUDE.md.
+from fetchers.normalize import india_funnel
+
 # The values db/schema.sql seeds into the single preferences row. Kept here as
 # well so tests and a --dry-run on a database that has not been migrated yet
 # have something honest to fall back on. The DATABASE is the source of truth at
@@ -207,9 +215,66 @@ NON_INDIA_LABEL = "non-india"
 # for a row edited by hand in psql.
 CITY_SELECTION_NEVER_MATCHES = frozenset({"india-unclear", NON_INDIA_LABEL})
 
-# jobs.work_mode, when the parser that fills it exists. NULL on every one of the
-# 9,703 stored rows today — see is_remote below, which is why this is inert.
+# THE WORK ARRANGEMENT — jobs.work_mode on one side, preferences.work_modes on
+# the other, and the two are read by two different rules that must not be
+# confused with each other:
+#
+#   is_remote / city_ok    a REMOTE posting is exempt from the CITY gate. A
+#                          statement about geography. Reads only jobs.work_mode.
+#   work_mode_ok           this account will only accept these arrangements. A
+#                          statement about preference. Reads both.
+#
+# Naming REMOTE_WORK_MODE separately from WORK_MODE_LABELS is deliberate: the
+# relaxation cares about exactly one of the three values, and spelling that as
+# `WORK_MODE_LABELS[2]` would make the rule depend on the order of a list.
 REMOTE_WORK_MODE = "remote"
+
+# The three values notify.description.detect_work_mode can produce, mirrored in
+# dashboard/src/lib/labels.WORK_MODE_OPTIONS. No CHECK constrains the column (see
+# db/schema.sql), so a fourth value arriving from a vendor is data to look at
+# rather than a crash — and it matches nobody's selection, which is the safe way
+# for an unrecognised value to fail.
+WORK_MODE_LABELS = ("onsite", "hybrid", "remote")
+
+# WHAT A NULL jobs.work_mode IS READ AS, AND WHY IT IS NOT WRITTEN DOWN.
+#
+# NULL means "nobody has established this posting's arrangement" — the
+# description was never read, or it was read and stated nothing a rule could see.
+# Most of the board is in that state and always will be, because a description is
+# only ever fetched for a job some filter already wants (crawler/enrich.py).
+#
+# Read as onsite, so an unenriched job keeps behaving exactly as it did before
+# this slice existed for anybody whose selection includes onsite — which is the
+# default shape of the answer and what the operator's row says.
+#
+# NOT BACKFILLED INTO THE COLUMN, and that is the load-bearing half. Writing
+# 'onsite' onto 9,600 rows nobody has looked at would record a conclusion as
+# though it were an observation, and the table would lose the ability to tell
+# "read it, it said onsite" from "never looked". That is jobs.notified exactly —
+# one column carrying two facts — and the fix there cost four sub-phases. The
+# distinction is preserved on the row and collapsed only here, at the moment of
+# comparison, where collapsing it is a filtering decision rather than a record.
+DEFAULT_WORK_MODE = "onsite"
+
+# THE INSTALL'S OWN ANSWER, AND THAT IS NOT THE SAME THING AS "WHAT A BLANK ROW
+# MEANS" — a distinction this file already draws twice and one it is easy to get
+# backwards. This constant mirrors what scripts/backfill_onboarding_prefs.py
+# wrote onto the operator's row (all three: nothing was filtered on mode), the
+# same status DEFAULT_EXP_RANGE_LOW/_HIGH have. It is reached only by
+# `Preferences()` with no row behind it — an un-migrated database, and the tests.
+#
+# "BLANK MATCHES NOTHING" LIVES IN from_row, NOT HERE, and the mechanism is
+# _as_tuple's: a row that HAS the column and holds '{}' yields (), which is in no
+# membership test, so that account matches nothing. Only a NULL or an absent
+# column reaches this fallback, and both of those mean "a database older than the
+# column" rather than "a person who ticked nothing".
+#
+# Getting this backwards is not a small error. Set to () it would mean a bare
+# Preferences() — the fallback for a database with no preferences row at all —
+# silently matched zero jobs, which is the "quiet week rather than an error"
+# failure this codebase spends its guards on. It cost 85 red tests to notice,
+# which is the guards working.
+DEFAULT_WORK_MODES: tuple[str, ...] = ("onsite", "hybrid", "remote")
 
 # Grounded in the resume rather than in what a job board happens to call things:
 # every term here is a role title, a stack, or a discipline actually worth
@@ -444,6 +509,7 @@ class Preferences:
     exp_range_low: int | None = DEFAULT_EXP_RANGE_LOW
     exp_range_high: int | None = DEFAULT_EXP_RANGE_HIGH
     show_no_experience_jobs: bool = DEFAULT_SHOW_NO_EXPERIENCE_JOBS
+    work_modes: tuple[str, ...] = DEFAULT_WORK_MODES
 
     @property
     def effective_cities(self) -> tuple[str, ...]:
@@ -608,6 +674,7 @@ class Preferences:
             show_no_experience_jobs=cls._as_bool(
                 row, "show_no_experience_jobs", DEFAULT_SHOW_NO_EXPERIENCE_JOBS
             ),
+            work_modes=cls._as_tuple_column(row, "work_modes", DEFAULT_WORK_MODES),
         )
 
 
@@ -621,18 +688,17 @@ def is_remote(job: Mapping[str, Any]) -> bool:
     `min_experience` follow. The evidence is a description or a location string;
     the conclusion is the column.
 
-    THIS FUNCTION RETURNS FALSE FOR EVERY JOB IN THE DATABASE TODAY, and that is
-    a fact worth stating rather than a hedge. jobs.work_mode is NULL on all 9,703
-    stored rows (9,703 of 9,703, checked against live Postgres when this was
-    written) because the parser that fills it does not exist yet — it is the next
-    slice. `or ""` turns that NULL into the empty string, which is not
-    REMOTE_WORK_MODE, so every job is treated as NOT remote.
+    THIS IS LIVE AS OF THE WORK-MODE SLICE. It was built by cities Slice B and
+    could not fire, because jobs.work_mode was NULL on all 9,703 stored rows;
+    notify/description.py now writes the column for every job whose description
+    is read, so the branch in city_ok below turns on by data rather than by an
+    edit to the rule — which is exactly what it was built early for.
 
-    So the remote branch in city_ok below is CORRECT AND INERT. It is built now,
-    against the column's specified values, so that the work-mode slice turns it on
-    by populating the column rather than by editing the rule — which is the same
-    expand-then-contract ordering jobs.seeded and the experience columns followed,
-    and the reason neither of those needed the matcher touched twice.
+    NOTE WHAT THIS DOES *NOT* USE: DEFAULT_WORK_MODE. work_mode_of below reads a
+    NULL as onsite for the purpose of comparing against a person's selection;
+    this reads it as "not remote" by simply failing the equality. The two agree
+    on today's board — onsite is not remote either way — and they are written
+    separately because they answer different questions and could one day disagree.
 
     NULL READS AS NOT-REMOTE RATHER THAN AS UNKNOWN-MEANS-KEEP, which is the
     opposite of what min_experience does with its NULL, and the asymmetry is
@@ -643,6 +709,42 @@ def is_remote(job: Mapping[str, Any]) -> bool:
     column.
     """
     return (job.get("work_mode") or "") == REMOTE_WORK_MODE
+
+
+def work_mode_of(job: Mapping[str, Any]) -> str:
+    """The stored arrangement, with a NULL read as onsite. Never written back.
+
+    See DEFAULT_WORK_MODE for why the collapse happens here and not in the table.
+    The value is lowercased and stripped because it is compared against a
+    person's selection, which lib/preferences.cleanList has already normalised —
+    two sides of a membership test have to agree about case or the test is a
+    coin flip.
+    """
+    return (job.get("work_mode") or "").strip().lower() or DEFAULT_WORK_MODE
+
+
+def work_mode_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
+    """This posting's arrangement is one this account said it would accept.
+
+    A plain membership test over opaque strings, exactly as the explicit branch of
+    city_ok is, and vocabulary-blind for the same reason: the labels live in
+    notify/description.py and in the picker, and this rule does not need to know
+    what they mean.
+
+    BLANK MATCHES NOTHING — the fourth member of a family. An unconfigured
+    experience range, a blank city answer, and now an empty work_modes all
+    resolve the same way, and the argument has not changed since Slice 1b: a
+    filter nobody chose, applied silently, is the expensive failure, and handing
+    this account somebody else's three ticks would be exactly that. It is
+    unreachable for an onboarded account by construction — PUT /api/preferences
+    refuses an empty selection and is the only writer of this column AND of
+    onboarding_completed, so onboarded implies configured.
+
+    It EXCLUDES rather than raising, because notify.digest.run_fan_out catches
+    only DigestError and an exception here would take every account's digest down
+    over one account's blank row.
+    """
+    return work_mode_of(job) in prefs.work_modes
 
 
 def city_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
@@ -680,14 +782,18 @@ def city_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
     list, so a row edited by hand in psql cannot get past it either. See that
     constant for why india-unclear and non-india are on it and other-india is not.
 
-    WHAT THIS DELIBERATELY DOES NOT READ is the preferences column holding which
-    working arrangements an account WANTS. That is a filter of its own and belongs
-    to the work-mode slice, with the parser that makes it answerable; naming it
-    here is not just premature but is caught by tests/test_phase3_columns.py, whose
-    sweep reads prose as well as code on the argument that a column named in a
-    comment is where the next edit starts. This branch is only about a remote
-    posting being exempt from a CITY test, which is a statement about geography
-    rather than about preference.
+    WHAT THIS STILL DELIBERATELY DOES NOT READ is preferences.work_modes. That
+    column now exists and now decides — work_mode_ok is where it decides — and
+    keeping it out of THIS function is what stops one rule from carrying two
+    arguments. This branch says "a remote posting has no city to be tested
+    against", which is a statement about geography and is true whatever anybody
+    ticked. Whether that person WANTS a remote job is the other test, and it runs
+    beside this one in title_stage_ok rather than inside it.
+
+    The two do interact, and the interaction is the right way round: an account
+    that did not tick `remote` never sees a remote posting at all, so the
+    relaxation cannot smuggle one past a city gate for somebody who did not ask
+    for it. That falls out of the AND rather than needing a rule.
     """
     city = job.get("city") or ""
 
@@ -722,23 +828,69 @@ def level_excluded(job: Mapping[str, Any], prefs: Preferences) -> bool:
 
 
 def title_stage_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
-    """The four title tests: city AND keyword AND NOT excluded AND NOT level.
+    """The FIVE free tests: city AND work mode AND keyword AND NOT excluded AND
+    NOT level.
 
-    This is the set worth spending a network request on. notify/description.py
-    fetches a description only for jobs that get TRUE from this function, which
-    is what keeps the second stage at a handful of requests per run instead of
-    one per row on the board.
+    "Free" is what the name has always meant, rather than "about the title" —
+    these are the tests that read a column the crawler already stored, against a
+    job that has cost no network request. work_mode joined them in the work-mode
+    slice and belongs here on exactly that basis: crawler/store.upsert_seen does
+    not write it, but notify/description.py does, so by the time this runs the
+    answer is a string on the row or a NULL that reads as onsite. No fetch.
 
-    It is also, deliberately, the whole of the old is_match. Nothing about the
-    title stage changed when the description stage was added; the new tests are
-    two extra AND clauses, not a rewrite.
+    IT IS NO LONGER THE ENRICHMENT SEAM ON ITS OWN — see worth_a_description
+    below, which is wider by one branch and is what crawler/enrich.py calls. This
+    function decides what MATCHES; that one decides what is worth a request, and
+    conflating them made the remote branch unable to fire.
     """
     return (
         city_ok(job, prefs)
+        and work_mode_ok(job, prefs)
         and keyword_ok(job, prefs)
         and not excluded(job, prefs)
         and not level_excluded(job, prefs)
     )
+
+
+def worth_a_description(job: Mapping[str, Any], prefs: Preferences) -> bool:
+    """Is this job worth spending a network request on? The enrichment seam.
+
+    WIDER THAN title_stage_ok BY EXACTLY ONE BRANCH, and without that branch the
+    remote relaxation could never fire on a single row. The circularity is worth
+    spelling out because it is not obvious and it is fatal:
+
+        a job that remote-relaxes-city would admit is, by definition, a job that
+        FAILS city_ok today. Narrow the enrichment queue by title_stage_ok and
+        such a job never earns a description read, so work_mode stays NULL, so it
+        never becomes 'remote', so the relaxation never fires. The feature would
+        ship green and admit nothing, forever.
+
+    So a row that fails ONLY the city gate is still worth asking about — but only
+    if a remote verdict could actually rescue it, and that is where the cost stays
+    bounded. india_funnel is the country floor, the same one city_ok applies to
+    its relaxing branches: a `non-india` posting can never match whatever its
+    arrangement turns out to be, so it is never worth a request. On the live board
+    that is the difference between 390 extra candidates and 24.
+
+    IT READS THE LOCATION STRING RATHER THAN jobs.city, deliberately. The stored
+    label is whatever the labeller of the day wrote; the string is the evidence,
+    and fetchers.normalize is the current reading of it. That keeps this seam
+    correct on a database whose city labels predate the current vocabulary, which
+    is precisely the state this one is in.
+
+    work_mode_ok is NOT applied here, and that is the one asymmetry. A job's mode
+    is the thing the fetch exists to discover, so filtering on it first would be
+    asking the answer to decide whether to ask the question.
+    """
+    if not (
+        keyword_ok(job, prefs)
+        and not excluded(job, prefs)
+        and not level_excluded(job, prefs)
+    ):
+        return False
+    if city_ok(job, prefs):
+        return True
+    return india_funnel(job.get("location"))
 
 
 def pm_excluded(job: Mapping[str, Any]) -> bool:
@@ -884,6 +1036,17 @@ def explain(job: Mapping[str, Any], prefs: Preferences) -> MatchReport:
             )
         else:
             reason = f"city {job.get('city')!r} not in preferences"
+    elif not work_mode_ok(job, prefs):
+        # Two ways to fail one test, and the second is worth naming separately
+        # because it is a blank filter rather than a rejected job. Stated
+        # character for character in dashboard/src/lib/match.explain.
+        if not prefs.work_modes:
+            reason = "no work arrangement is selected"
+        else:
+            reason = (
+                f"work mode {work_mode_of(job)!r} is not one of "
+                f"{', '.join(repr(m) for m in prefs.work_modes)}"
+            )
     elif not keywords_hit:
         reason = "no keyword in title"
     elif exclusions_hit:

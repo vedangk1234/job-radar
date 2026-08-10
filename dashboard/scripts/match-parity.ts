@@ -119,6 +119,31 @@ function python(payload: unknown): { matched: string[][] } {
   throw new Error("no python interpreter found on PATH");
 }
 
+/** notify/match.NON_INDIA_LABEL, spelled locally — this script imports no app module with a pool. */
+const NON_INDIA_LABEL_LOCAL = "non-india";
+
+/**
+ * A fabricated row with the shape both matchers read. Never inserted anywhere.
+ *
+ * The title and the description facts are chosen to pass every OTHER test, so a
+ * failure can only be attributable to the city gate and the work-mode rule —
+ * the same discipline the VARIANTS follow by differing in one field at a time.
+ */
+function synthetic(id: string, city: string, workMode: string | null): Row {
+  return {
+    canonical_id: id,
+    company: "(synthetic)",
+    title: "Backend Engineer",
+    city,
+    work_mode: workMode,
+    min_experience: null,
+    is_pm_role: false,
+    desc_checked: true,
+    desc_fetch_failed: false,
+    user_notified: false,
+  };
+}
+
 async function main() {
   // The current user, resolved exactly as src/lib/currentUser.ts and
   // db/users.py both do. Inlined for the same reason findRepoRoot above is:
@@ -133,15 +158,16 @@ async function main() {
   `;
   if (!user) throw new Error("MY_EMAIL matches no row in public.users — run scripts/seed_user.py");
 
-  // The same nine columns notify/store.PREFERENCES_SQL selects — nine since cities
-  // Slice B added the city gate's two and kept the legacy one for the fallback.
+  // The same TEN columns notify/store.PREFERENCES_SQL selects — ten since the
+  // work-mode slice added work_modes to the nine cities Slice B left.
   // Selecting fewer would hand both matchers an undefined range or an undefined
   // city answer, which is not a state any real loader can produce — the check would
   // then be comparing two implementations on an input neither will ever see.
   const [prefsRow] = await sql<Preferences[]>`
     SELECT cities, selected_cities, all_india,
            keywords, exclusions, max_level,
-           exp_range_low, exp_range_high, show_no_experience_jobs
+           exp_range_low, exp_range_high, show_no_experience_jobs,
+           work_modes
       FROM preferences WHERE user_id = ${user.id}
   `;
   if (!prefsRow) {
@@ -254,12 +280,48 @@ async function main() {
         selected_cities: ["mumbai", "navi-mumbai", "mumbai-suburban", "thane"],
       },
     },
+
+    /*
+     * THE WORK-MODE VARIANTS. The live row ticks all three, which makes the mode
+     * gate a no-op for it — so running only the live row would prove the port did
+     * not regress and prove nothing whatever about a rule that can now hide a job.
+     * Same argument the experience matrix and the city variants make, one field
+     * over. These differ from the live row ONLY in work_modes, except the last,
+     * which also narrows the cities in order to reach the branch it is named for.
+     */
+    {
+      label: "all modes",
+      note: "the live row's own answer, stated explicitly — the mode gate is a no-op",
+      prefs: { ...prefsRow, work_modes: ["onsite", "hybrid", "remote"] },
+    },
+    {
+      label: "onsite only",
+      note: "the relaxation cannot fire; a NULL work_mode still reads as onsite and stays",
+      prefs: { ...prefsRow, work_modes: ["onsite"] },
+    },
+    {
+      label: "remote only",
+      note: "only postings a description PROVED remote — every unread row is onsite and drops",
+      prefs: { ...prefsRow, work_modes: ["remote"] },
+    },
+    {
+      label: "remote relaxes city",
+      note: "remote + one city: a remote India job outside blr must still match",
+      prefs: { ...prefsRow, work_modes: ["remote"], all_india: false, selected_cities: ["blr"] },
+    },
+    {
+      label: "no mode answer",
+      note: "nothing ticked — must match NOTHING, fail-closed",
+      prefs: { ...prefsRow, work_modes: [] },
+    },
   ];
 
   const pythonMatched = python({ variants: VARIANTS, jobs }).matched;
   let drifted = 0;
 
-  console.log("prefs matrix — the same open rows under seven filters (experience, then city):");
+  console.log(
+    "prefs matrix — the same open rows under twelve filters (experience, city, work mode):",
+  );
   const perVariant: Set<string>[] = [];
 
   for (const [i, variant] of VARIANTS.entries()) {
@@ -320,20 +382,122 @@ async function main() {
   }
 
   /*
-   * THE REMOTE BRANCH IS NOT EXERCISED BY ANY VARIANT ABOVE, and printing that is
-   * the point. jobs.work_mode is filled by a parser that does not exist yet, so
-   * every row arrives NULL and notify.match.is_remote is False for all of them — a
-   * green matrix is evidence about the CITY gate and no evidence whatever about the
-   * relaxation. tests/test_phase3_columns.py::test_the_remote_branch_is_built_but_
-   * inert is what covers it, over synthetic rows, because the database cannot.
+   * A COVERAGE GATE RATHER THAN A NOTE, since the work-mode slice. This line used
+   * to print "0 of 7,869 non-NULL" so that a green matrix could not be misread as
+   * coverage of a branch no live row could reach. The parser now fills the column,
+   * so zero means something different and worse: the backfill has not been applied,
+   * or the enrichment rail stopped writing — and the matrix above is once again
+   * green over a rule live data cannot reach.
    */
+  const byMode = new Map<string, number>();
+  for (const job of jobs) {
+    const key = job.work_mode ?? "NULL";
+    byMode.set(key, (byMode.get(key) ?? 0) + 1);
+  }
   const parsedWorkMode = jobs.filter((j) => j.work_mode !== null).length;
   console.log(
-    `\nwork_mode: ${parsedWorkMode} of ${jobs.length} rows non-NULL — the remote branch is ` +
-      (parsedWorkMode === 0
-        ? "NOT exercised by live data (inert until the work-mode slice)"
-        : "now reachable from live data"),
+    `\nwork_mode: ${parsedWorkMode} of ${jobs.length} rows non-NULL   ` +
+      [...byMode]
+        .sort((a, b) => b[1] - a[1])
+        .map(([m, n]) => `${m}=${n}`)
+        .join("  "),
   );
+  console.log(
+    "  NULL is read as 'onsite' at match time and is never written down — see " +
+      "notify.match.DEFAULT_WORK_MODE",
+  );
+  if (parsedWorkMode === 0) {
+    console.error(
+      "\nNO ROW CARRIES A work_mode. The remote relaxation cannot fire, so every " +
+        "variant above is green over a rule live data cannot reach. Run " +
+        "`python scripts/backfill_work_mode.py --dry-run` and read the report.",
+    );
+    process.exitCode = 1;
+  }
+
+  /*
+   * Fail-closed, ASSERTED rather than compared — both languages agreeing on a
+   * wrong answer would pass a comparison, exactly as for the blank city answer
+   * and the unconfigured range. "Ticking no arrangement matches nothing" is the
+   * property. Indexed from the end so adding a variant above cannot silently
+   * re-point this at a different one.
+   */
+  const noModeAnswer = perVariant[VARIANTS.length - 1].size;
+  if (noModeAnswer !== 0) {
+    console.error(
+      `\nA BLANK WORK-MODE ANSWER MATCHED ${noModeAnswer} job(s). Ticking no ` +
+        `arrangement must match nothing — see notify.match.work_mode_ok.`,
+    );
+    process.exitCode = 1;
+  }
+
+  /*
+   * THE SYNTHETIC PROBE — the one thing live data cannot prove.
+   *
+   * The strict prose detector labels ZERO rows of the current board remote (see
+   * notify/description._REMOTE_FRAMED_RE for why the threshold is where it is),
+   * so every variant above exercises the ONSITE and HYBRID paths and none of them
+   * reaches the relaxation. A green matrix would therefore say nothing whatever
+   * about the branch this slice exists to turn on, which is exactly the trap the
+   * old "0 of 7,869 non-NULL" note was printed to avoid.
+   *
+   * So four fabricated rows are judged by BOTH implementations. They are not
+   * inserted anywhere — they exist for the length of one comparison — and they
+   * cover the branch and its two floors: a remote job outside the selection
+   * matches, the same job outside INDIA does not, an unparsed job in the same
+   * place does not, and an account that did not tick `remote` does not get it.
+   */
+  const SYNTHETIC: { note: string; job: Row; prefsIndex: number; expect: boolean }[] = [
+    {
+      note: "remote + chennai, account ticked remote -> MATCHES (the branch fires)",
+      job: synthetic("syn-remote-chennai", "chennai", "remote"),
+      prefsIndex: 10,
+      expect: true,
+    },
+    {
+      note: "remote + non-india -> NO (the country floor still holds)",
+      job: synthetic("syn-remote-foreign", NON_INDIA_LABEL_LOCAL, "remote"),
+      prefsIndex: 10,
+      expect: false,
+    },
+    {
+      note: "unparsed + chennai -> NO (NULL is onsite, not remote)",
+      job: synthetic("syn-null-chennai", "chennai", null),
+      prefsIndex: 10,
+      expect: false,
+    },
+    {
+      note: "remote + chennai, account ticked ONSITE only -> NO",
+      job: synthetic("syn-remote-onsite-acct", "chennai", "remote"),
+      prefsIndex: 8,
+      expect: false,
+    },
+  ];
+
+  const synthPy = python({
+    variants: SYNTHETIC.map((s) => ({ prefs: VARIANTS[s.prefsIndex].prefs })),
+    jobs: SYNTHETIC.map((s) => s.job),
+  }).matched;
+
+  console.log("\nsynthetic probe — the remote branch, which no live row can reach:");
+  let synthFailed = 0;
+  for (const [i, probe] of SYNTHETIC.entries()) {
+    const py = synthPy[i].includes(probe.job.canonical_id);
+    const ts = isMatch(probe.job, VARIANTS[probe.prefsIndex].prefs);
+    const ok = py === ts && ts === probe.expect;
+    if (!ok) synthFailed += 1;
+    console.log(
+      `  ${ok ? "ok  " : "FAIL"}  py ${py ? "MATCH" : "no   "}  ts ${ts ? "MATCH" : "no   "}  ` +
+        `expected ${probe.expect ? "MATCH" : "no"}   ${probe.note}`,
+    );
+  }
+  if (synthFailed) {
+    console.error(
+      `\n${synthFailed} synthetic probe(s) failed. The remote relaxation is not ` +
+        `behaving as specified, or the two implementations disagree about it.`,
+    );
+    process.exitCode = 1;
+  }
 
   // The live row's verdict is what the rest of the report describes: the per-company
   // breakdown, the "For you" total, and the number this script exists to be

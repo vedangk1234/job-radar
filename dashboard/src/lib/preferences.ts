@@ -58,7 +58,7 @@ async function explainMissingRow(): Promise<never> {
 }
 
 /**
- * TEN COLUMNS SINCE SLICE 2, and the four new ones split two ways.
+ * ELEVEN COLUMNS SINCE THE WORK-MODE SLICE, and the new ones split two ways.
  *
  * exp_range_low, exp_range_high and show_no_experience_jobs are read by the RULES
  * (lib/match.experienceExcluded) as well as shown on the screen.
@@ -75,7 +75,7 @@ export async function loadPreferences(userId: string): Promise<Preferences> {
     SELECT cities, selected_cities, all_india,
            keywords, exclusions, max_level,
            exp_range_low, exp_range_high, years_of_experience_held,
-           show_no_experience_jobs,
+           show_no_experience_jobs, work_modes,
            updated_at, onboarding_completed
       FROM preferences
      WHERE user_id = ${userId}
@@ -171,6 +171,7 @@ export async function savePreferences(
     exp_range_high: number;
     years_of_experience_held: number | null;
     show_no_experience_jobs: boolean;
+    work_modes: string[];
   },
 ): Promise<Preferences> {
   const [row] = await sql<Preferences[]>`
@@ -185,13 +186,14 @@ export async function savePreferences(
            exp_range_high           = ${next.exp_range_high},
            years_of_experience_held = ${next.years_of_experience_held},
            show_no_experience_jobs  = ${next.show_no_experience_jobs},
+           work_modes               = ${next.work_modes}::text[],
            onboarding_completed     = TRUE,
            updated_at               = now()
      WHERE user_id = ${userId}
     RETURNING cities, selected_cities, all_india,
               keywords, exclusions, max_level,
               exp_range_low, exp_range_high, years_of_experience_held,
-              show_no_experience_jobs,
+              show_no_experience_jobs, work_modes,
               updated_at, onboarding_completed
   `;
   if (!row) return explainMissingRow();

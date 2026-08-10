@@ -77,7 +77,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
 from notify.description import enrich_candidates
-from notify.match import Preferences, is_match, title_stage_ok
+from notify.match import Preferences, is_match, worth_a_description
 from notify.store import fetch_enrichment_targets, load_active_preferences
 
 # How long a FAILED description read is believed before it is worth asking
@@ -142,10 +142,15 @@ async def enrich_matches(
 ) -> EnrichmentPass:
     """Read every title-stage match's description once, and store what it says.
 
-    The two stages are the same seam the digest uses, and for the same reason:
-    `title_stage_ok` is free and runs over everything, `enrich_candidates` costs
-    a request and runs over what survived. Doing it in this order is what keeps
-    the pass at a few dozen requests instead of 788.
+    The two stages are the same shape they always were: a free test over
+    everything, then a request for what survived. What changed in the work-mode
+    slice is WHICH free test — `worth_a_description` rather than `title_stage_ok`,
+    wider by one branch so that a job which fails only the city gate but is
+    plausibly in India still earns a read. Without that a remote posting outside
+    the selected cities could never be discovered to BE remote, and the
+    relaxation in city_ok would be unreachable by construction. See that function
+    for the circularity and for the country floor that keeps the cost bounded —
+    24 extra candidates on the live board rather than 310.
 
     A job earns a request if ANY active filter would want it. The alternative —
     intersecting the filters — would read fewer descriptions and leave exactly the
@@ -164,7 +169,7 @@ async def enrich_matches(
 
     targets = await fetch_enrichment_targets(conn, retry_before)
     candidates = [
-        job for job in targets if any(title_stage_ok(job, prefs) for prefs in filters)
+        job for job in targets if any(worth_a_description(job, prefs) for prefs in filters)
     ]
 
     report = await enrich_candidates(

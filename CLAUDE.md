@@ -139,6 +139,7 @@ that re-applying the schema can never reset a value the dashboard has edited.
 | `miss_count` | consecutive fetches that did *not* contain it |
 | `status` | `open` \| `closed` |
 | `seeded` | stored during this company's first-ever crawl — **back catalogue, never emailed to anybody** |
+| `work_mode` | `onsite` \| `hybrid` \| `remote`, from the description. **NULL = never established**, read as onsite when filtering and never written down |
 | `min_experience` | years the description demands as a minimum. **NULL = unknown; whether unknown means keep is the reader's `show_no_experience_jobs`, per account, since Slice 2** |
 | `is_pm_role` | the description frames the role as product/people management |
 | `desc_checked` | the description has been read once; never read twice |
@@ -174,7 +175,7 @@ drop was a genuine no-op against a queue that had been reading `seeded` for a
 whole sub-phase, rather than a behaviour change with an inbox-shaped failure
 mode. See *The diffing guards* for the queue itself.
 
-The five description-derived columns are the **only** trace a job description
+The six description-derived columns are the **only** trace a job description
 ever leaves in this database. There is no description column, on purpose: two
 scalars per job cost nothing, and 10 KB of HTML per job across a growing board
 is how a free tier turns into a bill. The discipline is structural rather than a
@@ -286,7 +287,8 @@ Step 0 added nine more; five are wired up, four are still inert:
 | `show_no_experience_jobs` | **live** since Slice 2 — what a NULL `jobs.min_experience` means for this account |
 | `years_of_experience_held` | stored, editable, **read by no matcher, ever** — informational only |
 | `selected_cities`, `all_india` | **live** since cities Slice B — the city gate. `cities` is now the legacy fallback for a row that predates the backfill, and the contract slice drops it |
-| `work_modes`, `salary_bands` | still inert, still covered by `tests/test_phase3_columns.py`'s sweep |
+| `work_modes` | **live** since the work-mode slice — the arrangement filter. Blank matches nothing |
+| `salary_bands` | still inert, still covered by `tests/test_phase3_columns.py`'s sweep |
 
 It lives in the database and not in a Python constant precisely so the dashboard
 can `UPDATE` it and the very next digest obeys — no redeploy, no commit.
@@ -1524,9 +1526,12 @@ deployed crawler is still the pre-Slice-A one, so the board is still labelled
 admits every open row for an all-India account, foreign postings included, and the
 keyword and experience filters are all that narrow 7,869 to 343. See *Pending*.
 
-`match-parity` also prints how many rows carry a non-NULL `work_mode`. It is 0,
-and the line exists to stop a green matrix being read as coverage of the remote
-branch, which no live row can reach.
+`match-parity` also prints how many rows carry a non-NULL `work_mode`, and since
+the work-mode slice that line is a **failing gate** rather than a note: zero means
+the backfill was never applied and the whole matrix is green over a rule live data
+cannot reach. It is 102 (onsite 97, hybrid 5). No live row is `remote`, so the
+relaxation is covered by a **synthetic probe** instead — four fabricated rows run
+through both implementations and inserted nowhere.
 
 Two more checks answer questions parity cannot. Neither is about drift between
 the two languages; both are about a thing being *true against the real database*.
@@ -2561,6 +2566,108 @@ Newest last. Append here as the project evolves.
 
   Deliberately **not** here: the work-mode parser, `work_modes`, `salary_bands`,
   the watch-list picker, and the Slice A relabel — see *Pending*.
+
+- **2026-08-10 — Phase 3, the work-mode slice. The remote branch stops being inert.**
+  Two halves, as the cities slices were: a parser that fills `jobs.work_mode`, and
+  `preferences.work_modes` — created empty by Step 0 — becoming a filter. Together
+  they turn on the relaxation cities Slice B built and could not fire.
+
+  **`work_mode` is on the `is_pm_role` rail**, not the `city` one. It is written by
+  `notify/store.SAVE_DESCRIPTION_FACTS_SQL`, once, when a description is read, and
+  by nothing else — `tests/test_phase3_columns.test_only_the_enrichment_statement_
+  may_write_work_mode` asserts both halves. The crawl deliberately may not write
+  it: `UPSERT_SEEN` runs hourly on every re-sighting and would overwrite a
+  description-derived verdict with a guess from a location string, so a job read as
+  remote on Monday would be silently un-remoted by Tuesday.
+
+  **Two tiers, and the first one is not a parser.** Three of the five live ATSes
+  publish the answer, verified against real boards rather than documentation:
+  `ashby.workplaceType` (`OnSite`/`Hybrid`/`Remote`), `lever.workplaceType`
+  (lowercase), `smartrecruiters.location.remote`/`.hybrid` (two booleans, both
+  FALSE being a real onsite). All three ride in payloads already fetched, so the
+  structural tier costs nothing. **Greenhouse and Workday publish no such field at
+  all** — checked against postings whose location says "Remote - US" — which is
+  5,589 of 7,860 open rows and why the prose tier has to exist.
+
+  **The prose tier is deliberately strict, and the asymmetry is the reason.** A
+  wrongly-onsite job is a quiet miss; a wrongly-remote job **bypasses the city
+  gate** and can arrive from anywhere in the country on one misread sentence. So
+  only unambiguous statements about *this posting* count — `fully remote`,
+  `100% remote`, `this role is remote`, `work from anywhere`, `Location: Remote`.
+  Rejected with reasons on the record: `remote-first` and `all-remote` (statements
+  about the company — every GitLab JD carries one), `remote-friendly`, `flexible`,
+  `distributed`, and **`wfh` / `work from home`**, which attach to benefits far
+  more often than to arrangements. Two of the three remote verdicts in the first
+  live dry run came from bare `WFH` and neither survived review.
+
+  On top of framing sits a **masking veto** — `_mask` blanks technical and
+  incidental uses the same length, exactly `_mask_experience_numbers`' idiom — so
+  "remote servers", "manage a remote team", "remote procedure call", "hybrid
+  cloud" cannot be read as arrangements, *and* a description can still say both
+  things in two sentences and be read correctly.
+
+  **The dry run caught a real false positive, which is what it is for.** The first
+  live pass added one job: a Stripe posting, location field `na`, matched on
+  "Experience in **fully remote** work environments" — a requirement about the
+  *applicant's history* in a requirements bullet. The veto grew a
+  candidate-history branch (`experience|comfortable|thrive|proven|track record …
+  remote`, bounded so it cannot cross a sentence) and that line is now a test.
+
+  **The enrichment seam had to widen, or the feature was decorative.**
+  `crawler/enrich.py` narrowed by `title_stage_ok`, which **includes `city_ok`** —
+  so a job the relaxation would rescue is exactly a job that never earned a
+  description read, and `work_mode` could never become `remote`. `notify.match.
+  worth_a_description` is the fix: the same tests minus the city gate, plus
+  `india_funnel(location)` as the country floor, since a `non-india` posting can
+  never match whatever its arrangement is. That is the difference between 310 extra
+  candidates and 24. It reads the **location string**, not `jobs.city`, so it is
+  correct on a database whose labels predate the current vocabulary — which this
+  one is.
+
+  **NULL is read as onsite and never written.** `DEFAULT_WORK_MODE` collapses it at
+  the moment of comparison; the column keeps saying nothing. "We read it and it
+  said nothing" and "we never looked" stay different facts on the row — the
+  `jobs.notified` lesson applied *before* the mistake instead of after it. ~9,675
+  rows are still NULL and are matched exactly as they were before this slice.
+  `lib/jobs.workModeClause` therefore says `COALESCE(j.work_mode, 'onsite') =
+  ANY(…)`; without it the prefilter would be narrower than the matcher and Home
+  would drop to a handful of rows.
+
+  **The field is fail-closed on blank**, the fourth member of the family with the
+  unconfigured range and the blank city answer, and unreachable for an onboarded
+  account by the same construction — `PUT /api/preferences` refuses an empty
+  selection and is the only writer of the column *and* of `onboarding_completed`.
+  `DEFAULT_WORK_MODES` is all three, mirroring what
+  `backfill_onboarding_prefs.py` wrote; "blank matches nothing" lives in
+  `from_row`, not in the constant. Getting that backwards made a bare
+  `Preferences()` match zero jobs and cost 85 red tests, which is the guards
+  working.
+
+  **`scripts/backfill_work_mode.py`** is prove-before-commit, shaped like
+  `relabel_cities.py`: projected distribution, a **marker report** (every non-onsite
+  verdict grouped by the phrase that produced it — the reviewable unit is the
+  marker, not the row), a **blast radius** per account computed with the whole
+  matcher, the **added-by-remote-relaxes-city list** with the description snippet
+  behind each verdict, and a lifecycle fingerprint over every column except
+  `work_mode`. Its fingerprint window is the **write**, not the run: the first live
+  pass reported a MISMATCH because the hourly crawl landed during three minutes of
+  fetching, which is a fact about this database rather than about the UPDATE.
+
+  Applied: **102 rows written — onsite 97, hybrid 5, remote 0**; 9,675 stay NULL.
+  Fingerprint MATCH. `match-parity` **34 before and 34 after** over 7,860 live rows
+  × 12 filters (the live total was 38 a day earlier; the board churned, and the
+  slice moved it by nothing). `onsite only` reports **33**, which is the mode gate
+  proving it is not a no-op.
+
+  **No live row is remote, so `match-parity` gained a synthetic probe.** Four
+  fabricated rows, judged by both implementations and inserted nowhere, prove the
+  branch fires (remote + chennai matches), that the country floor holds (remote +
+  non-india does not), that NULL is not remote, and that an account which did not
+  tick `remote` never sees one. The old `0 of N non-NULL` note became a **failing
+  gate**: zero now means the backfill was never applied.
+
+  1,517 pytest pass (72 new in `tests/test_work_mode.py`), typecheck clean,
+  `onboarding-check` and `badge-check` green.
 
 **Pending**
 

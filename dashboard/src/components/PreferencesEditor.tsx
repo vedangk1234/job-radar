@@ -13,6 +13,7 @@ import {
   type StoredResume,
 } from "@/lib/labels";
 import { CityPicker } from "./CityPicker";
+import { WorkModePicker } from "./WorkModePicker";
 import { KeywordChips } from "./KeywordChips";
 import { ResumePanel } from "./ResumePanel";
 
@@ -84,6 +85,16 @@ export function PreferencesEditor({
     return stored.filter((c) => SELECTABLE.has(c));
   });
   const [allIndia, setAllIndia] = useState<boolean>(initial.all_india);
+  /*
+   * NO LEGACY FALLBACK HERE, unlike the city selection above, and the asymmetry
+   * is honest rather than an oversight. `selected_cities` needed one because an
+   * account's answer might be sitting in the older `cities` column; work_modes
+   * has no predecessor to fall back TO. An account that has not saved since this
+   * slice renders whatever the column holds — all three for the operator's row
+   * (scripts/backfill_onboarding_prefs.py wrote them), empty for a brand-new
+   * account, which is exactly the unconfigured state onboarding exists to fill.
+   */
+  const [workModes, setWorkModes] = useState<string[]>(initial.work_modes ?? []);
   const [keywords, setKeywords] = useState<string[]>(initial.keywords);
   const [exclusions, setExclusions] = useState<string[]>(initial.exclusions);
   const [maxLevel, setMaxLevel] = useState<number>(initial.max_level);
@@ -145,6 +156,7 @@ export function PreferencesEditor({
   const dirty =
     JSON.stringify([
       selectedCities, allIndia, keywords, exclusions, maxLevel, expLow, expHigh, yearsHeld, showNoExp,
+      workModes,
     ]) !==
     JSON.stringify([
       initialSelectedCities,
@@ -156,6 +168,7 @@ export function PreferencesEditor({
       initial.exp_range_high === null ? "" : String(initial.exp_range_high),
       initial.years_of_experience_held === null ? "" : String(initial.years_of_experience_held),
       rangeConfigured ? initial.show_no_experience_jobs : true,
+      initial.work_modes ?? [],
     ]);
 
   const overCap = keywords.length > KEYWORD_CAP;
@@ -168,6 +181,12 @@ export function PreferencesEditor({
    * empty selection is the correct and complete answer.
    */
   const noCityAnswer = !allIndia && !selectedCities.length;
+
+  /*
+   * The same rule PUT /api/preferences enforces, restated for the button, exactly
+   * as noCityAnswer and rangeInvalid are. The server is where the rule LIVES.
+   */
+  const noWorkModeAnswer = workModes.length === 0;
 
   /*
    * The same rule PUT /api/preferences enforces, restated for the button. The
@@ -251,6 +270,7 @@ export function PreferencesEditor({
           exp_range_high: Number(expHigh),
           years_of_experience_held: yearsHeld.trim() === "" ? null : Number(yearsHeld),
           show_no_experience_jobs: showNoExp,
+          work_modes: workModes,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -270,6 +290,7 @@ export function PreferencesEditor({
           : String(data.preferences.years_of_experience_held),
       );
       setShowNoExp(data.preferences.show_no_experience_jobs);
+      setWorkModes(data.preferences.work_modes);
       setUpdatedAt(data.preferences.updated_at);
       setMessage({ kind: "ok", text: data.message });
 
@@ -381,6 +402,8 @@ export function PreferencesEditor({
         </div>
       </div>
 
+      <WorkModePicker selected={workModes} onChange={setWorkModes} />
+
       <CityPicker
         selected={selectedCities}
         onSelectedChange={setSelectedCities}
@@ -429,7 +452,9 @@ export function PreferencesEditor({
         <button
           className="primary"
           onClick={save}
-          disabled={busy || !dirty || overCap || rangeInvalid || noCityAnswer}
+          disabled={
+            busy || !dirty || overCap || rangeInvalid || noCityAnswer || noWorkModeAnswer
+          }
         >
           {busy
             ? "Saving…"
@@ -441,6 +466,8 @@ export function PreferencesEditor({
                 ? "Fix the experience range to save"
                 : noCityAnswer
                   ? "Pick a city to save"
+                  : noWorkModeAnswer
+                    ? "Pick a work arrangement to save"
                   : dirty
                     ? "Save preferences"
                     : "No changes"}

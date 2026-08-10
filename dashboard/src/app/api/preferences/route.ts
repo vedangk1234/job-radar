@@ -1,7 +1,12 @@
 import { NextResponse } from "next/server";
 
 import { badRequest, requireSession, serverError } from "@/lib/guard";
-import { CITY_LABELS, CITY_UMBRELLAS, SELECTABLE_CITY_LABELS } from "@/lib/labels";
+import {
+  CITY_LABELS,
+  CITY_UMBRELLAS,
+  SELECTABLE_CITY_LABELS,
+  WORK_MODE_VALUES,
+} from "@/lib/labels";
 import { NON_INDIA_LABEL } from "@/lib/match";
 import { cleanList, KEYWORD_CAP, loadPreferences, savePreferences } from "@/lib/preferences";
 
@@ -213,6 +218,36 @@ export async function PUT(request: Request) {
   }
 
   /*
+   * THE WORK ARRANGEMENT — REQUIRED, and it belongs in the same family as the
+   * empty-cities, empty-keywords and unset-range rules above rather than being a
+   * new kind of check. lib/match.workModeOk treats an empty selection as
+   * "matches nothing", so a row saved without one produces a digest that goes
+   * quiet and reads as "nothing was posted".
+   *
+   * This refusal is the third of the three layers, and the only one that holds
+   * for a row edited by hand: the picker offers exactly these three, this rejects
+   * anything else, and notify.match.work_mode_ok is a plain membership test that
+   * an unrecognised value simply fails.
+   *
+   * IT IS ALSO WHAT MAKES "ONBOARDED IMPLIES CONFIGURED" TRUE for this column,
+   * the same construction the experience range relies on: this route is the only
+   * writer of work_modes AND of onboarding_completed.
+   */
+  const workModes = cleanList(body.work_modes, { max: 10 });
+  if (!workModes.length) {
+    return badRequest(
+      "pick at least one work arrangement — an empty selection matches no job at all",
+    );
+  }
+  const unknownModes = workModes.filter((m) => !WORK_MODE_VALUES.includes(m));
+  if (unknownModes.length) {
+    return badRequest(
+      `unknown work arrangement(s): ${unknownModes.join(", ")}. ` +
+        `Choose from: ${WORK_MODE_VALUES.join(", ")}`,
+    );
+  }
+
+  /*
    * THE EXPERIENCE RANGE — REQUIRED, and it belongs in the same paragraph of the
    * doc comment above as the empty-cities and empty-keywords rules, because it is
    * the same failure. lib/match.experienceExcluded treats an unconfigured range as
@@ -295,6 +330,7 @@ export async function PUT(request: Request) {
       exp_range_high: expHigh,
       years_of_experience_held: yearsHeld,
       show_no_experience_jobs: showNoExperienceJobs,
+      work_modes: workModes,
     });
     return NextResponse.json({
       preferences,
@@ -302,6 +338,7 @@ export async function PUT(request: Request) {
         `Saved. ${keywords.length} keyword(s), ` +
         `${allIndia ? "all of India" : `${selectedCities.length} cit(y/ies)`}, ` +
         `${exclusions.length} exclusion(s), max_level ${maxLevel}, ` +
+        `${workModes.join("/")}, ` +
         `looking for ${expLow}-${expHigh} years` +
         `${showNoExperienceJobs ? ", including" : ", excluding"} jobs that state no minimum. ` +
         `The next digest uses this.`,

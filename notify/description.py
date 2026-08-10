@@ -77,7 +77,7 @@ import html
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, NamedTuple
 from urllib.parse import urlsplit
 
 from fetchers.http import polite_get
@@ -379,6 +379,294 @@ def detect_pm_role(title: Any, text: Any) -> bool:
     return bool(_PM_FRAMED_RE.search(text) or _MANAGES_PEOPLE_RE.search(text))
 
 
+# --- work arrangement: onsite / hybrid / remote ----------------------------
+#
+# TWO TIERS, AND THE FIRST ONE IS NOT A PARSER AT ALL.
+#
+# Three of the five live ATSes publish the answer as a field, so guessing it out
+# of prose there would be inventing a verdict next to a stated one. Verified live
+# against real boards rather than taken from documentation, which is the same
+# discipline the Workday country facet earned the hard way:
+#
+#   ashby            workplaceType  "OnSite" | "Hybrid" | "Remote"   (also isRemote)
+#   lever            workplaceType  "onsite" | "hybrid" | "remote"
+#   smartrecruiters  location.remote / location.hybrid, two booleans
+#
+# All three ride in a payload this module ALREADY fetches, so the structural tier
+# costs zero extra requests.
+#
+# GREENHOUSE AND WORKDAY PUBLISH NOTHING. Greenhouse's board API carries
+# `location.name`, `offices` and a free-form `metadata` array and no workplace
+# field of any kind; Workday's CXS detail route carries `jobRequisitionLocation`,
+# `timeType` and `location`, and again nothing. Both were checked against live
+# postings whose location string says "Remote - US". That is 5,589 of 7,858 open
+# rows, and it is why the prose tier below has to exist and has to be careful.
+#
+# THE BIAS IS THE MIRROR IMAGE OF detect_pm_role's, and getting that backwards is
+# the whole risk here. A false PM verdict HIDES a job. A false remote verdict
+# ADMITS one — notify.match.city_ok lets a remote posting skip the city gate — so
+# `remote` is the hard-to-convince answer and `onsite` is the resting state.
+
+WORK_MODES = ("onsite", "hybrid", "remote")
+
+# What a row with nothing written on it is READ AS at match time. It is not
+# written to the column: see notify.match.work_mode_of, and the module docstring
+# of scripts/backfill_work_mode.py for why NULL is never backfilled.
+DEFAULT_WORK_MODE = "onsite"
+
+
+def work_mode_from_row(ats: Any, row: Mapping[str, Any] | None) -> str | None:
+    """The ATS's own workplace field, or None if this vendor publishes none.
+
+    Read, never inferred. A vendor that states the arrangement is a better
+    authority on it than any regex over the prose underneath, and the three that
+    do state it are the three whose description already arrives in a board
+    payload — so this is free.
+
+    smartrecruiters is two booleans rather than an enum, and both being FALSE is
+    a real answer ("neither remote nor hybrid" is onsite) rather than a silence.
+    Hybrid is tested first for the reason the prose tier gives below.
+    """
+    ats = str(ats or "").strip().lower()
+    if not isinstance(row, Mapping):
+        return None
+
+    if ats in ("ashby", "lever"):
+        value = str(row.get("workplaceType") or "").strip().lower()
+        return value if value in WORK_MODES else None
+
+    if ats == "smartrecruiters":
+        location = row.get("location")
+        if isinstance(location, Mapping):
+            if location.get("hybrid") is True:
+                return "hybrid"
+            if location.get("remote") is True:
+                return "remote"
+            if location.get("remote") is False and location.get("hybrid") is False:
+                return "onsite"
+
+    return None
+
+
+# THE PHRASES WHERE "remote" IS A TECHNICAL NOUN AND NOT AN ARRANGEMENT.
+#
+# This list is the reason the prose tier is safe to run at all. "Remote" is the
+# one arrangement word with a heavy second life in engineering English, and every
+# phrase below appears in ordinary Bangalore-onsite backend JDs:
+#
+#     "you will manage a remote team of eight engineers"
+#     "debugging remote servers over SSH"
+#     "experience with remote procedure calls"
+#     "push to the remote repository"
+#     "we support remote work for some teams"
+#
+# A detector that read any of those as "this posting is fully remote" would relax
+# the city gate on a job that is nothing of the kind, and the failure is silent —
+# the job simply turns up in a digest it should never have reached.
+_REMOTE_NOT_AN_ARRANGEMENT_RE = re.compile(
+    r"\bremote\s+(?:team|teams|colleague|colleagues|coworkers|co-workers|peers|"
+    r"workforce|employees|staff|engineers|developers|members|"
+    r"server|servers|host|hosts|machine|machines|desktop|device|devices|"
+    r"system|systems|access|debugging|monitoring|sensing|execution|"
+    r"procedure|repository|repositories|branch|branches|origin|"
+    r"api|apis|endpoint|endpoints|call|calls|data|database|databases|"
+    r"connection|connections|session|sessions|node|nodes|cluster|clusters|"
+    r"config|configuration|state|cache|storage|"
+    r"culture|work\s+culture|collaboration|communication)\b"
+    r"|\bmanag(?:e|es|ing|ement\s+of)\s+(?:a\s+|an\s+)?(?:\w+\s+){0,2}remote\b"
+    r"|\b(?:lead|leads|leading|mentor|mentors|mentoring)\s+(?:a\s+)?remote\b"
+    r"|\bdistributed\s+team[s]?\b"
+    r"|\bremote\s+procedure\s+call\b|\brpc\b"
+    r"|\bsupport(?:s|ing)?\s+remote\s+work\b"
+    r"|\bremote[- ]friendly\s+culture\b"
+    r"|\bacross\s+remote\b|\bwith\s+remote\b"
+    # A REMOTE WORK *ENVIRONMENT* IS A KIND OF WORKPLACE IN GENERAL, not this
+    # workplace. "Experience in fully remote work environments" is a sentence
+    # about the candidate's history, and it is a requirements bullet in postings
+    # that are not remote at all.
+    r"|\bremote\s+(?:work\s+)?(?:environment|environments|setting|settings|culture)\b"
+    # THE CANDIDATE'S PAST, NOT THE ROLE'S PRESENT — and this one was found by the
+    # dry run rather than by review, which is why the dry run exists.
+    #
+    # A Stripe posting, "Software Engineer, Secrets Infrastructure", location
+    # field left as "na", requirements list reading "...Experience operating
+    # complex services on AWS. Experience in fully remote work environments."
+    # _REMOTE_FRAMED_RE's "fully remote" fired, the job was called remote, the
+    # city gate relaxed, and a US posting became the ONE job this whole slice
+    # would have added to the operator's digest. Precisely the failure the
+    # framing discipline exists to prevent, arriving through a phrase that IS
+    # framed — just pointed at the applicant instead of at the job.
+    #
+    # Bounded by [^.\n] so it cannot reach across a sentence: "Prior experience
+    # is a plus. This role is fully remote." keeps its second sentence.
+    r"|\b(?:experience|experienced|comfortable|familiar|thrive[sd]?|thriving|"
+    r"worked|success|successful|proven|track\s+record)\b"
+    r"[^.\n]{0,40}?\b(?:100\s*%\s*|fully\s+|entirely\s+|completely\s+)?remote\b",
+    re.IGNORECASE,
+)
+
+# The same problem one word over, and less obvious. "Hybrid" is all over
+# engineering prose that has nothing to do with where anybody sits — "hybrid
+# cloud", "hybrid app", "hybrid model" in an ML JD, "hybrid search". Bare
+# "hybrid" is therefore never enough; the framed patterns below are what count.
+_HYBRID_NOT_AN_ARRANGEMENT_RE = re.compile(
+    r"\bhybrid\s+(?:cloud|app|apps|application|applications|mobile|architecture|"
+    r"approach|model|models|search|index|infrastructure|deployment|deployments|"
+    r"network|networks|storage|encryption|solution|solutions|system|systems|"
+    r"framework|stack|environment\s+of\s+services)\b",
+    re.IGNORECASE,
+)
+
+
+def _mask(text: str, pattern: re.Pattern[str]) -> str:
+    """Blank every match of `pattern`, same-length, so nothing else can read it.
+
+    Exactly notify.match._mask_experience_numbers' idiom and for exactly its
+    reason: the replacement is the same length, so every offset and every \\b in
+    the patterns that run afterwards still lines up with the original text, and
+    '#' is a non-word character so a masked phrase cannot be matched back out.
+
+    Masking rather than "find a hit, then check whether it was a false one"
+    because a description contains MANY mentions. "We debug remote servers. This
+    role is fully remote." has to answer remote, and "You manage a remote team
+    from our Bengaluru office" has to answer onsite — a whole-text veto would get
+    the first wrong and a first-hit-wins scan would get the second wrong.
+    """
+    out = list(text)
+    for match in pattern.finditer(text):
+        out[match.start() : match.end()] = "#" * (match.end() - match.start())
+    return "".join(out)
+
+
+# HYBRID, FRAMED. Every alternative names the WORK rather than a technology.
+_HYBRID_FRAMED_RE = re.compile(
+    r"\bhybrid\s+(?:work(?:ing|place|\s+model|\s+week)?|role|position|job|schedule|"
+    r"setup|set-up|arrangement|arrangements|policy|environment|office|mode)\b"
+    r"|\b(?:role|position|job|this)\s+is\s+(?:a\s+)?hybrid\b"
+    r"|\bwork(?:ing)?\s+model\s*[:\-]?\s*hybrid\b"
+    r"|\bhybrid\s*[-–—(:]\s*\d+\s*days?\b"
+    r"|\b\d+\s*days?\s+(?:a|per)\s+week\s+(?:in|from|at)\s+(?:the\s+)?office\b"
+    r"|\b\d+\s*days?\s+(?:in|from|at)\s+(?:the\s+)?office\b"
+    r"|\bin[- ]office\s+\d+\s*days?\b",
+    re.IGNORECASE,
+)
+
+# REMOTE, FRAMED — AND DELIBERATELY STRICT. Every alternative is an unambiguous
+# statement that THIS POSTING is remote. Weak and merely suggestive language does
+# not appear here and does not earn the label.
+#
+# THE ASYMMETRY THAT DECIDES WHERE THE LINE SITS. A wrongly-ONSITE job is a quiet
+# miss: it stays in whatever city bucket it was already in, and an account that
+# ticked that city still sees it. A wrongly-REMOTE job BYPASSES THE CITY GATE —
+# notify.match.city_ok exempts it — so it can arrive in a digest from anywhere in
+# the country on the strength of one misread sentence. The two errors are not the
+# same size, so the threshold is not in the middle.
+#
+# WHAT WAS CONSIDERED AND REJECTED, each for a stated reason rather than by
+# omission:
+#
+#   remote-first, all-remote      statements about the COMPANY, not the posting.
+#                                 "GitLab is an all-remote company" appears in
+#                                 every GitLab JD including the office-bound ones.
+#   remote-friendly               explicitly weak; it means "we tolerate it".
+#   flexible, distributed         say nothing about where the job is.
+#   wfh, work from home           reached the label in an earlier draft and both
+#                                 come attached to BENEFITS far more often than to
+#                                 arrangements — "WFH allowance", "WFH setup
+#                                 provided", "WFH on Fridays". Two of the three
+#                                 remote verdicts in the first live dry run came
+#                                 from bare "WFH" and neither survived review.
+#   remote role/position (bare)   fine when framed ("this is a remote role") and
+#                                 not when merely mentioned ("we have remote roles
+#                                 across the company"). Only the framed form is
+#                                 here.
+#   "you may work remotely"       `may` is permission, not arrangement.
+#   occasional/some remote        a hybrid week described loosely at best.
+#
+# The cost of the strictness is on the record and was measured: it labels ZERO
+# rows of the current live board remote, including a Databricks posting whose
+# LOCATION field reads "Remote - India" but whose prose never says so. That job is
+# a miss, and a miss is the error this file is willing to make.
+_REMOTE_FRAMED_RE = re.compile(
+    # An unambiguous intensifier, which no benefits list produces.
+    r"\b(?:100\s*%|fully|entirely|completely|permanently)\s*[- ]?\s*remote\b"
+    # The posting saying it about itself, in so many words.
+    r"|\b(?:this|the)\s+(?:role|position|job|opportunity|opening)\s+(?:is|will\s+be)\s+"
+    r"(?:an?\s+)?(?:fully\s+|100%\s+|entirely\s+)?remote\b"
+    r"|\b(?:this\s+)?is\s+(?:an?\s+)?(?:fully\s+)?remote\s+(?:role|position|job|opening)\b"
+    r"|\byou\s+will\s+(?:be\s+)?work(?:ing)?\s+(?:100%\s+|fully\s+)?remotely\b"
+    # Working from anywhere is a location claim and cannot be a perk in disguise.
+    r"|\bwork\s+from\s+anywhere\b|\bbased\s+anywhere\s+in\s+india\b"
+    # A structured line inside the prose — the vendor's own field, spelled out.
+    r"|\b(?:work\s+)?(?:location|workplace(?:\s+type)?)\s*[:\-]\s*remote\b"
+    r"|\bremote\s*\(\s*(?:india|anywhere)\s*\)",
+    re.IGNORECASE,
+)
+
+# In a TITLE the term needs no framing, exactly as _PM_TITLE_RE does not: a
+# posting called "Software Engineer (Remote)" is not discussing remote servers.
+# Anchored on the bracket or dash a title actually uses, so "Remote Sensing
+# Engineer" is untouched.
+_TITLE_REMOTE_RE = re.compile(r"[(\[|,-]\s*(?:100%\s*)?remote\b|\bremote\s*[)\]]", re.IGNORECASE)
+_TITLE_HYBRID_RE = re.compile(r"[(\[|,-]\s*hybrid\b|\bhybrid\s*[)\]]", re.IGNORECASE)
+
+
+def explain_work_mode(title: Any, text: Any) -> tuple[str | None, str | None, str | None]:
+    """(mode, the phrase that decided it, a snippet of context around it).
+
+    The verdict AND the evidence, for the same reason
+    fetchers.normalize.explain_label returns its marker: a person reviewing a
+    backfill has to be able to see WHY a row was called remote, and re-deriving
+    that in the report would be a second implementation of the rule.
+
+    marker None with a mode of "onsite" means "read it, and it stated no
+    arrangement" — the specified default, which is a rule and not a shrug. Mode
+    None means there was no text at all.
+    """
+    if isinstance(title, str) and title.strip():
+        if (hit := _TITLE_HYBRID_RE.search(title)) is not None:
+            return "hybrid", hit.group(0).strip(), title.strip()[:160]
+        if (hit := _TITLE_REMOTE_RE.search(title)) is not None:
+            return "remote", hit.group(0).strip(), title.strip()[:160]
+
+    if not isinstance(text, str) or not text.strip():
+        return None, None, None
+
+    masked = _mask(_mask(text, _REMOTE_NOT_AN_ARRANGEMENT_RE), _HYBRID_NOT_AN_ARRANGEMENT_RE)
+
+    for mode, pattern in (("hybrid", _HYBRID_FRAMED_RE), ("remote", _REMOTE_FRAMED_RE)):
+        hit = pattern.search(masked)
+        if hit is None:
+            continue
+        # The snippet comes from the ORIGINAL text, not the masked copy, because
+        # it is for a person to read. Same offsets — that is what same-length
+        # masking buys.
+        start, end = max(0, hit.start() - 90), min(len(text), hit.end() + 90)
+        snippet = " ".join(text[start:end].split())
+        return mode, hit.group(0).strip(), f"…{snippet}…"
+
+    return DEFAULT_WORK_MODE, None, None
+
+
+def detect_work_mode(title: Any, text: Any) -> str | None:
+    """onsite | hybrid | remote from the description, or None if there was none.
+
+    HYBRID IS TESTED BEFORE REMOTE, and it is the precedence that matters. A
+    hybrid posting nearly always contains remote language — "two days remote,
+    three in the office" — and reading it as fully remote would relax a city gate
+    that this posting does not relax. Same shape as navi-mumbai being scanned
+    ahead of mumbai in fetchers/normalize.py.
+
+    None means no description was readable, which is NOT "onsite". The column
+    stays NULL, notify.match.work_mode_of reads that NULL as onsite for the
+    purpose of filtering, and the difference between the two is preserved on the
+    row — the jobs.notified lesson: one column, one fact. "We read it and it said
+    nothing" and "we never managed to read it" are different facts, and the
+    second is the one desc_fetch_failed already tracks.
+    """
+    return explain_work_mode(title, text)[0]
+
+
 # --- fetching the description ---------------------------------------------
 #
 # Two shapes of source, and the difference is one request versus zero.
@@ -600,14 +888,28 @@ async def _smartrecruiters_description(token: str, job_id: str) -> str | None:
     _LEADING_DURATION_RE anchors on. Politeness is the shared default: the same
     client, semaphore, per-host pace and backoff as every other fetch here.
     """
+    return (await _smartrecruiters_read(token, job_id)).text
+
+
+async def _smartrecruiters_read(token: str, job_id: str) -> "DescriptionRead":
+    """The posting's prose AND its `location.remote` / `location.hybrid` booleans.
+
+    The two booleans sit on the same response the sections come from, so reading
+    them is free. Verified live: a Continental posting answers
+    `location: {remote: false, hybrid: false, ...}`, and both being false is a
+    real "onsite" rather than a silence — which is why work_mode_from_row treats
+    it as one.
+    """
     res = await polite_get(SMARTRECRUITERS_JOB_URL.format(token=token, job_id=job_id))
     if not res.ok or not isinstance(res.json, dict):
-        return None
+        return DescriptionRead(None)
+
+    mode = work_mode_from_row("smartrecruiters", res.json)
 
     ad = res.json.get("jobAd")
     sections = ad.get("sections") if isinstance(ad, dict) else None
     if not isinstance(sections, dict):
-        return None
+        return DescriptionRead(None, mode)
 
     parts: list[Any] = []
     for key in _SR_SECTIONS:
@@ -616,7 +918,7 @@ async def _smartrecruiters_description(token: str, job_id: str) -> str | None:
             continue
         parts.append(section.get("title"))
         parts.append(html_to_text(section.get("text")))
-    return _joined(parts)
+    return DescriptionRead(_joined(parts), mode)
 
 
 def workday_external_path(site: str, url: Any) -> str | None:
@@ -672,6 +974,73 @@ async def _workday_description(company: Mapping[str, Any], job: Mapping[str, Any
     return html_to_text(info.get("jobDescription"))
 
 
+class DescriptionRead(NamedTuple):
+    """What one read of a posting yielded: the prose, and the vendor's own field.
+
+    Two values because they come from two places and only one of them is a guess.
+    `work_mode` is set when the ATS PUBLISHES the arrangement (ashby, lever,
+    smartrecruiters — see work_mode_from_row) and is None otherwise, which is
+    what makes "the structural answer wins over the prose one" expressible
+    without either tier knowing about the other.
+
+    A NamedTuple rather than a second return value so that
+    `enrich_candidates` can accept both this and a bare string: every test in
+    this repo injects a fetcher returning `str | None`, and those injections are
+    the point of the seam rather than an implementation detail to churn. Same
+    accommodation notify.match.Preferences._as_tuple makes for asyncpg lists
+    versus the SQLite shim's JSON text.
+    """
+
+    text: str | None
+    work_mode: str | None = None
+
+
+async def read_description(
+    company: Mapping[str, Any], job: Mapping[str, Any]
+) -> DescriptionRead:
+    """fetch_description, plus whatever the vendor stated about the arrangement.
+
+    THE STRUCTURAL FIELD COSTS NOTHING EXTRA, and that is why it is read here
+    rather than in a pass of its own. All three ATSes that publish it publish it
+    on the same row this function was already going to parse the description out
+    of — lever and ashby from the cached board index, smartrecruiters from the
+    single posting it fetches anyway. Greenhouse and Workday publish no such
+    field, so they come back with work_mode None and the prose tier answers.
+    """
+    ats = str(company.get("ats") or "").strip().lower()
+    token = str(company.get("token") or "").strip()
+    if not ats or not token:
+        return DescriptionRead(None)
+
+    native_id = native_id_from(job.get("canonical_id")) or job.get("native_id")
+
+    if ats == "greenhouse":
+        text = await _greenhouse_description(token, str(native_id)) if native_id else None
+        return DescriptionRead(text)
+
+    if ats == "smartrecruiters":
+        if not native_id:
+            return DescriptionRead(None)
+        return await _smartrecruiters_read(token, str(native_id))
+
+    if ats == "workday":
+        return DescriptionRead(await _workday_description(company, job))
+
+    if ats in _BOARD_URLS:
+        if not native_id:
+            return DescriptionRead(None)
+        row = (await _board_index(ats, token)).get(str(native_id))
+        if not row:
+            return DescriptionRead(None)
+        return DescriptionRead(description_from_row(ats, row), work_mode_from_row(ats, row))
+
+    # The custom scrapers (custom_jsonld, custom_sitemap) publish no description
+    # route this module has verified. Unknown, therefore kept — and recorded as a
+    # FAILED read rather than a clean one, so it is asked about again tomorrow
+    # instead of being believed forever.
+    return DescriptionRead(None)
+
+
 async def fetch_description(
     company: Mapping[str, Any], job: Mapping[str, Any]
 ) -> str | None:
@@ -686,36 +1055,13 @@ async def fetch_description(
     Politeness is the shared kind: this goes through fetchers.http.polite_get,
     so the global concurrency cap, the per-host 1 req/sec pace and the 429/5xx
     backoff are the same ones the crawler runs under.
+
+    THE TEXT HALF OF read_description, kept as its own name because it is the
+    whole of what most callers and every test injection want. Production goes
+    through read_description; this is the narrower question asked of the same
+    machinery, not a second route to it.
     """
-    ats = str(company.get("ats") or "").strip().lower()
-    token = str(company.get("token") or "").strip()
-    if not ats or not token:
-        return None
-
-    native_id = native_id_from(job.get("canonical_id")) or job.get("native_id")
-
-    if ats == "greenhouse":
-        return await _greenhouse_description(token, str(native_id)) if native_id else None
-
-    if ats == "smartrecruiters":
-        return (
-            await _smartrecruiters_description(token, str(native_id)) if native_id else None
-        )
-
-    if ats == "workday":
-        return await _workday_description(company, job)
-
-    if ats in _BOARD_URLS:
-        if not native_id:
-            return None
-        row = (await _board_index(ats, token)).get(str(native_id))
-        return description_from_row(ats, row) if row else None
-
-    # The custom scrapers (custom_jsonld, custom_sitemap) publish no description
-    # route this module has verified. Unknown, therefore kept — and recorded as a
-    # FAILED read rather than a clean one, so it is asked about again tomorrow
-    # instead of being believed forever.
-    return None
+    return (await read_description(company, job)).text
 
 
 # --- the enrichment pass ---------------------------------------------------
@@ -820,27 +1166,43 @@ async def enrich_candidates(
     request at a time is the version whose behaviour against someone else's
     board is obvious from reading it.
     """
-    fetch = fetcher or fetch_description
+    fetch = fetcher or read_description
     report: list[dict[str, Any]] = []
-    facts: list[tuple[str, int | None, bool, bool]] = []
+    facts: list[tuple[str, int | None, bool, bool, str | None]] = []
 
     for job in candidates:
         if not needs_description_check(job, retry_before=retry_before):
             continue
 
-        text = await fetch(company_of(job), job)
+        # BOTH FETCHER SHAPES ACCEPTED. Production hands back a DescriptionRead;
+        # every test injection in this repo hands back `str | None`, and those
+        # injections are what the seam is FOR. A bare string means "no structural
+        # field", which is exactly the state greenhouse and workday are in.
+        read = await fetch(company_of(job), job)
+        if not isinstance(read, DescriptionRead):
+            read = DescriptionRead(read)
+        text, stated_mode = read.text, read.work_mode
+
         failed = text is None
         min_experience = detect_min_experience(text)
         is_pm_role = detect_pm_role(job.get("title"), text)
+
+        # THE VENDOR'S FIELD WINS OVER THE PROSE, and it wins even when the prose
+        # could not be read at all: an ashby row whose description came back
+        # empty still stated `workplaceType`, and a stated answer beats no answer.
+        # detect_work_mode returns None for an unreadable description, which
+        # leaves the column NULL — read as onsite at match time, never written.
+        work_mode = stated_mode or detect_work_mode(job.get("title"), text)
 
         # The row dict is updated in place so the caller's very next is_match()
         # sees these facts without a re-read of the table.
         job["min_experience"] = min_experience  # type: ignore[index]
         job["is_pm_role"] = is_pm_role  # type: ignore[index]
+        job["work_mode"] = work_mode  # type: ignore[index]
         job["desc_checked"] = True  # type: ignore[index]
         job["desc_fetch_failed"] = failed  # type: ignore[index]
 
-        facts.append((job["canonical_id"], min_experience, is_pm_role, failed))
+        facts.append((job["canonical_id"], min_experience, is_pm_role, failed, work_mode))
         report.append(
             {
                 "canonical_id": job["canonical_id"],
@@ -848,6 +1210,8 @@ async def enrich_candidates(
                 "company": job.get("company"),
                 "min_experience": min_experience,
                 "is_pm_role": is_pm_role,
+                "work_mode": work_mode,
+                "work_mode_stated_by_ats": stated_mode is not None,
                 "fetched": not failed,
             }
         )
