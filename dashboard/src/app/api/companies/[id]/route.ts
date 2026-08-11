@@ -35,8 +35,11 @@ export const dynamic = "force-dynamic";
  *
  * THE PER-USER WATCH LIST IS THE THING THIS IS NOT. `user_companies` is where
  * "I want alerts for this company" belongs, it is a different table on a
- * different axis, and no route writes it yet. Nothing here should be widened to
- * stand in for it.
+ * different axis, and it has its own route — POST / DELETE /api/watchlist, which
+ * writes rows bound to the caller's own session and creates each pair together
+ * with the history suppression that stops a first digest being an archive dump.
+ * Nothing here should be widened to stand in for it: this route edits the SHARED
+ * catalog row, that one edits a statement about one person.
  */
 export async function PATCH(request: Request, ctx: { params: Promise<{ id: string }> }) {
   const gate = await requireSession();

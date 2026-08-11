@@ -39,8 +39,25 @@ export type CompanyRow = {
  */
 export type CompanyCard = CompanyRow & { match_jobs: number; applied_jobs: number };
 
-/** The company rows and their open/total counts. One aggregate, no job rows. */
-async function companyRows(id: number | null = null): Promise<CompanyRow[]> {
+/**
+ * The company rows and their open/total counts. One aggregate, no job rows.
+ *
+ * `watchedBy` NARROWS THE CATALOG TO ONE PERSON'S WATCH LIST, and it is the whole
+ * of what the picker slice changed in this file. Passing null asks the old
+ * question — "every company in the shared catalog" — which is what the Add flow,
+ * GET /api/companies and the picker itself still want. Passing a user id asks
+ * "the companies THIS person watches", which is what Home and Jobs want now that
+ * the two lists can differ.
+ *
+ * EXISTS rather than a join to user_companies, the same choice
+ * notify/store.CANDIDATES_SQL makes and for the same reason: the question is
+ * existence, and a join invites the reader to wonder whether a company can come
+ * back twice. It cannot — UNIQUE (user_id, company_id) — but EXISTS says so
+ * without being asked, and this query is already grouping.
+ */
+async function companyRows(
+  { id = null, watchedBy = null }: { id?: number | null; watchedBy?: string | null } = {},
+): Promise<CompanyRow[]> {
   return sql<CompanyRow[]>`
     SELECT c.id,
            c.name,
@@ -55,11 +72,17 @@ async function companyRows(id: number | null = null): Promise<CompanyRow[]> {
       FROM companies c
       LEFT JOIN jobs j ON j.company_id = c.id
      WHERE (${id}::int IS NULL OR c.id = ${id}::int)
+       AND (${watchedBy}::uuid IS NULL
+            OR EXISTS (SELECT 1
+                         FROM user_companies uc
+                        WHERE uc.user_id = ${watchedBy}::uuid
+                          AND uc.company_id = c.id))
      GROUP BY c.id
      ORDER BY c.name ASC
   `;
 }
 
+/** Every company in the shared catalog, watched or not. What the picker browses. */
 export async function listCompanies(): Promise<CompanyRow[]> {
   return companyRows();
 }
@@ -80,10 +103,53 @@ export async function listCompanyCards(userId: string): Promise<CompanyCard[]> {
   return rows.map((row) => withCounts(row, counts));
 }
 
-/** One company, with every count. For the response to a PATCH. */
+/**
+ * The same cards, narrowed to the companies THIS person watches — what Home and
+ * Jobs render since the watch-list picker exists.
+ *
+ * WHY THE TWO SCREENS MOVED AND THE CATALOG DID NOT. Until this slice there was
+ * one list, because there was only one list to have: `user_companies` had no
+ * writer in the web app, so "the catalog" and "your companies" were the same
+ * fifty rows for everybody. They are different lists now, and the two screens
+ * that print a "for you" count are the ones that have to follow the person rather
+ * than the install — a count computed over companies you do not watch is a count
+ * of jobs that can never reach your inbox, which is precisely the disagreement
+ * between Home and the digest this slice exists to close.
+ *
+ * The full catalog is still browsable, on /watchlist, which is where adding and
+ * removing happens. Nothing about the catalog is hidden; it moved to the screen
+ * whose question it answers.
+ *
+ * AN EMPTY WATCH LIST RETURNS AN EMPTY LIST, and that is the honest answer rather
+ * than a fallback to the catalog. Falling back would show a brand-new account
+ * fifty companies' worth of matches that its digest will never contain — the
+ * "seeded defaults" failure Slices 1b and 1c spent two commits removing from the
+ * preferences row, arriving one table over. The screens say so in words and point
+ * at the picker.
+ */
+export async function listWatchedCompanyCards(userId: string): Promise<CompanyCard[]> {
+  const prefs = await loadPreferences(userId);
+  const [rows, counts] = await Promise.all([
+    companyRows({ watchedBy: userId }),
+    matchCountsByCompany(prefs, userId),
+  ]);
+  return rows.map((row) => withCounts(row, counts));
+}
+
+/**
+ * One company, with every count. For the response to a PATCH.
+ *
+ * Catalog-scoped rather than watch-list-scoped on purpose: the caller has just
+ * edited a company's category, which is a fact about the shared catalog, and
+ * answering "no such company" because the editor does not happen to watch it
+ * would be a 404 about the wrong thing.
+ */
 export async function companyCard(id: number, userId: string): Promise<CompanyCard | null> {
   const prefs = await loadPreferences(userId);
-  const [rows, counts] = await Promise.all([companyRows(id), matchCountsByCompany(prefs, userId)]);
+  const [rows, counts] = await Promise.all([
+    companyRows({ id }),
+    matchCountsByCompany(prefs, userId),
+  ]);
   return rows[0] ? withCounts(rows[0], counts) : null;
 }
 

@@ -1,4 +1,6 @@
-import { listCompanyCards } from "@/lib/companies";
+import Link from "next/link";
+
+import { listWatchedCompanyCards } from "@/lib/companies";
 import { requirePage } from "@/lib/guard";
 import { CompanyList } from "@/components/CompanyList";
 
@@ -29,22 +31,40 @@ export const dynamic = "force-dynamic";
  * Home, where it would be on every row. There is no Applied checkbox here: this
  * screen is the raw reference, and the tick belongs on the list of jobs worth
  * applying to.
+ *
+ * IT FOLLOWS HOME ONTO THE WATCH LIST, since the picker slice. The question this
+ * screen exists to answer — "did the crawler miss it, or did the filter drop it?"
+ * — is asked ABOUT a company whose matches you were expecting, and those are the
+ * companies you watch. Keeping the catalog here while Home narrowed would make
+ * the reference list and the list it is a reference FOR two different sets, which
+ * is exactly the confusion the two-list problem creates. /watchlist browses
+ * everything.
  */
 export default async function JobsPage() {
   const { userId } = await requirePage();
 
-  const companies = await listCompanyCards(userId);
+  const companies = await listWatchedCompanyCards(userId);
   const openJobs = companies.reduce((n, c) => n + c.open_jobs, 0);
 
   return (
     <>
       <h1>Jobs</h1>
       <p className="lede">
-        Every open job the crawler currently holds — <strong>{openJobs}</strong> across{" "}
-        {companies.length} companies — with no filtering at all. All seniorities, all cities,
-        sales and HR included. Read-only: the crawler owns this table.
+        Every open job the crawler holds for the companies you watch —{" "}
+        <strong>{openJobs}</strong> across {companies.length} compan
+        {companies.length === 1 ? "y" : "ies"} — with no filtering at all. All seniorities, all
+        cities, sales and HR included. Read-only: the crawler owns this table.
       </p>
-      <CompanyList initial={companies} mode="all" />
+      <CompanyList
+        initial={companies}
+        mode="all"
+        empty={
+          <>
+            You are not watching any company yet, so this reference list is empty.{" "}
+            <Link href="/watchlist">Pick some on the Watchlist tab</Link>.
+          </>
+        }
+      />
       <p className="muted small" style={{ marginTop: 14 }}>
         A <span className="badge suggested">suggested</span> badge marks the postings that also
         pass your filter — the same matcher Home uses, run over this unfiltered list. Everything

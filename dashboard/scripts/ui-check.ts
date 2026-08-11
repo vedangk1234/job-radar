@@ -49,6 +49,10 @@ import { AppRouterContext } from "next/dist/shared/lib/app-router-context.shared
 
 import { CompanyList } from "../src/components/CompanyList";
 import { JobLine, type Mode } from "../src/components/JobLine";
+// Static for the reason CompanyList is: its lib/companies import is `import
+// type` and erased, and the only other things it reaches are React and the DOM.
+// Nothing on that graph builds a database pool.
+import { WatchlistPicker, type PickerCompany } from "../src/components/WatchlistPicker";
 import type { CompanyCard } from "../src/lib/companies";
 import type { JobView } from "../src/lib/jobs";
 
@@ -80,6 +84,10 @@ type Lib = {
   matchingJobsForCompany: typeof import("../src/lib/jobs").matchingJobsForCompany;
   openJobsWithMatchFlag: typeof import("../src/lib/jobs").openJobsWithMatchFlag;
   listCompanyCards: typeof import("../src/lib/companies").listCompanyCards;
+  listWatchedCompanyCards: typeof import("../src/lib/companies").listWatchedCompanyCards;
+  listCompanies: typeof import("../src/lib/companies").listCompanies;
+  watchlistState: typeof import("../src/lib/watchlist").watchlistState;
+  FREE_WATCHLIST_CAP: typeof import("../src/lib/labels").FREE_WATCHLIST_CAP;
   loadPreferences: typeof import("../src/lib/preferences").loadPreferences;
   /**
    * DEFERRED FOR THE SAME REASON AS THE REST, even though it is a component and
@@ -100,13 +108,15 @@ type Lib = {
 };
 
 async function loadLib(): Promise<Lib> {
-  const [db, currentUser, jobs, companies, preferences, deleteAccount, editor] =
+  const [db, currentUser, jobs, companies, preferences, watchlist, labels, deleteAccount, editor] =
     await Promise.all([
       import("../src/lib/db"),
       import("./current-user"),
       import("../src/lib/jobs"),
       import("../src/lib/companies"),
       import("../src/lib/preferences"),
+      import("../src/lib/watchlist"),
+      import("../src/lib/labels"),
       import("../src/components/DeleteAccount"),
       import("../src/components/PreferencesEditor"),
     ]);
@@ -116,6 +126,10 @@ async function loadLib(): Promise<Lib> {
     matchingJobsForCompany: jobs.matchingJobsForCompany,
     openJobsWithMatchFlag: jobs.openJobsWithMatchFlag,
     listCompanyCards: companies.listCompanyCards,
+    listWatchedCompanyCards: companies.listWatchedCompanyCards,
+    listCompanies: companies.listCompanies,
+    watchlistState: watchlist.watchlistState,
+    FREE_WATCHLIST_CAP: labels.FREE_WATCHLIST_CAP,
     loadPreferences: preferences.loadPreferences,
     DeleteAccount: deleteAccount.DeleteAccount,
     PreferencesEditor: editor.PreferencesEditor,
@@ -166,6 +180,29 @@ async function gateIsShut() {
       "/api/companies",
       { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
     ],
+    // The watch-list write path. Both directions, because they are separate
+    // handlers on one route and a gate is exactly the kind of thing that gets
+    // added to the one somebody was thinking about. A POST here creates a
+    // user_companies row and suppresses a company's history for whoever the
+    // session names — so an unauthenticated caller reaching it would be writing
+    // per-user rows with no user.
+    ["/api/watchlist", {}],
+    [
+      "/api/watchlist",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ company_id: 1 }),
+      },
+    ],
+    [
+      "/api/watchlist",
+      {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ company_id: 1 }),
+      },
+    ],
     // The sealed write. 401 here proves only the outer gate; that the field is
     // refused for a caller who IS signed in is proved by the route reading no
     // identity at all (see the 400 branch in api/companies/[id]/route.ts) and by
@@ -198,7 +235,7 @@ async function gateIsShut() {
   // exempt from the SESSION gate as well. It must redirect to /signin with no
   // cookie exactly like every other page, and the middleware matcher's holes
   // must not have grown a fifth one.
-  for (const path of ["/", "/jobs", "/preferences", "/add", "/onboarding"]) {
+  for (const path of ["/", "/jobs", "/watchlist", "/preferences", "/add", "/onboarding"]) {
     const res = await fetch(`${BASE}${path}`, { redirect: "manual" });
     const location = res.headers.get("location") ?? "";
     check(
@@ -261,13 +298,19 @@ async function main() {
   // scripts/ since 2b, so the request path cannot reach it even by accident; a
   // page or route resolves its user from the session — see lib/guard.ts.
   lib = await loadLib();
-  const { currentUserId, loadPreferences, listCompanyCards, matchingJobsForCompany, openJobsWithMatchFlag } = lib;
+  const { currentUserId, loadPreferences, listWatchedCompanyCards, matchingJobsForCompany, openJobsWithMatchFlag } = lib;
 
   const userId = await currentUserId();
   console.log(`\nlive rows for the operator's account: ${userId}`);
 
   const prefs = await loadPreferences(userId);
-  const companies = await listCompanyCards(userId);
+  // listWatchedCompanyCards, which is what Home and Jobs call since the picker
+  // slice. For this account it returns the same fifty rows the catalog query does
+  // — it watches everything, via scripts/backfill_user_companies.py in Phase 1c —
+  // and that equality is asserted below rather than assumed, because it is the
+  // whole reason the two screens could be narrowed without moving anything the
+  // operator sees.
+  const companies = await listWatchedCompanyCards(userId);
 
   let home: JobView[] = [];
   let all: JobView[] = [];
@@ -400,6 +443,124 @@ async function main() {
     companyMarkup.includes("<select"),
     "and the category select — the one control that legitimately stays — is still there",
   );
+
+  /*
+   * --- Watchlist — the company picker, and what Home now lists --------------
+   *
+   * The control CLAUDE.md called "the next slice" from Phase 1c to here. It is
+   * the Step 5c argument in its strongest form: `user_companies` has existed for
+   * two phases, the digest has read it for two phases, and nothing in the web app
+   * could write it — so a feature that is specified, agreed and not rendered is
+   * not hypothetical here, it is the state this slice found the product in.
+   *
+   * Rendered from the SHIPPED component over the LIVE catalog, three times, for
+   * the three states that behave differently: watching some, watching none, and
+   * at the cap.
+   */
+  console.log("\nWatchlist — the picker");
+  const catalog = (await lib.listCompanies()) as PickerCompany[];
+  const state = await lib.watchlistState(userId);
+  console.log(
+    `  the operator watches ${state.companyIds.length} of ${catalog.length} catalog ` +
+      `companies, on plan '${state.plan}' (cap ${state.cap ?? "none"})`,
+  );
+
+  check(
+    companies.length === state.companyIds.length,
+    `Home lists exactly the ${state.companyIds.length} companies this account watches`,
+    `Home listed ${companies.length}, the watch list holds ${state.companyIds.length}`,
+  );
+  check(
+    catalog.length >= companies.length,
+    `and the catalog the picker browses is the wider list (${catalog.length})`,
+  );
+
+  const picker = renderToStaticMarkup(
+    createElement(WatchlistPicker, {
+      catalog,
+      initialWatched: state.companyIds,
+      cap: state.cap,
+    }),
+  );
+  check(picker.includes('type="search"'), "the picker renders a search box over the catalog");
+  check(
+    picker.includes(`>${catalog[0].name}`) || picker.includes(catalog[0].name),
+    "and the catalog rows themselves — a company you could add is on the screen",
+  );
+  check(
+    /aria-label="(Watch|Stop watching) /.test(picker),
+    "with a per-company control labelled for a screen reader",
+  );
+  check(
+    /already has as seen/.test(picker) || /already<\/em> has as seen/.test(picker),
+    "and it says what adding one does to that company's existing jobs — the second " +
+      "half of tracking, stated where a person can read it",
+    "nothing on the picker explains the history suppression",
+  );
+
+  /*
+   * THE EMPTY STATE, which is what a brand-new account sees. It has to say that
+   * nothing can match — the same fail-closed sentence the city picker prints for
+   * an empty selection, and for the same reason: an account released from
+   * onboarding with no watch list has an empty digest and nothing on screen
+   * explaining why.
+   */
+  const emptyPicker = renderToStaticMarkup(
+    createElement(WatchlistPicker, { catalog, initialWatched: [], cap: lib.FREE_WATCHLIST_CAP }),
+  );
+  check(
+    /not watching any company/.test(emptyPicker),
+    "with none watched the picker says so as an ERROR, not as a neutral note",
+  );
+  check(
+    /msg bad/.test(emptyPicker),
+    "and marks it red — an empty watch list matches nothing, exactly like an empty city list",
+  );
+  check(
+    emptyPicker.includes(`of ${lib.FREE_WATCHLIST_CAP}`),
+    `and the heading states the cap (0 of ${lib.FREE_WATCHLIST_CAP})`,
+  );
+
+  /*
+   * AT THE CAP. The server refuses the sixth add (scripts/watchlist-check proves
+   * that against the live database); this is the half where a person is told
+   * before they press rather than after.
+   */
+  const cappedPicker = renderToStaticMarkup(
+    createElement(WatchlistPicker, {
+      catalog,
+      initialWatched: catalog.slice(0, lib.FREE_WATCHLIST_CAP).map((c) => c.id),
+      cap: lib.FREE_WATCHLIST_CAP,
+    }),
+  );
+  check(
+    cappedPicker.includes("Limit reached"),
+    "at the cap, the Add control on an unwatched company says the limit is reached",
+  );
+  check(
+    /disabled=""/.test(cappedPicker),
+    "and is disabled rather than merely relabelled",
+  );
+  check(
+    cappedPicker.includes("Remove"),
+    "while the companies already watched can still be removed — the cap refuses " +
+      "additions and never takes anything away",
+  );
+
+  /*
+   * THE OVER-CAP ACCOUNT, which is the operator: 50 watched against a free cap of
+   * 5, because the Phase-1c backfill predates the limit by two phases. It must
+   * read as "you cannot add more", never as "some of these are not counting" —
+   * a cap that appeared to have silently trimmed a watch list would be the
+   * cry-wolf failure inverted.
+   */
+  if (state.cap !== null && state.companyIds.length > state.cap) {
+    check(
+      /Nothing has been removed/.test(picker),
+      `an over-cap account (${state.companyIds.length} of ${state.cap}) is told nothing was removed`,
+      "the over-cap notice does not say the existing watch list is intact",
+    );
+  }
 
   // --- PREFERENCES: the delete-account surface ----------------------------
   //
@@ -758,6 +919,44 @@ async function main() {
     /An empty city list matches nothing/.test(blank),
     "and the blank city answer is named inline — fail-closed, said out loud rather than implied",
     "a new account sees no city checkbox ticked and nothing explaining why nothing would match",
+  );
+
+  /*
+   * THE FIFTH SAVE GATE — an account watching no company, since the picker slice.
+   *
+   * PUT /api/preferences refuses that save, because the digest queue asks
+   * `EXISTS (user_companies …)` before it asks anything about a title: an account
+   * watching nothing matches nothing however good its keywords are. This is the
+   * screen saying so before the button is pressed, exactly as the blank range and
+   * the empty city selection do above.
+   */
+  console.log("\nPreferences — the watch-list save gate");
+  //
+  // The keyword list is trimmed to one for these two renders, and that is not
+  // cosmetic: the operator's stored row holds 43 keywords against a KEYWORD_CAP
+  // of 25, so `overCap` fires FIRST in the label chain and the button would read
+  // "Remove 18 keywords to save" whatever the watch list said. Checking the
+  // watch-list gate needs a row on which it is the only unmet condition.
+  const savable = { ...prefs, keywords: ["backend engineer"] };
+  const noCompanies = withRouter(
+    createElement(lib.PreferencesEditor, { initial: savable, resume: null, watchedCount: 0 }),
+  );
+  check(
+    noCompanies.includes("Pick a company to watch to save"),
+    "with nothing watched, Save is disabled and says which answer is missing",
+    "the button did not name the empty watch list",
+  );
+  check(
+    /would match nothing at all/.test(noCompanies) && noCompanies.includes('href="/watchlist"'),
+    "and the message links to the screen that fixes it — the picker is not on THIS page",
+    "a person on /preferences is told to pick companies with no way to get there",
+  );
+  const withCompanies = withRouter(
+    createElement(lib.PreferencesEditor, { initial: savable, resume: null, watchedCount: 3 }),
+  );
+  check(
+    !withCompanies.includes("Pick a company to watch to save"),
+    "and an account that watches something is not blocked by it",
   );
 
   // --- the ordering rule --------------------------------------------------

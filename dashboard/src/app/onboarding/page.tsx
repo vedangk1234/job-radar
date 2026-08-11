@@ -1,9 +1,11 @@
 import { redirect } from "next/navigation";
 
+import { listCompanies } from "@/lib/companies";
 import { requirePage } from "@/lib/guard";
 import { loadPreferences } from "@/lib/preferences";
 import { loadResume } from "@/lib/resume";
-import { PreferencesEditor } from "@/components/PreferencesEditor";
+import { watchlistState } from "@/lib/watchlist";
+import { OnboardingSetup } from "@/components/OnboardingSetup";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -41,28 +43,57 @@ export const dynamic = "force-dynamic";
  * onboarding_completed in the one statement (lib/preferences.savePreferences),
  * and the editor then navigates. /preferences passes no such prop and stays
  * where it is after saving, which is right for a settings screen and wrong here.
+ *
+ * THE WATCH LIST IS PART OF SETUP, SINCE THE PICKER SLICE, AND IT IS THE HALF
+ * THAT WAS MISSING. Everything this screen collected until now narrowed something
+ * — but the digest's first question is not "does this title match" and never was:
+ * it is "is this job at a company you asked about". A person who finished
+ * onboarding watched nothing, so the answer was no for every job on the board and
+ * their digest was empty forever, with a perfectly good filter on the row and a
+ * dashboard showing the whole shared catalog as if it were theirs. The landing
+ * page says "tell us the companies you'd like to watch"; this is where they do.
+ *
+ * SO THE SAVE NOW REQUIRES ONE, and that is a fail-closed choice made on the same
+ * argument as the empty city selection rather than a new kind of rule: an account
+ * that watches nothing matches nothing, and being released onto an empty
+ * dashboard with no explanation is the failure the other four required answers
+ * exist to prevent. The refusal lives in PUT /api/preferences; the button says so
+ * first. See components/OnboardingSetup for why the picker commits immediately
+ * while the filter waits for Save.
  */
 export default async function OnboardingPage() {
   // The one page allowed past its own gate — see the enumerated holes in
   // lib/guard.requirePage. Gated, it would redirect to itself forever.
   const { userId } = await requirePage({ allowUnfinishedOnboarding: true });
 
-  const [preferences, resume] = await Promise.all([loadPreferences(userId), loadResume(userId)]);
+  const [preferences, resume, catalog, watchlist] = await Promise.all([
+    loadPreferences(userId),
+    loadResume(userId),
+    listCompanies(),
+    watchlistState(userId),
+  ]);
 
   if (preferences.onboarding_completed) redirect("/");
 
   return (
     <>
-      <h1>Set up your filter</h1>
+      <h1>Set up your radar</h1>
       <p className="lede">
-        Two things decide what reaches your inbox: the keywords below and how much experience
-        you are looking for. A job title has to contain at least one keyword, and the years its
-        description asks for have to fall inside your range — so both are yours to write, and
-        nothing has been chosen for you. Upload your resume and we will read it once and suggest
-        some keywords, or type your own. Save when it looks right and the dashboard opens; you
-        can change any of this later.
+        Two things decide what reaches your inbox. First, the companies you watch — we crawl
+        every board below hourly, and you hear about the ones you pick. Then the filter: a job
+        title has to contain at least one of your keywords, and the years its description asks
+        for have to fall inside your range. Both are yours to write, and nothing has been chosen
+        for you. Upload your resume and we will read it once and suggest some keywords, or type
+        your own. Save when it looks right and the dashboard opens; you can change any of this
+        later.
       </p>
-      <PreferencesEditor initial={preferences} resume={resume} redirectOnSave="/" />
+      <OnboardingSetup
+        preferences={preferences}
+        resume={resume}
+        catalog={catalog}
+        initialWatched={watchlist.companyIds}
+        cap={watchlist.cap}
+      />
     </>
   );
 }

@@ -381,9 +381,18 @@ dashboard used to let any signed-in account write `companies.tracked` from a
 toggle on every company row — a per-install flag edited through a control that
 looked like a personal setting, which is precisely the confusion this paragraph
 warns about, shipped. The write is gone (see *Writes the dashboard is allowed to
-make*). Nothing in the web app writes either column yet: `user_companies` is
-still created only by `scripts/track_companies.py`, and the picker that will
-create it is the next slice.
+make*), and `companies.tracked` is still sealed.
+
+**The web app writes this table since the watch-list slice, and it is the only
+per-user table it writes.** `dashboard/src/lib/watchlist.ts` is the writer —
+`watchCompany` / `unwatchCompany`, reached from `POST` / `DELETE /api/watchlist`
+and from the picker on `/watchlist` and `/onboarding`. It is a **port of
+`db/watchlist.track_companies`**, not a second design: the two statements are
+compared normalised, in both directions, by `tests/test_watchlist_write.py`,
+because there is no API between the runtimes and a Vercel request cannot call
+Python. The same file seals the table to that one module — no other file under
+`dashboard/src` may write `user_companies` or `user_job_notifications`, for the
+reason the bulk `INSERT` was deleted in 1e.
 
 `db/watchlist.py` holds the statements (so the tests exercise what production
 runs) and `scripts/backfill_user_companies.py` is the seed — the same MY_EMAIL
@@ -1223,15 +1232,24 @@ Bangalore job in July may have one in August.
 
 Next.js App Router + TypeScript in `dashboard/`. Read-mostly.
 
-- **Home (`/`)** — per-company collapsible rows showing **matches only**, with a
-  "for you" count per company and, once there is one, an "N applied" count
-  beside it. Whether a job has been emailed is deliberately *not* part of this
+- **Home (`/`)** — per-company collapsible rows showing **matches only**, over
+  **the companies this account watches** (since the watch-list slice; it was the
+  whole shared catalog before), with a "for you" count per company and, once
+  there is one, an "N applied" count beside it. Whether a job has been emailed is deliberately *not* part of this
   filter, in either its old global form or the per-user one: Home answers "what
   fits me right now", not "what has not been emailed yet" — a job sent in this
   morning's digest is still worth applying to this afternoon. It is shown as a
   badge instead. Every job row carries an **Applied** checkbox.
+- **Watchlist (`/watchlist`)** — the **company picker**: browse and search the
+  full shared catalog, add or remove companies from **your** `user_companies`
+  rows. The write path the app never had. Adding one records that company's
+  stored jobs as already-seen for you in the same transaction, and the screen
+  says how many. A free account may watch **5**; the limit is enforced in
+  `lib/watchlist.watchCompany`, inside that transaction, and the picker only
+  greys the buttons.
 - **Jobs (`/jobs`)** — literally the same component with one prop different
-  (`mode="all"`), showing every open posting unfiltered. This is the screen that
+  (`mode="all"`), showing every open posting unfiltered, over the same watched
+  companies Home lists. This is the screen that
   answers "did the crawler miss it, or did the filter drop it?". In this mode
   each job additionally shows its `status` and a SUGGESTED badge if it also
   passes the filter. There is no Applied checkbox here: this screen is the raw
@@ -1245,10 +1263,13 @@ Next.js App Router + TypeScript in `dashboard/`. Read-mostly.
 - **Preferences (`/preferences`)** — edits **this user's** `preferences` row,
   found by owner since 1b rather than at `id = 1`. `PUT` rather than `PATCH`,
   because the editor sends the full lists it is showing.
-- **Onboarding (`/onboarding`)** — the same `PreferencesEditor`, with setup copy
-  and no delete-account section, and the one page `requirePage()` lets past its
-  own gate. It redirects to Home the moment `onboarding_completed` is TRUE, so an
-  onboarded account cannot sit on a setup screen.
+- **Onboarding (`/onboarding`)** — the same `WatchlistPicker` and the same
+  `PreferencesEditor` (wrapped by `OnboardingSetup`, which carries one number
+  between them), with setup copy and no delete-account section, and the one page
+  `requirePage()` lets past its own gate. It redirects to Home the moment
+  `onboarding_completed` is TRUE, so an onboarded account cannot sit on a setup
+  screen. **A save is refused while the account watches no company** — see *The
+  onboarding gate*.
 
 ### The onboarding gate
 
@@ -1270,28 +1291,53 @@ and erasure is a right that does not wait on a filter**) and
 `/preferences` opens no way round the gate: the flag is set by a save, and a save
 there is the same editor writing the same row through the same statement.
 
+**Since the watch-list slice, finishing onboarding also requires watching at
+least one company.** `PUT /api/preferences` refuses the save otherwise, which
+makes it the fifth member of the family that already holds the city answer, the
+keyword list, the experience range and the work arrangement — and the one the
+queue asks *first*: `CANDIDATES_SQL` opens with `EXISTS (user_companies …)`, so
+an account watching nothing matches nothing however good its keywords are. Before
+the picker existed **every** account that completed onboarding was in exactly
+that state, which is what the slice fixes. The alternative — auto-watching the
+catalog for a new account — is the archive dump with a friendly face and the
+seeded-defaults mistake Slices 1b and 1c removed from the preferences row, so the
+answer is fail-closed, as it is for the city selection. The editor greys Save and
+says which answer is missing; `/preferences` has no picker on it, so the message
+there links to `/watchlist`.
+
 **API routes are deliberately not gated.** `PUT /api/preferences` is the only
 exit from onboarding, so a second exemption list would have its first mistake
 seal the only door; the data routes are already scoped to the caller's own id.
+`POST /api/watchlist` is deliberately in that ungated set for the same reason it
+has to be: an account mid-onboarding has to be able to pick companies, and every
+statement behind it is bound to the caller's own `userId`.
 Sign-in, the callback and sign-out are untouched by construction rather than by
 exemption — none of them calls a guard.
 
-**The company list is still the shared catalog, on both screens.** Phase 1 made
-the watch list per-user in the database and stopped there on purpose — 1f moved
-the badge and explicitly left the company list alone. So the dashboard shows
-every catalog company rather than the ones you track, and there is no picker for
-adding or removing one. `scripts/track_companies.py` is the only supported way to
-create a tracking row until that screen exists (Phase 3). Worth knowing because
-the two halves now disagree: a company can be visible on Home, crawled hourly,
-full of matching jobs, and still in nobody's digest.
+**The company list on Home and Jobs is the watch list, and the catalog moved to
+its own screen.** Phase 1 made the watch list per-user in the database and
+stopped there on purpose — 1f moved the badge and explicitly left the company
+list alone — so for two phases both screens showed every catalog company while
+the digest read `user_companies`, and a company could be visible on Home, crawled
+hourly, full of matching jobs, and in nobody's digest. The watch-list slice closed
+that: `lib/companies.listWatchedCompanyCards` is what both pages call, and
+`/watchlist` browses the full catalog.
 
-**Each row on that list is now entirely read-only except its category tag.**
-Until Phase 3 Slice 1a it also carried a switch writing `companies.tracked`,
-which is a catalog-wide crawl flag and not a per-account setting — so on a screen
-that shows everybody the same shared list, one user could stop the crawl for all
-of them. Removing it leaves the pill as a label. The control that *should* live
-here is a watch-list picker writing `user_companies`, and that is the next slice;
-the seal is deliberately not a stand-in for it.
+**Which of the two lists a screen should show is decided by whether it prints a
+per-user number.** Home and Jobs do — a "for you" count over a company you do not
+watch counts jobs that can never reach your inbox — so they follow the person. The
+picker, `GET /api/companies` and the Add flow do not, so they still see the shared
+catalog. Nothing is hidden by the narrowing; it moved to the screen whose question
+it answers.
+
+**Each row on Home and Jobs is read-only except its category tag.** Until Phase 3
+Slice 1a it also carried a switch writing `companies.tracked`, which is a
+catalog-wide crawl flag and not a per-account setting — so on a screen that shows
+everybody the same shared list, one user could stop the crawl for all of them.
+Removing it left the pill as a label, and the note there said the control that
+*should* live on a company row is a watch-list picker writing `user_companies`.
+That is what `/watchlist` now is; `companies.tracked` stays sealed, and the two
+have never been the same axis.
 
 Both screens ship only counts, never job rows: sending ~790 rows of JSON with
 the page to render twelve numbers would be wasted, and eleven of twelve rows
@@ -1316,6 +1362,7 @@ Guard 3 (`miss_count >= 3`) disappears from both screens.
 | `jobs.ts` | the two job queries and `setApplied` — the app's only write to `jobs` |
 | `companies.ts` | shared company queries + `upsertCompany`; read by routes *and* by server components directly |
 | `preferences.ts` | load/save this user's row, `cleanList` |
+| `watchlist.ts` | the per-user watch list: `watchCompany` (pair + history suppression, one transaction, per-plan cap), `unwatchCompany`, `watchesAnything`. The port of `db/watchlist.py` + `db/notifications.SUPPRESS_COMPANY_HISTORY_SQL` |
 | `currentUser.ts` | the MY_EMAIL → `public.users.id` bridge, memoised. **Temporary; deleted at Phase 2 auth** |
 | `labels.ts` | `Preferences`, `CITY_LABELS`, `KEYWORD_CAP`, `DEFAULT_PREFERENCES` (the install's filter, mirrored from Python) and `NEW_ACCOUNT_SEED` (what a signup actually gets) — **constants with no database import** |
 | `match.ts` | the port of `notify/match.py` |
@@ -1438,13 +1485,22 @@ session reads. The two must name the same person and nothing checks that they do
 Phase 2 replaces with a session carrying a real user id.
 
 **Writes the dashboard is allowed to make**, and nothing else:
-`companies.category`, this user's `preferences` row, inserting a company, and
-`jobs.applied` / `jobs.applied_at`. Everything else
+`companies.category`, this user's `preferences` row, inserting a company,
+`jobs.applied` / `jobs.applied_at`, and — since the watch-list slice — **this
+user's `user_companies` rows, together with the `user_job_notifications` rows
+that suppress a newly-watched company's history**. Everything else
 about a job stays read-only — the crawler owns the lifecycle, and a dashboard
 able to edit `seeded` or `status` could silently un-send or re-send a digest.
-Note what is *not* on that list: `user_companies` and `user_job_notifications`.
-The dashboard reads the second (for the badge) and neither reads nor writes the
-first, so it cannot subscribe you to a company and cannot mark a job as sent.
+
+The two per-user tables arrived on that list together and could not have arrived
+separately: creating a tracking row without the suppression is the archive-dump
+failure, so a picker that could write only the first would be worse than no
+picker. They are written from `lib/watchlist.ts` and nowhere else —
+`tests/test_watchlist_write.py` sweeps `dashboard/src` for any other `INSERT`,
+`UPDATE` or `DELETE` against either table — and the notification rows it may write
+are exactly the suppression ones. **The dashboard still cannot mark a job as
+sent**: `record_sent` is the digest's, and nothing in the web app writes a
+`notifications` receipt.
 The applied pair is not a hole in that rule but the other side of it: those two
 columns record something no crawl can observe, so nothing but the dashboard
 could write them. `lib/jobs.setApplied` is the one statement in the app that
@@ -1555,6 +1611,7 @@ the two languages; both are about a thing being *true against the real database*
 | `npm run db:check` | does the transaction pooler actually work? Several parameterised and concurrent queries in a row, not one `SELECT 1` — the prepared-statement failure is never the first query, it is the second or third |
 | `npm run config-roundtrip` | does a company added through the dashboard store `config` as a jsonb **object**? |
 | `npm run badge-check` | is the NEW / NOTIFIED badge genuinely **per-user**? |
+| `npm run watchlist-check` | does adding a company do **both halves** — the pair *and* the history suppression — and does the cap refuse the sixth without writing anything? |
 
 `badge-check` is the Phase-1f/1g check and is shaped by what it cannot prove from
 one account. §1 asserts the drop actually happened — `jobs` has no `notified` and
@@ -1570,6 +1627,20 @@ re-counts outside the transaction to verify the rollback rather than assuming it
 imports `lib/jobs.notifiedToUser` and `lib/badges.homeBadge` themselves rather
 than restating them, which is the same discipline `match-parity` enforces one
 language over: a check that restates the rule proves a copy of it.
+
+`watchlist-check` is shaped by the same problem `badge-check` has — the thing
+under test cannot be seen from the account that already exists. The operator
+watches all 50 companies and has for two phases, so "adding a company suppresses
+its history" is unobservable there; the check creates a throwaway account through
+`linkUser`, adds the company with the most stored rows, and then asks the digest's
+own four clauses of it. The number it prints is the point: **1,180 rows recorded
+as already-seen, and a queue of 0 against the 212 open non-seeded rows that would
+otherwise have been that account's first email**. It then re-adds (0 suppressed),
+fills the watch list to the cap, and asserts the sixth add is refused *and* wrote
+nothing — the refusal is a throw inside the transaction, so the pair it had
+already inserted rolls back with it. Real rows, deleted in a `finally`, for the
+reason `onboarding-check` documents; the operator's counts are snapshotted before
+and after.
 
 `config-roundtrip` is the Step 5e bug turned into a test, and its assertion is
 deliberately not "what I put in comes back out" — that would have **passed**
@@ -2778,6 +2849,75 @@ Newest last. Append here as the project evolves.
   1,468 pytest pass, 1 skipped (82 new in `tests/test_salary.py`), typecheck clean,
   `onboarding-check` green.
 
+- **2026-08-11 — Phase 3, the watch-list slice. The picker, and the write path
+  the app never had.** `user_companies` has existed since Phase 1c and the digest
+  queue has read it since 1e, and until this commit **nothing in the web app
+  wrote it**: `scripts/track_companies.py` was its only creator. So a new account
+  watched nothing, its queue's first clause was false for every job on the board,
+  and its digest was empty forever — while Home showed it all 50 catalog
+  companies with per-user match counts on them, as though those were its
+  companies. The landing page has said "tell us the companies you'd like to
+  watch" the whole time.
+
+  **`lib/watchlist.ts` is the writer and it is a PORT, not a new design.**
+  `watchCompany` is `db/watchlist.track_companies` for one id: the pair
+  (`ON CONFLICT DO NOTHING RETURNING`) and the history suppression
+  (`db/notifications.SUPPRESS_COMPANY_HISTORY_SQL`) in **one transaction**, the
+  second running **only on a genuine insert**. Both statements are compared
+  normalised against the Python by `tests/test_watchlist_write.py`, which also
+  asserts the suppression is not scoped to open rows, that both statements run on
+  the transaction handle rather than the pool (bound to `sql` inside `sql.begin`
+  they would run on another connection and the atomicity would be decorative),
+  and that the already-watching branch RETURNS rather than falling through into
+  the suppression it exists to skip. Seven mutations were run against those
+  guards and all seven were caught.
+
+  **The number this slice turns on: 1,180 and 0.** Adding Continental — 1,180
+  stored jobs, 212 of them open and not back catalogue — to a fresh account
+  recorded 1,180 rows as already-seen and left that account's queue at **zero**.
+  Without the second half those 212 would have been its first email.
+  `npm run watchlist-check` is that run, against the live database, plus: a
+  re-add suppresses 0, an untrack leaves the suppression rows alone (otherwise a
+  toggle twice re-delivers everything in between), and the sixth company is
+  refused with **nothing written**, because the refusal is a throw inside the
+  transaction that had already inserted the pair.
+
+  **Home and Jobs moved to the watch list; the catalog moved to `/watchlist`.**
+  The rule is not "narrow everything" — it is that a screen printing a per-user
+  number has to follow the person, because a "for you" count over a company you
+  do not watch counts jobs that can never arrive. `GET /api/companies`, the Add
+  flow and the picker itself still see the shared catalog.
+
+  **"Watch up to 5 companies" was on the pricing card and enforced nowhere.** It
+  is now `FREE_WATCHLIST_CAP`, read from `public.users.plan`, checked inside
+  `watchCompany`'s transaction — with a test asserting the constant and the
+  landing copy state the same number, because a cap raised in one and not the
+  other is a promise the product quietly stops keeping. It refuses **additions
+  only**: the operator watches 50, put there by the Phase-1c backfill two phases
+  before any limit existed, and a cap that trimmed a watch list would silence a
+  digest that has been running for months.
+
+  **Onboarding gained a fifth required answer**, fail-closed like the city
+  selection: `PUT /api/preferences` refuses a save from an account watching
+  nothing. Auto-watching the catalog instead would be the seeded-defaults mistake
+  1b and 1c removed, one table over. The picker sits above the editor on
+  `/onboarding` and commits immediately (the suppression is a transaction, not a
+  staged edit) while the filter still waits for Save — the asymmetry the resume
+  panel already established on that screen.
+
+  **Nothing about the operator's account moved, and that is measured.**
+  `match-parity` **34 before and 34 after** over 7,852 live rows × 15 filters;
+  they watch every catalog company, so their Home is the same fifty rows either
+  query produces — asserted in `ui-check` rather than assumed. 1,547 pytest pass
+  (69 new), typecheck and `next build` clean, `ui-check` +24 assertions over the
+  shipped picker and the three new 401s, `onboarding-check` and `badge-check`
+  green.
+
+  Deliberately **not** here: `companies.tracked` (still sealed, still the
+  crawler's), `is_active` (a new account still cannot receive email until a
+  sending domain is verified — see *Pending*), the matchers, the crawler, and the
+  Python watch-list path, which is unchanged and still the CLI.
+
 **Pending**
 
 - **The Slice A relabel has never been applied to live Postgres, and the deployed
@@ -2835,14 +2975,22 @@ Newest last. Append here as the project evolves.
   them. That is not a fix, and reading it as one would be a mistake — the install's
   own row has the toggle ON, so for the account that actually exists the leak is
   exactly as open as it was.
-- **Nothing creates a `user_companies` row except `scripts/track_companies.py`.**
+- **A swept-in company still reaches nobody's digest until somebody watches it.**
   The discovery sweep and the dashboard's Add screen both write `companies` and
-  stop there, which is the right default — auto-subscribing every account to
-  whatever a sweep found is the archive dump with a different trigger — but it
-  means a company can now be in the catalog, crawled hourly, full of matching
-  jobs, and in nobody's digest. Since Step 7 the sweep is how most companies
-  arrive. Run `track_companies.py --email … --company-ids …` after a sweep, or
-  build the picker (Phase 3) and stop having to remember.
+  stop there, which remains the right default — auto-subscribing every account to
+  whatever a sweep found is the archive dump with a different trigger. What
+  changed with the picker is who can do something about it: `/watchlist` shows the
+  whole catalog, so a newly-swept company is visible and one click from being
+  watched, and `scripts/track_companies.py` is no longer the only way. The
+  operator's own account still watches all 50 and is unaffected either way.
+- **A new account is `is_active = FALSE`, so finishing onboarding still does not
+  produce an email.** That is a different axis from this slice and deliberately
+  untouched: `notify/digest.assert_self_send` refuses any recipient other than
+  `MY_EMAIL` while `FROM_EMAIL` is Resend's sandbox sender, so a new account with
+  `is_active` TRUE would enter the fan-out, fail, and turn the cron's "Send the
+  digests" step permanently red for everybody. Verifying a sending domain (2d) is
+  what flips it. Worth stating beside the watch list because the two together are
+  what "a new user gets a digest" needs, and only one of them is now true.
 - **Enrichment is scoped to the MY_EMAIL user's filter**, because
   `enrich_matches` is a crawl entrypoint and needs *a* preferences row to pick
   title-stage matches. Harmless with one account. With a second account whose

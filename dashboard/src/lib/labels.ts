@@ -141,6 +141,53 @@ export const SALARY_BAND_VALUES: readonly string[] = SALARY_BAND_OPTIONS.map((o)
 export const KEYWORD_CAP = 25;
 
 /**
+ * HOW MANY COMPANIES A FREE ACCOUNT MAY WATCH — the pricing card's promise, made
+ * enforceable.
+ *
+ * The number is not chosen here. The landing page has said "Watch up to 5
+ * companies" under the Free tier since the pricing section shipped, and until the
+ * watch-list picker existed there was nothing anywhere that could enforce it —
+ * `user_companies` had no writer in the web app at all, so the limit was a
+ * sentence on a marketing page rather than a rule. This constant is that sentence,
+ * moved to where the write happens; app/signin/page.tsx and this line have to say
+ * the same number, and `tests/test_watchlist_write.py` asserts that they do.
+ *
+ * ENFORCED IN lib/watchlist.watchCompany AND NOT ONLY IN THE PICKER, for the
+ * reason KEYWORD_CAP is enforced in the route rather than only in the editor: a
+ * cap that lives in the browser is a suggestion to anyone holding curl. The
+ * server-side half is the real one; the picker greys out the Add buttons so a
+ * person is told before they press rather than after.
+ *
+ * IT REFUSES ADDITIONS AND NEVER REMOVES ANYTHING, and that asymmetry is
+ * deliberate rather than an omission. The operator's account watches all 50
+ * catalog companies (scripts/backfill_user_companies.py put them there in Phase
+ * 1c, long before any limit existed), and a cap that trimmed a watch list to fit
+ * would silence a digest that has been running for months — the cry-wolf failure
+ * inverted. An over-cap account keeps every row it has, sees them all on Home,
+ * and simply cannot add another.
+ */
+export const FREE_WATCHLIST_CAP = 5;
+
+/**
+ * How many companies THIS account may watch, from `public.users.plan`.
+ *
+ * `null` means no limit. The column is `TEXT NOT NULL DEFAULT 'free'` with no
+ * CHECK (db/schema.sql, matching companies.category), so every account on this
+ * install is `free` today and the paid tiers are a pricing page rather than a
+ * product — see the landing copy, which says so out loud.
+ *
+ * UNKNOWN PLANS ARE UNLIMITED RATHER THAN CAPPED, which is the one judgement call
+ * in this function. The alternative — anything not recognised gets the free cap —
+ * fails in the direction that takes something away from a person who paid, on the
+ * strength of a string this file has never heard of. A cap wrongly not applied
+ * costs some rows in a table; a cap wrongly applied is somebody's paid watch list
+ * refusing to grow with a message about a free tier they are not on.
+ */
+export function watchlistCapForPlan(plan: string | null | undefined): number | null {
+  return (plan ?? "free").trim().toLowerCase() === "free" ? FREE_WATCHLIST_CAP : null;
+}
+
+/**
  * The stored resume, as the profile screen shows it.
  *
  * Here rather than in lib/resume.ts for the reason this whole file exists: the

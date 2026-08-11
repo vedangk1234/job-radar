@@ -6,7 +6,11 @@ WHAT THIS SEALS, AND WHY IT WAS A HOLE RATHER THAN A ROUGH EDGE
 `FROM companies WHERE tracked = TRUE`, so the column is ONE SHARED VALUE for the
 whole install. It is not a preference, it has no owner, and nothing about it is
 per-user — the per-user thing is `user_companies`, a different table on a
-different axis, which no route writes yet.
+different axis, which since the watch-list slice the dashboard DOES write, from
+its own route and its own module (see tests/test_watchlist_write.py). That the
+picker exists is what makes this seal load-bearing rather than merely tidy: there
+is now a per-company control on screen again, and the whole point is that it
+writes the person's row and not the install's flag.
 
 Until this commit every company row on Home and Jobs carried a checkbox that
 PATCHed it. The route behind that checkbox gates on lib/guard.requireSession(),

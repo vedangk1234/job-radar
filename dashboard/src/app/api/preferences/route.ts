@@ -10,6 +10,7 @@ import {
 } from "@/lib/labels";
 import { NON_INDIA_LABEL } from "@/lib/match";
 import { cleanList, KEYWORD_CAP, loadPreferences, savePreferences } from "@/lib/preferences";
+import { watchesAnything } from "@/lib/watchlist";
 
 /**
  * Tick-one-get-all, applied at the ROUTE and not only in the browser.
@@ -348,6 +349,46 @@ export async function PUT(request: Request) {
     if (!Number.isInteger(yearsHeld) || yearsHeld < 0 || yearsHeld > 50) {
       return badRequest("years_of_experience_held must be null or a whole number from 0 to 50");
     }
+  }
+
+  /*
+   * THE WATCH LIST — REQUIRED, AND IT IS THE FIFTH MEMBER OF THE FAMILY ABOVE
+   * RATHER THAN A NEW KIND OF RULE.
+   *
+   * Every other refusal in this route guards the same failure: a row that matches
+   * no job at all, producing a digest that goes quiet and reads as "nothing was
+   * posted". An empty watch list is that failure in its purest form, and it does
+   * not even need a matcher to produce it — notify/store.CANDIDATES_SQL asks
+   * `EXISTS (user_companies …)` FIRST, so an account watching nothing has an empty
+   * queue however good its keywords are.
+   *
+   * IT IS ALSO WHAT THIS SLICE EXISTS TO FIX. Until the picker there was no writer
+   * for that table in the web app at all, so EVERY account that completed
+   * onboarding was in exactly this state — filter chosen, inbox permanently empty,
+   * and a Home screen showing the whole shared catalog as though those companies
+   * were theirs. Letting a save through without one would leave the hole open on
+   * the commit that built the control for closing it.
+   *
+   * WHY REFUSE RATHER THAN DEFAULT TO SOMETHING. The obvious alternative is to
+   * auto-watch the catalog (or its top N) for a new account, and it is the
+   * archive-dump failure with a friendly face: fifty companies' stored history
+   * suppressed on somebody's behalf, a digest whose contents nobody chose, and the
+   * "seeded defaults" mistake Slices 1b and 1c spent two commits removing from the
+   * preferences row. Fail-closed is the same answer the city selection gets, for
+   * the same reason.
+   *
+   * CHECKED LAST, after every field-level validation, so a body that is also
+   * malformed is told about the malformation first — this is the one refusal here
+   * that is about the STATE of the account rather than about the request, and
+   * reporting it before a typo'd city label would send somebody to the wrong
+   * screen.
+   */
+  if (!(await watchesAnything(gate.session.userId))) {
+    return badRequest(
+      "you are not watching any company, so this filter would match nothing at all. " +
+        "Pick at least one on the Watchlist tab and save again — your digest is built " +
+        "from the companies you watch first, and the filter narrows those.",
+    );
   }
 
   try {

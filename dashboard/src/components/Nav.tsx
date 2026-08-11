@@ -7,10 +7,16 @@ import { signOutEverywhere } from "@/app/actions";
 
 // Home first because it is the default page and the one worth opening: it
 // answers "what should I apply to today". Jobs is the unfiltered reference next
-// to it, and the two settings tabs sit after both.
+// to it, and the settings tabs sit after both.
+//
+// Watchlist sits between the two views and the two settings screens, which is
+// where it belongs in both directions: it decides what Home and Jobs are lists
+// OF, and it is edited about as often as the filter is. It is deliberately not
+// called "Companies" — the catalog is shared and this tab is about yours.
 const TABS = [
   { href: "/", label: "Home" },
   { href: "/jobs", label: "Jobs" },
+  { href: "/watchlist", label: "Watchlist" },
   { href: "/add", label: "Add" },
   { href: "/preferences", label: "Preferences" },
 ];

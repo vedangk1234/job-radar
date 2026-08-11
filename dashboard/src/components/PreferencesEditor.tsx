@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
@@ -58,10 +59,30 @@ export function PreferencesEditor({
   initial,
   resume,
   redirectOnSave,
+  watchedCount,
 }: {
   initial: Preferences;
   resume: StoredResume | null;
   redirectOnSave?: string;
+  /**
+   * HOW MANY COMPANIES THIS ACCOUNT WATCHES, since the picker slice — the fifth
+   * member of the family this button already gates on (city answer, keywords,
+   * experience range, work arrangement).
+   *
+   * It belongs here for the same reason those four do: PUT /api/preferences
+   * refuses a save that would leave the account matching nothing, and this is the
+   * screen saying why before somebody presses. An empty watch list matches
+   * nothing by construction rather than by rule — the digest queue's first clause
+   * is `EXISTS (user_companies …)` — so an onboarded account without one gets an
+   * empty digest and a blank Home with nothing on screen explaining it.
+   *
+   * A COUNT, NOT THE LIST, and optional. This editor has no business knowing what
+   * a watch list is; it needs to know whether there is one. Undefined means "the
+   * caller is not telling me", and the gate is then not applied — the route still
+   * refuses, so the rule holds either way and no caller can accidentally weaken
+   * it by omission.
+   */
+  watchedCount?: number;
 }) {
   const router = useRouter();
 
@@ -194,6 +215,13 @@ export function PreferencesEditor({
    * as noCityAnswer and rangeInvalid are. The server is where the rule LIVES.
    */
   const noWorkModeAnswer = workModes.length === 0;
+
+  /*
+   * And the fifth: an account watching no company matches nothing, whatever else
+   * is on this screen. `undefined` means the caller did not say, and an unstated
+   * count is not a claim that the list is empty — see the prop's own comment.
+   */
+  const noCompaniesWatched = watchedCount !== undefined && watchedCount === 0;
 
   /*
    * The same rule PUT /api/preferences enforces, restated for the button. The
@@ -449,6 +477,22 @@ export function PreferencesEditor({
         </select>
       </div>
 
+      {/*
+        Said in words as well as on the button, because the fix is on ANOTHER
+        SCREEN when this editor is /preferences — there is no picker here to
+        point at, and a greyed button reading "pick a company to watch" with no
+        company control in sight is the kind of dead end this project's other
+        blank-answer messages exist to avoid. On /onboarding the picker is
+        directly above and the link is simply redundant rather than wrong.
+      */}
+      {noCompaniesWatched ? (
+        <p className="msg bad">
+          You are not watching any company, so this filter would match nothing at all — the
+          digest asks for jobs at the companies you watch first, and there are none.{" "}
+          <Link href="/watchlist">Pick some on the Watchlist tab</Link>, then save.
+        </p>
+      ) : null}
+
       <div
         className="panel"
         style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap" }}
@@ -464,7 +508,13 @@ export function PreferencesEditor({
           className="primary"
           onClick={save}
           disabled={
-            busy || !dirty || overCap || rangeInvalid || noCityAnswer || noWorkModeAnswer
+            busy ||
+            !dirty ||
+            overCap ||
+            rangeInvalid ||
+            noCityAnswer ||
+            noWorkModeAnswer ||
+            noCompaniesWatched
           }
         >
           {busy
@@ -479,6 +529,8 @@ export function PreferencesEditor({
                   ? "Pick a city to save"
                   : noWorkModeAnswer
                     ? "Pick a work arrangement to save"
+                    : noCompaniesWatched
+                      ? "Pick a company to watch to save"
                   : dirty
                     ? "Save preferences"
                     : "No changes"}

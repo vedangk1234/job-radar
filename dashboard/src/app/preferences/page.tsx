@@ -53,9 +53,23 @@ export default async function PreferencesPage({
       <p className="lede">
         The single row that decides what reaches your inbox. The jobs table stores everything,
         every city, unfiltered; this is the only thing that narrows it. The crawler reads it on
-        every digest, so a save here is live on the next run — no redeploy, no commit.
+        every digest, so a save here is live on the next run — no redeploy, no commit. Which
+        companies it narrows is the other half, and that lives on the Watchlist tab.
       </p>
-      <PreferencesEditor initial={preferences} resume={resume} />
+      {/*
+        watchedCount comes off the footprint that is already being loaded for the
+        delete section below — `accountFootprint().companies` IS the count of
+        user_companies rows — so the fifth save gate costs this page no query at
+        all. It is passed here as well as on /onboarding because the rule is
+        enforced by the route for every caller, and a Save that is refused by the
+        server while the button looks willing is the failure the other four gates
+        already avoid.
+      */}
+      <PreferencesEditor
+        initial={preferences}
+        resume={resume}
+        watchedCount={footprint.companies}
+      />
 
       <hr className="rule" />
 

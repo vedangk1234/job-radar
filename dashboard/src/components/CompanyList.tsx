@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useId, useMemo, useState } from "react";
+import { useCallback, useId, useMemo, useState, type ReactNode } from "react";
 
 import { JobLine, type Mode } from "@/components/JobLine";
 import type { CompanyCard } from "@/lib/companies";
@@ -31,7 +31,23 @@ import { CATEGORIES } from "@/lib/labels";
 // diverge. Importers of this file kept the name they had.
 export type { Mode };
 
-export function CompanyList({ initial, mode }: { initial: CompanyCard[]; mode: Mode }) {
+export function CompanyList({
+  initial,
+  mode,
+  empty,
+}: {
+  initial: CompanyCard[];
+  mode: Mode;
+  /**
+   * What to say when there is nothing to list, since both screens became
+   * watch-list-scoped. It is a prop rather than a string in here because the two
+   * callers now have genuinely different reasons for an empty list — "you watch
+   * nothing" is a thing a person fixes on /watchlist, and the old message ("run
+   * seed_companies.py") answered a question only the operator of an empty
+   * database could have. Defaulted, so an empty catalog still explains itself.
+   */
+  empty?: ReactNode;
+}) {
   const [rows, setRows] = useState(initial);
   const [error, setError] = useState<string | null>(null);
 
@@ -45,8 +61,12 @@ export function CompanyList({ initial, mode }: { initial: CompanyCard[]; mode: M
   if (!rows.length) {
     return (
       <p className="msg warn">
-        No companies yet. Add one on the Add tab, or run{" "}
-        <code>python scripts/seed_companies.py</code>.
+        {empty ?? (
+          <>
+            No companies yet. Add one on the Add tab, or run{" "}
+            <code>python scripts/seed_companies.py</code>.
+          </>
+        )}
       </p>
     );
   }
