@@ -75,7 +75,7 @@ export async function loadPreferences(userId: string): Promise<Preferences> {
     SELECT cities, selected_cities, all_india,
            keywords, exclusions, max_level,
            exp_range_low, exp_range_high, years_of_experience_held,
-           show_no_experience_jobs, work_modes,
+           show_no_experience_jobs, work_modes, salary_bands,
            updated_at, onboarding_completed
       FROM preferences
      WHERE user_id = ${userId}
@@ -172,6 +172,7 @@ export async function savePreferences(
     years_of_experience_held: number | null;
     show_no_experience_jobs: boolean;
     work_modes: string[];
+    salary_bands: string[];
   },
 ): Promise<Preferences> {
   const [row] = await sql<Preferences[]>`
@@ -187,13 +188,14 @@ export async function savePreferences(
            years_of_experience_held = ${next.years_of_experience_held},
            show_no_experience_jobs  = ${next.show_no_experience_jobs},
            work_modes               = ${next.work_modes}::text[],
+           salary_bands             = ${next.salary_bands}::text[],
            onboarding_completed     = TRUE,
            updated_at               = now()
      WHERE user_id = ${userId}
     RETURNING cities, selected_cities, all_india,
               keywords, exclusions, max_level,
               exp_range_low, exp_range_high, years_of_experience_held,
-              show_no_experience_jobs, work_modes,
+              show_no_experience_jobs, work_modes, salary_bands,
               updated_at, onboarding_completed
   `;
   if (!row) return explainMissingRow();

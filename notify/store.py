@@ -98,9 +98,19 @@ from .match import Preferences
 # the fourth member of the family that matches NOTHING when blank — with the
 # unconfigured experience range and the blank city answer — and PUT
 # /api/preferences refuses to save an empty one for exactly that reason.
+#
+# ELEVEN SINCE THE SALARY SLICE. salary_bands is the multi-select of pay bands
+# this account will accept, read by notify.match.salary_ok. It is the one member
+# of this list that is NOT fail-closed when blank: an empty selection means "do
+# not filter on pay" rather than "match nothing", which is the opposite of what
+# work_modes, selected_cities and the experience range do. See salary_ok for the
+# argument — briefly, the job side of this rule is silent on ~100% of the board,
+# so blank is the filter's resting state rather than an unanswered question, and
+# fail-closed here could not produce the empty-digest failure the other three are
+# arranged against because it would empty nothing.
 PREFERENCES_SQL = (
     "SELECT cities, selected_cities, all_india, keywords, exclusions, max_level, "
-    "exp_range_low, exp_range_high, show_no_experience_jobs, work_modes "
+    "exp_range_low, exp_range_high, show_no_experience_jobs, work_modes, salary_bands "
     "FROM preferences WHERE user_id = $1"
 )
 
@@ -155,11 +165,20 @@ UNOWNED_PREFERENCES_SQL = "SELECT count(*) FROM preferences WHERE user_id IS NUL
 # every candidate test would answer False, and the pass would read NOTHING at
 # all. A silent, total stop rather than a leak; the same edit-them-together rule
 # catches both.
+#
+# THE SALARY SLICE IS THE THIRD TIME THAT WARNING HAD TEETH, and it bites in the
+# gentlest of the three ways — which is worth saying, because "this one is
+# harmless" is how the pair drifts apart. salary_bands is read by is_match but
+# NOT by title_stage_ok, so an enrichment union missing it would not stop the pass
+# (the work-mode failure) and would not narrow it wrongly (the cities failure); it
+# would simply give every filter DEFAULT_SALARY_BANDS, which filters nothing, on a
+# pass whose candidate test does not consult pay anyway. The two statements are
+# still edited together, because the next column may not be so forgiving.
 ACTIVE_PREFERENCES_SQL = """
 SELECT p.cities, p.selected_cities, p.all_india,
        p.keywords, p.exclusions, p.max_level,
        p.exp_range_low, p.exp_range_high, p.show_no_experience_jobs,
-       p.work_modes
+       p.work_modes, p.salary_bands
   FROM preferences p
   JOIN public.users u ON u.id = p.user_id
  WHERE u.is_active = TRUE
@@ -314,6 +333,19 @@ VALUES ($1, now(), $2)
 # work_mode_of reads it as onsite for filtering WITHOUT writing onsite down. One
 # column, one fact: the jobs.notified lesson, applied before the mistake instead
 # of after it.
+# THE SALARY TRIO JOINED IN THE SALARY SLICE, and salary_checked is the reason
+# the pair can be written at all without repeating jobs.notified. salary_min NULL
+# on a row this statement has touched means "read it, this posting states no pay",
+# which is 100% of what the parser finds today; salary_min NULL on a row it has
+# not touched means "nobody has looked". Those are different facts and they now
+# live in different columns, so notify.match.salary_ok can treat both as unpriced
+# — which it does, deliberately — without the TABLE losing the distinction.
+#
+# salary_checked is written as $8 rather than as a literal TRUE, unlike
+# desc_checked directly above it. desc_checked means "we asked", which is true
+# even when the fetch came back with nothing. salary_checked means "a parser saw
+# a description", which a failed fetch is precisely not — so the two differ on
+# exactly the desc_fetch_failed rows and cannot share a spelling.
 SAVE_DESCRIPTION_FACTS_SQL = """
 UPDATE jobs
    SET min_experience    = $2,
@@ -321,6 +353,9 @@ UPDATE jobs
        desc_checked      = TRUE,
        desc_fetch_failed = $4,
        work_mode         = $5,
+       salary_min        = $6,
+       salary_max        = $7,
+       salary_checked    = $8,
        desc_checked_at   = now()
  WHERE canonical_id = $1
 """
@@ -458,9 +493,20 @@ async def fetch_enrichment_targets(
 
 
 async def save_description_facts(
-    conn, facts: Iterable[tuple[str, int | None, bool, bool, str | None]]
+    conn,
+    facts: Iterable[
+        tuple[str, int | None, bool, bool, str | None, Any, Any, bool]
+    ],
 ) -> int:
-    """Persist (canonical_id, min_experience, is_pm_role, fetch_failed, work_mode).
+    """Persist (canonical_id, min_experience, is_pm_role, fetch_failed, work_mode,
+    salary_min, salary_max, salary_checked).
+
+    The salary pair is typed `Any` rather than `Decimal | None` for one reason:
+    asyncpg binds a NUMERIC from a Decimal and the SQLite test shim stores a REAL
+    from a float, and both are legitimate callers of this function. Narrowing the
+    annotation to Decimal would describe production and exclude the mirror the
+    whole suite runs against — the accommodation Preferences._as_tuple already
+    makes one module over.
 
     Returns how many rows were handed to the database. Not in a transaction, and
     it does not need to be: each row is independent, every write is idempotent,
@@ -476,8 +522,8 @@ async def save_description_facts(
     them would be the only cost of not writing them here.
     """
     records = [
-        (cid, years, bool(is_pm), bool(failed), mode)
-        for cid, years, is_pm, failed, mode in facts
+        (cid, years, bool(is_pm), bool(failed), mode, low, high, bool(checked))
+        for cid, years, is_pm, failed, mode, low, high, checked in facts
     ]
     if not records:
         return 0

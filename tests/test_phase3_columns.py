@@ -141,6 +141,34 @@ NEW_COLUMNS = [name for name, *_ in PREFERENCE_COLUMNS] + [name for name, _ in J
 #     deliberately stopped being true. It is replaced by
 #     test_the_remote_branch_is_live_and_still_india_only, which keeps every
 #     assertion that is still meaningful and drops only the inertness.
+# THE SALARY SLICE WIRES UP THE LAST THREE, and STILL_UNWIRED becomes empty for
+# the first time since Step 0 created these columns. That is not a reason to
+# delete the sweep: the list below is what the NEXT speculative column will be
+# added to, and a guard removed the day it stops having work to do is a guard
+# that has to be rebuilt from memory the day it is needed again.
+#
+# jobs.salary_min / salary_max are written by notify/store.SAVE_DESCRIPTION_FACTS
+# _SQL on the enrichment rail beside work_mode, and read by notify.match.salary_ok
+# and its port. preferences.salary_bands is read by the same pair.
+#
+# THE SAME TWO GUARANTEES CHANGE HANDS AS FOR work_mode, and neither is dropped:
+#
+#   * test_the_job_write_paths_name_none_of_the_new_job_columns can no longer
+#     cover the salary pair, so it narrows to the assertion that actually matters
+#     and that survives every future slice — crawler.store.UPSERT_SEEN names
+#     NONE of these columns. That is the hourly statement: it runs on every
+#     re-sighting of every row, and a crawl able to stamp pay (or an arrangement)
+#     from a board payload would overwrite a description-derived verdict with a
+#     guess, every hour, forever.
+#   * "the column is honestly NULL because nothing writes it" is replaced by
+#     test_an_unpriced_job_shows_regardless_of_bands and the salary_checked
+#     distinction — the column is now NULL because a parser looked and found
+#     nothing, which db/schema.sql explains is a different fact and needed its own
+#     column to stay one.
+#
+# jobs.salary_checked is NOT in NEW_COLUMNS at all: it is the salary slice's own
+# column rather than one of Step 0's twelve, and it arrived already wired. It is
+# named here only so a reader looking for it finds out where it went.
 WIRED_UP = {
     "onboarding_completed",
     "exp_range_low",
@@ -151,6 +179,9 @@ WIRED_UP = {
     "all_india",
     "work_mode",
     "work_modes",
+    "salary_min",
+    "salary_max",
+    "salary_bands",
 }
 
 STILL_UNWIRED = [c for c in NEW_COLUMNS if c not in WIRED_UP]
@@ -313,31 +344,63 @@ def test_no_decider_names_a_still_unwired_column(relative_path: str) -> None:
 
 
 
-def test_the_job_write_paths_name_none_of_the_new_job_columns() -> None:
-    """The crawl and enrichment statements cannot fill the SALARY pair in by accident.
+def test_the_crawl_may_write_none_of_the_description_derived_columns() -> None:
+    """The hourly crawl cannot stamp an arrangement or a wage. Only a read may.
 
     Same shape as tests/test_applied_column.py, and the same argument: ownership
     of a column is a property of the SQL that writes the table, not a convention
-    the write path has to remember. No parser writes salary_min or salary_max, so
-    the honest value of both is NULL and these two statements are the only things
-    that could make it otherwise.
+    the write path has to remember.
 
-    work_mode LEFT THIS LIST IN THE WORK-MODE SLICE, because one of the two
-    statements now writes it on purpose. See the next test for the half of the
-    guarantee that survives and matters more.
+    THIS TEST USED TO ASSERT THAT NEITHER STATEMENT NAMED THESE COLUMNS, which was
+    the right assertion while no parser existed — the honest value of all three was
+    NULL, and these two statements were the only things that could have made it
+    otherwise. The work-mode slice took work_mode out of that list, and the salary
+    slice takes the pair, because SAVE_DESCRIPTION_FACTS_SQL now writes all three
+    on purpose.
+
+    WHAT SURVIVES IS THE HALF THAT MATTERS AND IT NOW COVERS ALL THREE. The
+    remaining question is not "can anything write these" but "can the CRAWL write
+    these", and the answer must stay no forever, for a reason that gets stronger
+    as more columns join: crawler.store.UPSERT_SEEN runs on every re-sighting of
+    every row, every hour, and it already rewrites `city` from the location string.
+    A crawl that also wrote pay or arrangement would overwrite a
+    description-derived verdict with a guess from a board payload — so a job read
+    as 18 LPA on Monday would be un-priced by Tuesday, and the digest would change
+    for a reason nothing records.
     """
-    unwritten = [(c, t) for c, t in JOB_COLUMNS if c != "work_mode"]
-    assert [c for c, _ in unwritten] == ["salary_min", "salary_max"]
+    derived = [c for c, _ in JOB_COLUMNS]
+    assert derived == ["work_mode", "salary_min", "salary_max"]
 
-    for statement_name, statement in (
-        ("crawler.store.UPSERT_SEEN", UPSERT_SEEN),
-        ("notify.store.SAVE_DESCRIPTION_FACTS_SQL", SAVE_DESCRIPTION_FACTS_SQL),
-    ):
-        for column, _ in unwritten:
-            assert not re.search(rf"\b{re.escape(column)}\b", statement), (
-                f"{statement_name} names jobs.{column}, which no statement may write "
-                f"until a parser step for it exists"
-            )
+    for column in [*derived, "salary_checked"]:
+        assert not re.search(rf"\b{re.escape(column)}\b", UPSERT_SEEN), (
+            f"crawler.store.UPSERT_SEEN names jobs.{column}. The crawl has no "
+            f"evidence about it and re-runs hourly — writing it there would "
+            f"overwrite every verdict the description reader established."
+        )
+
+
+def test_only_the_enrichment_statement_may_write_the_salary_trio() -> None:
+    """The salary pair AND salary_checked are written in exactly one statement.
+
+    The sibling of test_only_the_enrichment_statement_may_write_work_mode below,
+    and it carries one assertion that function does not need: salary_checked must
+    be written as a BOUND PARAMETER rather than as a literal TRUE.
+
+    That is not style. desc_checked is `= TRUE` in the same statement and is
+    correct that way, because it means "we asked", which is true even when the
+    fetch came back with nothing. salary_checked means "a parser saw a
+    description", which a failed fetch is precisely not. Written as a literal it
+    would mark every desc_fetch_failed row as parsed-and-empty — re-fusing the two
+    facts db/schema.sql split this column out to keep apart, in the one statement
+    that could do it.
+    """
+    for column in ("salary_min", "salary_max", "salary_checked"):
+        assert re.search(rf"\b{column}\s*=\s*\$\d", SAVE_DESCRIPTION_FACTS_SQL), (
+            f"notify.store.SAVE_DESCRIPTION_FACTS_SQL does not write jobs.{column} "
+            f"as a bound parameter. The enrichment rail is the only place with the "
+            f"evidence, and salary_checked in particular must not be a literal — a "
+            f"failed fetch would then claim a parser had read the posting."
+        )
 
 
 def test_only_the_enrichment_statement_may_write_work_mode() -> None:
@@ -501,8 +564,9 @@ def test_the_matcher_value_object_carries_exactly_the_ten_deciding_fields() -> N
 
     notify.match.Preferences is frozen and is the only thing is_match reads, so this
     list IS the filter. It was four fields through Phase 2, seven since Slice 2,
-    nine since cities Slice B and ten since the work-mode slice; an eleventh
-    appearing means a column reached the matcher, whatever the SQL says.
+    nine since cities Slice B, ten since the work-mode slice and eleven since the
+    salary slice; a twelfth appearing means a column reached the matcher, whatever
+    the SQL says.
 
     THE EXACT LIST, NOT A COUNT, and the order is asserted too — a count would pass
     if somebody swapped years_of_experience_held in for show_no_experience_jobs,
@@ -528,6 +592,7 @@ def test_the_matcher_value_object_carries_exactly_the_ten_deciding_fields() -> N
         "exp_range_high",
         "show_no_experience_jobs",
         "work_modes",
+        "salary_bands",
     ], f"notify.match.Preferences carries {names}"
 
     assert "years_of_experience_held" not in names, (

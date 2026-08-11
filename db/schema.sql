@@ -999,8 +999,55 @@ ALTER TABLE preferences ADD COLUMN IF NOT EXISTS onboarding_completed     BOOLEA
 --
 -- min_experience already exists, is read by both matchers, and is not touched.
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS work_mode  TEXT;     -- onsite | hybrid | remote; NULL = not yet parsed
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_min NUMERIC;  -- normalised to LPA; NULL = not yet parsed
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_max NUMERIC;  -- normalised to LPA; NULL = not yet parsed
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_min NUMERIC;  -- normalised to LPA; NULL = no salary established
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_max NUMERIC;  -- normalised to LPA; NULL = no salary established
+
+
+-- ===========================================================================
+-- PHASE 3, THE SALARY SLICE — the one column Step 0 did not know it needed.
+-- ===========================================================================
+--
+-- salary_checked SPLITS A NULL THAT WAS ABOUT TO CARRY TWO FACTS, and it is here
+-- because this project has paid for that mistake once already at full price.
+--
+-- Step 0 created salary_min / salary_max nullable, with "NULL = not yet parsed"
+-- in the comment above. That reading is only available while NOTHING parses them.
+-- The moment a parser runs, a NULL means either of two things:
+--
+--     "we read the description and it stated no pay"     — 100% of this board
+--     "nobody has looked at this row yet"                — every unenriched row
+--
+-- One column, two facts, told apart by nothing — which is jobs.notified exactly,
+-- and that took four sub-phases to undo (see the DROP block above). The pattern
+-- is worth naming because it keeps arriving in a different costume: work_mode
+-- avoided it by keeping desc_checked beside it, and the salary pair cannot borrow
+-- desc_checked, because 87 of the 102 enrichable rows were read CLEANLY before
+-- this parser existed. Those rows are desc_checked = TRUE and have never had a
+-- salary looked for. Reading desc_checked as "salary established" would mark
+-- every one of them parsed-and-empty on no evidence at all.
+--
+-- So the fact gets its own column and the sentence stays one sentence:
+--
+--     salary_checked = FALSE                  nobody has looked
+--     salary_checked = TRUE,  salary_min NULL  looked, this posting states no pay
+--     salary_checked = TRUE,  salary_min set   looked, and it says this
+--
+-- IT DECIDES NO MATCH, deliberately. notify.match.salary_ok reads the pair and
+-- not this flag: an unpriced job is shown either way, so a row nobody has looked
+-- at and a row with genuinely no stated pay are treated identically BY THE
+-- FILTER while staying distinguishable ON THE ROW. That is the distinction being
+-- preserved where it is free rather than enforced where it would change an inbox.
+--
+-- What it does decide is what scripts/backfill_salary.py asks for, which is why
+-- it is not merely documentation: with it the backfill is idempotent in COST as
+-- well as in effect (a re-run skips the rows it has already read instead of
+-- re-fetching 102 descriptions), and "how much of the board has been priced" is
+-- a query rather than an estimate.
+--
+-- NOT NULL DEFAULT FALSE is metadata-only on PG 11+, so this costs one catalogue
+-- update against ~9,800 rows and touches none of them. FALSE is the honest value
+-- for every existing row: no parser has ever run.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_checked BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- NOTHING TO ADD TO THE RLS BLOCK ABOVE, and that is checked rather than
 -- assumed. This step creates no table and no sequence, so there is no new object

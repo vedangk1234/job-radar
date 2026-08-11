@@ -134,6 +134,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -275,6 +276,47 @@ DEFAULT_WORK_MODE = "onsite"
 # failure this codebase spends its guards on. It cost 85 red tests to notice,
 # which is the guards working.
 DEFAULT_WORK_MODES: tuple[str, ...] = ("onsite", "hybrid", "remote")
+
+# THE PAY LADDER — preferences.salary_bands on one side, jobs.salary_min/max on
+# the other, both in LPA (lakhs per annum).
+#
+# THE SIX IDENTIFIERS ARE NOT NEW AND MUST NOT BE RESPELT. They were written by
+# scripts/backfill_onboarding_prefs.py when Phase 3 Step 0 landed, and that script
+# has already run: the operator's row holds exactly these six strings today, and
+# the script's own verification asserts the set matches. Minting prettier ones
+# ("<10L", "50L+") would leave a live row full of labels the new vocabulary does
+# not admit, and because this is a membership test the symptom would be silent —
+# every PRICED job failing the gate, on a board where no job is priced yet, so it
+# would ship green and bite on the first posting that stated pay. The display
+# labels live in dashboard/src/lib/labels.SALARY_BAND_OPTIONS, which is the same
+# split `blr` (stored) and "Bengaluru" (shown) already have.
+#
+# HALF-OPEN AND CONTIGUOUS, [low, high), with 50+ unbounded. Written as a mapping
+# to bounds rather than as parallel lists so a band cannot acquire a range that
+# disagrees with its name, and so the gap-free property is checkable by reading
+# one column. None means "no ceiling" rather than a large number, because a large
+# number is a value somebody would eventually have to argue about.
+SALARY_BAND_LABELS: tuple[str, ...] = ("<10", "10-15", "15-25", "25-40", "40-50", "50+")
+
+SALARY_BAND_BOUNDS: dict[str, tuple[Decimal, Decimal | None]] = {
+    "<10": (Decimal(0), Decimal(10)),
+    "10-15": (Decimal(10), Decimal(15)),
+    "15-25": (Decimal(15), Decimal(25)),
+    "25-40": (Decimal(25), Decimal(40)),
+    "40-50": (Decimal(40), Decimal(50)),
+    "50+": (Decimal(50), None),
+}
+
+# THE INSTALL'S OWN ANSWER — all six, mirroring what backfill_onboarding_prefs.py
+# wrote and what the live row holds. Reached only by a bare `Preferences()` with
+# no row behind it, exactly like DEFAULT_WORK_MODES.
+#
+# AND UNLIKE DEFAULT_WORK_MODES, THE BLANK CASE AGREES WITH IT. work_modes has a
+# sharp difference between "the fallback for a database older than the column"
+# (all three) and "a person who ticked nothing" (matches nothing); for salary both
+# resolve to "do not filter on pay". That is not an oversight in the parallel —
+# it is the fail-open decision, and salary_ok is where it is written down.
+DEFAULT_SALARY_BANDS: tuple[str, ...] = SALARY_BAND_LABELS
 
 # Grounded in the resume rather than in what a job board happens to call things:
 # every term here is a role title, a stack, or a discipline actually worth
@@ -510,6 +552,7 @@ class Preferences:
     exp_range_high: int | None = DEFAULT_EXP_RANGE_HIGH
     show_no_experience_jobs: bool = DEFAULT_SHOW_NO_EXPERIENCE_JOBS
     work_modes: tuple[str, ...] = DEFAULT_WORK_MODES
+    salary_bands: tuple[str, ...] = DEFAULT_SALARY_BANDS
 
     @property
     def effective_cities(self) -> tuple[str, ...]:
@@ -675,6 +718,12 @@ class Preferences:
                 row, "show_no_experience_jobs", DEFAULT_SHOW_NO_EXPERIENCE_JOBS
             ),
             work_modes=cls._as_tuple_column(row, "work_modes", DEFAULT_WORK_MODES),
+            # The fallback is reached only by a row from before the column
+            # existed, and it is the same value an empty selection resolves to
+            # behaviourally — see DEFAULT_SALARY_BANDS. This is the one column
+            # here where "older than the migration" and "ticked nothing" are
+            # allowed to mean the same thing, because for pay they genuinely do.
+            salary_bands=cls._as_tuple_column(row, "salary_bands", DEFAULT_SALARY_BANDS),
         )
 
 
@@ -745,6 +794,136 @@ def work_mode_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
     over one account's blank row.
     """
     return work_mode_of(job) in prefs.work_modes
+
+
+def salary_of(job: Mapping[str, Any]) -> tuple[Decimal | None, Decimal | None]:
+    """The stored pay range in LPA, or (None, None) for a posting with no price.
+
+    Read, never recomputed — the same contract `city`, `is_pm_role`,
+    `min_experience` and `work_mode` follow. The evidence was a description, which
+    no longer exists anywhere; the conclusion is the column.
+
+    A HALF-STATED RANGE IS COMPLETED FROM THE OTHER END rather than left ragged.
+    "₹18,00,000 and up" parses to (18, None) and means everything from 18 upward,
+    so the missing bound is an absence of a ceiling and not an absence of
+    information — but salary_ok wants two numbers, so the open end is represented
+    by None and handled there. Both being None is the only state that means "no
+    price", which is what makes the test in salary_ok a single `is None` pair
+    rather than a case analysis.
+
+    Values arrive as Decimal from asyncpg's NUMERIC and as float from the SQLite
+    mirror's REAL; both are coerced through str() so the comparison arithmetic
+    happens in one type. A junk value reads as no price, rather than raising in
+    the middle of a digest run — the accommodation min_experience_of makes.
+
+    TRAILING ZEROS ARE STRIPPED, AND THAT IS A PARITY REQUIREMENT RATHER THAN
+    TIDINESS. NUMERIC keeps whatever scale it was given, so a column holding 18.00
+    hands back Decimal('18.00') whose str() is "18.00" — while the TypeScript port
+    reads the same column through postgres.js, which returns NUMERIC as a STRING,
+    parses it to the number 18, and renders "18". explain() interpolates this
+    value into a reason both languages must produce character for character, so
+    the two representations have to be reconciled somewhere, and here is the only
+    place both sides pass through.
+    """
+    def read(key: str) -> Decimal | None:
+        value = job.get(key)
+        if value is None:
+            return None
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        integral = amount.to_integral_value()
+        return integral if amount == integral else amount.normalize()
+
+    return read("salary_min"), read("salary_max")
+
+
+def salary_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
+    """This posting's pay overlaps a band this account ticked. Three branches.
+
+        no price on the job     ->  SHOW, whatever the bands say
+        no bands ticked         ->  SHOW, no pay filtering at all
+        otherwise               ->  the job's range OVERLAPS a selected band
+
+    THE FIRST BRANCH IS THE WHOLE RULE IN PRACTICE. Every one of the ~9,800 stored
+    rows is unpriced and will stay that way: 36 of 36 live candidate descriptions
+    were read cleanly and not one stated a number (notify/description.py carries
+    the measurement). So this gate is a no-op on today's board BY DATA, and the
+    synthetic probes in dashboard/scripts/match-parity.ts are the only thing that
+    can prove it fires at all. That is not a reason to weaken it — it is the reason
+    the second branch below points the way it does.
+
+    A BLANK SELECTION SHOWS EVERYTHING, AND THIS IS THE ONE PLACE THIS FILE
+    DELIBERATELY BREAKS ITS OWN FAIL-CLOSED PATTERN. The unconfigured experience
+    range, the blank city answer and an empty work_modes all match NOTHING, and
+    the argument there has been the same since Slice 1b: a filter nobody chose,
+    applied silently, is the expensive failure. Four reasons pay is genuinely a
+    different kind of question rather than a fourth instance of that one:
+
+    1. THE FAILURE THOSE THREE GUARD AGAINST IS UNREACHABLE HERE. They fail closed
+       because a blank filter would otherwise widen an inbox on an answer nobody
+       gave. Failing OPEN on pay widens nothing that the first branch has not
+       already shown — an unpriced job is visible either way — so the blast radius
+       of this choice on the current board is exactly zero rows.
+
+    2. FAIL-CLOSED WOULD CONTRADICT THE FIRST BRANCH. The rule already shows a job
+       whose EMPLOYER said nothing about pay. Hiding a job because the READER said
+       nothing would mean silence on one side of the same question admitting a job
+       and silence on the other side deleting it — the ordering violation
+       CITY_SELECTION_NEVER_MATCHES exists to prevent, mirrored.
+
+    3. THE JOB SIDE IS SILENT ALMOST ALWAYS, so "no opinion about pay" is this
+       filter's resting state rather than an unanswered question. That is not true
+       of a city or an arrangement, where the job side always has an answer and a
+       blank filter really is somebody who has not been asked yet.
+
+    4. IT IS THEREFORE OPTIONAL AT THE ROUTE TOO, and that consequence is stated
+       rather than left to be discovered: PUT /api/preferences does NOT refuse an
+       empty salary_bands, so "onboarded implies configured" — true of the city,
+       range and mode columns by construction — DOES NOT EXTEND TO THIS ONE. It
+       joins `exclusions` and `years_of_experience_held` as a field a person may
+       legitimately leave blank forever.
+
+    OVERLAP, NOT CONTAINMENT, and the difference decides real jobs. A posting
+    advertised at 18-24 LPA overlaps `15-25` and it also overlaps `10-15`, because
+    part of what it offers falls in each. Requiring containment would hide a job
+    from somebody whose band it partly meets, which is the same "a range that
+    partly fits is a fit" reasoning that governs the experience rule's floor —
+    except pay is a band a person is willing to accept rather than a threshold
+    they must clear, so the generous reading is the correct one rather than merely
+    the safe one.
+    """
+    low, high = salary_of(job)
+    if low is None and high is None:
+        return True
+    if not prefs.salary_bands:
+        return True
+
+    # A half-open job range: an absent end is unbounded on that side. `18 LPA and
+    # up` must reach 50+, and a posting stating only a ceiling must reach <10.
+    job_low = low if low is not None else Decimal(0)
+    job_high = high if high is not None else None
+
+    for band in prefs.salary_bands:
+        bounds = SALARY_BAND_BOUNDS.get(band)
+        if bounds is None:
+            # An unrecognised band matches nothing rather than raising — the same
+            # way an unrecognised work mode simply fails its membership test. A
+            # value this file does not know is data to look at, not a crash in the
+            # middle of a digest.
+            continue
+        band_low, band_high = bounds
+        # Overlap of [job_low, job_high] with [band_low, band_high), both ends
+        # possibly unbounded. Written as the two conditions that must BOTH hold
+        # rather than as the negation of "disjoint", because the ends are nullable
+        # and a De Morgan over nullable bounds is where this kind of test goes
+        # wrong silently.
+        starts_before_band_ends = band_high is None or job_low < band_high
+        ends_after_band_starts = job_high is None or job_high >= band_low
+        if starts_before_band_ends and ends_after_band_starts:
+            return True
+    return False
 
 
 def city_ok(job: Mapping[str, Any], prefs: Preferences) -> bool:
@@ -977,7 +1156,7 @@ def min_experience_of(job: Mapping[str, Any]) -> int | None:
 
 
 def is_match(job: Mapping[str, Any], prefs: Preferences) -> bool:
-    """The title stage AND NOT a PM role AND NOT a 3+-years role.
+    """The title stage AND NOT a PM role AND NOT a 3+-years role AND priced OK.
 
     Every exclusion is checked after the inclusions and each wins outright:
     "Senior Backend Engineer, Bengaluru", "SDE III, Bengaluru" and Razorpay's
@@ -985,15 +1164,24 @@ def is_match(job: Mapping[str, Any], prefs: Preferences) -> bool:
     tests before the one that drops them. The point of the filter is a small
     inbox, not a complete one.
 
-    They are four separate tests rather than one because they fail on four
-    different kinds of evidence — a word in the title, a number in the title, a
-    fact from the description, another fact from the description — and a preview
-    run has to be able to say which.
+    They are separate tests rather than one because they fail on different kinds
+    of evidence — a word in the title, a number in the title, a fact from the
+    description, another fact from the description, a figure from the description
+    — and a preview run has to be able to say which.
+
+    SALARY IS HERE AND NOT IN title_stage_ok, DELIBERATELY. It is a
+    description-derived fact like is_pm_role and min_experience, and the title
+    stage is what worth_a_description narrows the enrichment queue by — so a pay
+    test up there would be asking the answer to decide whether to ask the
+    question, the asymmetry that function's docstring already names for
+    work_mode_ok. Keeping it here costs nothing, because an unpriced job passes
+    the gate anyway and every candidate is unpriced until it has been read.
     """
     return (
         title_stage_ok(job, prefs)
         and not pm_excluded(job)
         and not experience_excluded(job, prefs)
+        and salary_ok(job, prefs)
     )
 
 
@@ -1070,6 +1258,18 @@ def explain(job: Mapping[str, Any], prefs: Preferences) -> MatchReport:
             reason = f"minimum {min_experience} years below the looking range {low}-{high}"
         else:
             reason = f"minimum {min_experience} years above the looking range {low}-{high}"
+    elif not salary_ok(job, prefs):
+        # ONE WAY TO FAIL THIS ONE, unlike the tests above, and that is worth
+        # saying rather than leaving the single branch to look like an oversight.
+        # Both of salary_ok's other branches RETURN TRUE, so a job that reaches
+        # here is necessarily priced and necessarily outside every ticked band.
+        # Stated character for character in dashboard/src/lib/match.explain.
+        low, high = salary_of(job)
+        stated = f"{low}-{high} LPA" if low != high else f"{low} LPA"
+        reason = (
+            f"pay {stated} is outside the selected band(s) "
+            f"{', '.join(repr(b) for b in prefs.salary_bands)}"
+        )
     else:
         reason = "matched " + ", ".join(repr(t) for t in keywords_hit)
 

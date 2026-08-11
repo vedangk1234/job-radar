@@ -169,7 +169,7 @@ async def test_enrichment_does_not_clear_an_applied_row(conn):
     await conn.add_company(1, "Testco")
     await conn.add_job("j1", title="Backend Engineer", applied=True, applied_at=APPLIED_AT)
 
-    await save_description_facts(conn, [("j1", 6, True, False, "remote")])
+    await save_description_facts(conn, [("j1", 6, True, False, "remote", 18, 24, True)])
 
     after = await row(conn, "j1")
     assert after["min_experience"] == 6  # the write happened

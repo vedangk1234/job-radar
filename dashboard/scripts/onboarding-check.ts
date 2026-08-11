@@ -370,6 +370,17 @@ async function main() {
       // save that ignored the field go unnoticed, exactly as (0, 2) would for
       // the range above. Hybrid+remote is a value only a person could choose.
       work_modes: ["hybrid", "remote"],
+      // The salary slice's one, and it is chosen on the same principle as the
+      // two above — NOT all six, which is the install's own answer. Two adjacent
+      // bands are a value only a person could have picked.
+      //
+      // Note what this does NOT prove and deliberately cannot: that a save is
+      // REQUIRED to carry bands. It is not. salary_bands is the one column on
+      // this row that may legitimately stay empty forever, because
+      // lib/match.salaryOk fails open — so §7 below asserts the empty save is
+      // ACCEPTED rather than refused, which is the opposite of what the city,
+      // keyword, range and work-mode checks assert about their fields.
+      salary_bands: ["15-25", "25-40"],
     });
 
     check(saved.keywords.length === 1, "it stored the one keyword the person chose");
@@ -378,6 +389,12 @@ async function main() {
       "and their work arrangement — the column a blank row leaves empty, which " +
         "matches nothing until this save",
       `got [${saved.work_modes.join(", ")}]`,
+    );
+    check(
+      saved.salary_bands.join() === "15-25,25-40",
+      "and their pay bands — the one column on this row that may stay empty " +
+        "forever, because salary_ok fails OPEN where the other three fail closed",
+      `got [${saved.salary_bands.join(", ")}]`,
     );
     check(
       saved.cities.join() === "blr,mumbai" &&

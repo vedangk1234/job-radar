@@ -13,6 +13,7 @@ import {
   type StoredResume,
 } from "@/lib/labels";
 import { CityPicker } from "./CityPicker";
+import { SalaryBandPicker } from "./SalaryBandPicker";
 import { WorkModePicker } from "./WorkModePicker";
 import { KeywordChips } from "./KeywordChips";
 import { ResumePanel } from "./ResumePanel";
@@ -95,6 +96,10 @@ export function PreferencesEditor({
    * account, which is exactly the unconfigured state onboarding exists to fill.
    */
   const [workModes, setWorkModes] = useState<string[]>(initial.work_modes ?? []);
+  // `?? []` for the reason work_modes has it: a row loaded before the column
+  // existed carries undefined, and an empty selection is a legitimate resting
+  // state for this field rather than an error — see SalaryBandPicker.
+  const [salaryBands, setSalaryBands] = useState<string[]>(initial.salary_bands ?? []);
   const [keywords, setKeywords] = useState<string[]>(initial.keywords);
   const [exclusions, setExclusions] = useState<string[]>(initial.exclusions);
   const [maxLevel, setMaxLevel] = useState<number>(initial.max_level);
@@ -157,6 +162,7 @@ export function PreferencesEditor({
     JSON.stringify([
       selectedCities, allIndia, keywords, exclusions, maxLevel, expLow, expHigh, yearsHeld, showNoExp,
       workModes,
+      salaryBands,
     ]) !==
     JSON.stringify([
       initialSelectedCities,
@@ -169,6 +175,7 @@ export function PreferencesEditor({
       initial.years_of_experience_held === null ? "" : String(initial.years_of_experience_held),
       rangeConfigured ? initial.show_no_experience_jobs : true,
       initial.work_modes ?? [],
+      initial.salary_bands ?? [],
     ]);
 
   const overCap = keywords.length > KEYWORD_CAP;
@@ -271,6 +278,7 @@ export function PreferencesEditor({
           years_of_experience_held: yearsHeld.trim() === "" ? null : Number(yearsHeld),
           show_no_experience_jobs: showNoExp,
           work_modes: workModes,
+          salary_bands: salaryBands,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -291,6 +299,7 @@ export function PreferencesEditor({
       );
       setShowNoExp(data.preferences.show_no_experience_jobs);
       setWorkModes(data.preferences.work_modes);
+      setSalaryBands(data.preferences.salary_bands);
       setUpdatedAt(data.preferences.updated_at);
       setMessage({ kind: "ok", text: data.message });
 
@@ -403,6 +412,8 @@ export function PreferencesEditor({
       </div>
 
       <WorkModePicker selected={workModes} onChange={setWorkModes} />
+
+      <SalaryBandPicker selected={salaryBands} onChange={setSalaryBands} />
 
       <CityPicker
         selected={selectedCities}

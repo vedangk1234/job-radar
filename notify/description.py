@@ -77,6 +77,7 @@ import html
 import json
 import re
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping, NamedTuple
 from urllib.parse import urlsplit
 
@@ -667,6 +668,576 @@ def detect_work_mode(title: Any, text: Any) -> str | None:
     return explain_work_mode(title, text)[0]
 
 
+# --- salary: what the posting says it pays ---------------------------------
+#
+# THE NOISIEST EXTRACTION IN THIS FILE, AND THE ONE WITH THE LEAST TO GAIN.
+#
+# Measured before it was written, over the 102 rows the enrichment seam actually
+# reaches: 36 of 36 descriptions were read cleanly and NOT ONE stated a number.
+# 22 of the 36 contained the WORDS salary / compensation / CTC. So the realistic
+# yield of this parser on today's board is zero, and its realistic failure mode is
+# reading one of those 22 as a wage. It is built for the day an Indian board starts
+# publishing pay, and until then the only thing it can do is be wrong.
+#
+# That asymmetry decides every rule below. A wrong number does not merely mislabel
+# a row: preferences.salary_bands is a membership test, so a job priced at a figure
+# nobody ticked is a job that DISAPPEARS. Silence, by contrast, shows the job —
+# notify.match.salary_ok treats an unpriced posting as always visible. So the whole
+# module is arranged to answer "no salary stated" whenever it is not certain, and
+# every rule here is a reason to say nothing.
+#
+# THE ANCHOR IS A CURRENCY OR A UNIT, NEVER A BARE NUMBER, and that single
+# structural decision removes most of the false-positive surface by construction
+# rather than by blocklist. Every one of these is a real string from the live
+# candidate set, and none of them can reach a rule below because none carries ₹,
+# Rs, INR, lakh, lac or crore:
+#
+#     "30,000+ employees worldwide"                Accenture   — headcount
+#     "200,000 people in 56 countries"             Continental — headcount
+#     "3000+ strong team"                          Razorpay    — headcount
+#     "1,700+ Zetanauts"                           Zeta        — headcount
+#     "trusted by over 2,500 of the world's ..."   HackerRank  — customers
+#     "30,000+ brands and leading publishers"      InMobi      — customers
+#     "the 200,000th candidate"                    HackerRank  — an ordinal
+#     "Founded in 1871"  /  "In 2023"  /  "2024"   Continental — dates
+#     "call +1 408-536-3015"                       Adobe       — a phone number
+#     "5 years of experience"                      everywhere  — a duration
+#
+# A parser that read bare numbers would find a salary in every one of them. This
+# one cannot see them at all, which is a stronger guarantee than a list of things
+# to avoid — the list can be incomplete, the anchor cannot.
+#
+# THE VETOES BELOW ARE THEREFORE ONLY FOR REAL MONEY THAT IS NOT THIS JOB'S PAY:
+# an ESOP grant, a funding round, an insurance cover, a foreign figure, an
+# application-form field. Those DO carry a currency, so the anchor lets them
+# through and something else has to stop them.
+
+# The unit everything normalises to: lakhs per annum. Decimal rather than float —
+# the value lands in a NUMERIC column, and 18.5 LPA should round-trip as 18.5.
+LAKH = Decimal(100_000)
+
+# Nobody in this market is hired at under a lakh a year or over two crore, and a
+# figure outside that is evidence the match was not a wage at all. This is what
+# quietly kills funding announcements: "raised ₹500 crore" normalises to 50,000
+# LPA and fails here even if every veto below missed it.
+MIN_PLAUSIBLE_LPA = Decimal(1)
+MAX_PLAUSIBLE_LPA = Decimal(200)
+
+_INR = r"(?:₹|rs\.?|inr)"
+_LAKH_UNIT = r"(?:lpa|lakhs?|lacs?)"
+_CRORE_UNIT = r"(?:crores?|crs?\b)"
+
+# "LAKH CRORE" IS ONE UNIT AND IT IS NOT LAKHS, and this lookahead is here
+# because the first live dry run priced five PhonePe postings at 150 LPA from:
+#
+#     "…transactions daily with an Annualized Total Payment Value (TPV) of over
+#      INR 150 lakh crore."
+#
+# The lakh pattern matched "INR 150 lakh", stopped, and never saw the word that
+# changes the magnitude by seven orders. 150 lakh crore is ₹1.5 quadrillion — a
+# payments company's annual volume, and the single largest number in the whole
+# candidate set. It read as a plausible senior salary because the parser had
+# truncated it into one.
+#
+# Every lakh form therefore refuses to match when `crore` follows. Note what that
+# does rather than what it might have done: the compound is not re-read at crore
+# scale, it is not read AT ALL, because _SALARY_SINGLE_CRORE_RE requires the
+# digits to be adjacent to `crore` and "lakh" sits between them. Silence is the
+# right answer for a company-metrics figure, and it is reached here by the
+# number's own shape rather than by a veto having to recognise "TPV".
+_NOT_LAKH_CRORE = r"(?!\s*crores?\b)"
+
+# EQUITY IS NOT PAY, and it is the false positive named most often for a reason:
+# Indian offer prose puts the two side by side, and the equity number is usually
+# the bigger one. "₹50,00,000 ESOP" beside "₹18,00,000 fixed" would be read as a
+# 50 LPA job by anything that took the largest figure, or a coin flip by anything
+# that took the first.
+#
+# Both directions are matched because both are written: the grant can lead
+# ("ESOPs worth ₹20 lakhs") or trail ("₹50,00,000 in stock options").
+_SALARY_EQUITY_RE = re.compile(
+    r"\b(?:esops?|equity|stock\s+options?|rsus?|restricted\s+stock|shares?|"
+    r"share\s+options?)\b[^.\n]{0,40}?"
+    + _INR
+    + r"\s*[\d.,]+\s*(?:" + _LAKH_UNIT + r"|" + _CRORE_UNIT + r"|k|l)?"
+    r"|" + _INR + r"?\s*[\d.,]+\s*(?:" + _LAKH_UNIT + r"|" + _CRORE_UNIT + r"|k|l)?"
+    r"[^.\n]{0,25}?\b(?:esops?|equity|stock\s+options?|rsus?|restricted\s+stock)\b",
+    re.IGNORECASE,
+)
+
+# A COMPANY'S MONEY IS NOT AN OFFER. Every Indian startup JD opens with the
+# funding paragraph — "raised $50M", "valued at ₹8,000 crore", "₹1,200 crore in
+# revenue" — and two of these were in the live sample ("sales of €41.4 billion",
+# "a valuation of $2 billion"). The plausibility ceiling catches most of them by
+# arithmetic; this catches the ones that happen to land in a believable range,
+# like a ₹40 lakh seed round.
+#
+# BOTH DIRECTIONS, because both are written and the first draft only had one.
+# "we raised ₹40 lakh" puts the word first; "₹1,200 crore in annual revenue" puts
+# it last, and that second shape slipped straight through until a test caught it.
+# The equity and benefit vetoes above are two-directional for the same reason —
+# English puts the qualifier on whichever side reads better.
+_SALARY_FUNDING_TERM = (
+    r"(?:raised|raising|funding|funded|valuation|valued|revenue|revenues|sales|"
+    r"turnover|arr|gmv|profit|invested|investment|investments|round|series\s+[a-f]|"
+    r"market\s+cap|assets\s+under\s+management|aum|ipo|acquisition|acquired|"
+    r"tpv|gtv|gmv|total\s+payment\s+value|payment\s+value|transaction\s+value|"
+    r"volume|volumes|throughput|disbursed|disbursements|processed)"
+)
+
+_SALARY_FUNDING_RE = re.compile(
+    r"\b" + _SALARY_FUNDING_TERM + r"\b[^.\n]{0,40}?"
+    + r"(?:" + _INR + r"|\$|€|£)?\s*[\d.,]+\s*"
+    + r"(?:" + _LAKH_UNIT + r"|" + _CRORE_UNIT + r"|k|m|bn|billion|million|trillion)\b"
+    r"|" + r"(?:" + _INR + r"|\$|€|£)?\s*[\d.,]+\s*"
+    + r"(?:" + _LAKH_UNIT + r"|" + _CRORE_UNIT + r"|k|m|bn|billion|million|trillion)\b"
+    + r"[^.\n]{0,40}?\b" + _SALARY_FUNDING_TERM + r"\b",
+    re.IGNORECASE,
+)
+
+# A BENEFIT IS NOT A SALARY, and this is the veto most likely to earn its keep the
+# day an Indian board does start publishing pay — because benefits are published
+# NOW. "₹5,00,000 medical insurance cover", "a joining bonus of ₹1 lakh",
+# "₹50,000 relocation allowance", "₹25,000 annual learning budget" are ordinary
+# lines in a perks section, and every one of them is a real rupee figure that is
+# not the wage.
+#
+# The same shape as _LEADING_DURATION_RE's _NOT_A_CAREER lookahead, one column
+# over: a perks list is formatted exactly like a compensation section, so position
+# and currency together are not enough to tell them apart.
+_SALARY_BENEFIT_RE = re.compile(
+    r"\b(?:insurance|cover|coverage|bonus|allowance|reimbursement|reimburse|budget|"
+    r"stipend|award|prize|gratuity|pf|provident|gift|voucher|discount|subsidy|"
+    r"relocation|referral|wellness|medical|health|learning|education|tuition|"
+    r"donation|contribution|fee|fees|penalty|fine|deposit|cost|price|premium)\b"
+    r"[^.\n]{0,30}?" + _INR + r"\s*[\d.,]+\s*(?:" + _LAKH_UNIT + r"|" + _CRORE_UNIT + r"|k|l)?"
+    r"|" + _INR + r"\s*[\d.,]+\s*(?:" + _LAKH_UNIT + r"|" + _CRORE_UNIT + r"|k|l)?"
+    r"[^.\n]{0,30}?\b(?:insurance|cover|coverage|bonus|allowance|reimbursement|budget|"
+    r"stipend|award|prize|gratuity|gift|voucher|discount|subsidy|relocation|referral|"
+    r"donation|contribution|fee|penalty|fine|deposit|premium)\b",
+    re.IGNORECASE,
+)
+
+# FOREIGN MONEY IS MASKED RATHER THAN CONVERTED, and refusing the conversion is
+# the decision rather than an omission.
+#
+# An FX rate is a number that changes, and putting one in this file would freeze
+# it: the LPA figure written today would be wrong for as long as the row lives,
+# in a column nothing re-derives. Worse, the arithmetic works — a $180,000 US
+# posting converts to roughly 150 LPA, lands squarely in the `50+` band, and reads
+# as the best job on the board while being in Seattle. The bands are an INDIAN pay
+# ladder and a converted figure is not a point on it.
+#
+# Masked rather than fatal, so "₹18 LPA (about $21k)" still parses as 18 and a
+# posting quoted only in dollars simply states no pay we can use. Both are the
+# safe direction: unpriced shows the job.
+#
+# Found live: the Anthropic Greenhouse posting embeds <div class="pay-range">
+# €220.000</div>, which is a genuine advertised salary in a currency this tool has
+# no opinion about.
+_SALARY_FOREIGN_RE = re.compile(
+    r"(?:us\s*\$|a\$|s\$|c\$|hk\$|\$|€|£|¥|₩|₽|"
+    r"\b(?:usd|eur|gbp|sgd|aud|cad|aed|sar|jpy|chf|cny|myr|hkd|nzd|zar)\b)"
+    r"\s*[\d.,]+\s*(?:k|m|mn|bn|million|billion|lpa|lakhs?)?"
+    r"|[\d.,]+\s*(?:k|m|mn)?\s*"
+    r"\b(?:usd|eur|gbp|sgd|aud|cad|aed|sar|jpy|chf|cny|myr|hkd|nzd|zar)\b",
+    re.IGNORECASE,
+)
+
+# THE APPLICATION FORM IS NOT THE OFFER, and on Greenhouse this is not a hazard
+# but a certainty. _greenhouse_description joins questions[].label into the text
+# on purpose (a form question is often the role describing itself), and 46 of the
+# 102 enrichable rows are Greenhouse. Both of these are verbatim from the live
+# sample:
+#
+#     "What are your salary expectations?"                          HackerRank
+#     "Current Compensation (Please mention breakup of Fixed +
+#      Variable + ESOPs)  Expected Comp"                            Razorpay
+#
+# They ask the CANDIDATE for a number. A posting that also states its own pay
+# would put it in the description, not in a form label — so masking the question
+# and everything to the end of its line cannot cost a real figure, and it stops
+# the one place a number is guaranteed to mean somebody else's salary.
+#
+# The candidate's-history discipline of _REMOTE_NOT_AN_ARRANGEMENT_RE, applied to
+# money: same mistake, different column.
+_SALARY_FORM_QUESTION_RE = re.compile(
+    r"\b(?:current|expected|desired|preferred|last\s+drawn|present)\s+"
+    r"(?:annual\s+|total\s+|fixed\s+|gross\s+|in[- ]hand\s+)?"
+    r"(?:salary|compensation|comp|ctc|package|pay|remuneration)\b[^\n]*"
+    r"|\b(?:salary|compensation|ctc|pay|package)\s+expectation[s]?\b[^\n]*"
+    r"|\bwhat\s+(?:are|is)\s+your\b[^\n]*\b(?:salary|compensation|ctc|pay)\b[^\n]*",
+    re.IGNORECASE,
+)
+
+# A RATE IS NOT AN ANNUAL WAGE. "₹500/hour", "₹8,000 per day" are contractor
+# terms, and annualising them needs an assumption about how many hours a year the
+# engagement runs — which is a guess, and this module does not guess. Monthly is
+# the one period that IS annualised, below, because twelve months is a year by
+# definition rather than by assumption.
+_SALARY_RATE_RE = re.compile(
+    _INR + r"?\s*[\d.,]+\s*(?:k)?\s*"
+    r"(?:/|per\s+|a\s+)\s*(?:hour|hr|day|week|session|class|project|assignment)\b",
+    re.IGNORECASE,
+)
+
+# Ordered, and each one names itself so scripts/backfill_salary.py can report
+# WHICH veto fired rather than only that the row produced nothing. The reviewable
+# unit is the veto, exactly as the work-mode backfill's reviewable unit is the
+# marker.
+SALARY_VETOES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("application-form question", _SALARY_FORM_QUESTION_RE),
+    ("equity/ESOP", _SALARY_EQUITY_RE),
+    ("funding/revenue/valuation", _SALARY_FUNDING_RE),
+    ("benefit/bonus/insurance", _SALARY_BENEFIT_RE),
+    ("foreign currency", _SALARY_FOREIGN_RE),
+    ("hourly/daily rate", _SALARY_RATE_RE),
+)
+
+# A monthly figure, annualised. The window is short and cannot cross a newline,
+# for _YEARS_RE's reason: "₹80,000" on one bullet and "per month" on the next are
+# two statements, and joining them invents a third.
+_PER_MONTH = r"(?:/|per\s+|a\s+|p\.?\s?m\.?\b|every\s+)\s*month|monthly|per\s+month"
+_PER_MONTH_RE = re.compile(r"^[ \t]*(?:" + _PER_MONTH + r")", re.IGNORECASE)
+
+# RANGES ARE SCANNED FIRST AND THEN MASKED OUT, so the single-figure patterns
+# below cannot re-read "18" and "24" out of "18-24 LPA" as two separate salaries
+# and then refuse the row for stating two. Same ordering discipline
+# detect_min_experience uses between its range and single forms.
+_SALARY_RANGE_LAKH_RE = re.compile(
+    _INR + r"?\s*(\d{1,3}(?:\.\d{1,2})?)\s*(?:" + _LAKH_UNIT + r"|l\b)?"
+    r"\s*(?:-|–|—|to|and)\s*"
+    + _INR + r"?\s*(\d{1,3}(?:\.\d{1,2})?)\s*(" + _LAKH_UNIT + r"|l\b)" + _NOT_LAKH_CRORE,
+    re.IGNORECASE,
+)
+
+_SALARY_RANGE_CRORE_RE = re.compile(
+    _INR + r"?\s*(\d{1,2}(?:\.\d{1,2})?)\s*(?:" + _CRORE_UNIT + r")?"
+    r"\s*(?:-|–|—|to|and)\s*"
+    + _INR + r"?\s*(\d{1,2}(?:\.\d{1,2})?)\s*(" + _CRORE_UNIT + r")",
+    re.IGNORECASE,
+)
+
+# The raw-rupee range needs the currency marker on at least the FIRST bound —
+# without it "1,800,000 - 2,400,000" is just two numbers, and this module does not
+# read bare numbers.
+_SALARY_RANGE_RAW_RE = re.compile(
+    _INR + r"\s*([\d,]{5,})\s*(?:-|–|—|to)\s*" + _INR + r"?\s*([\d,]{5,})",
+    re.IGNORECASE,
+)
+
+_SALARY_SINGLE_LAKH_RE = re.compile(
+    _INR + r"?\s*(\d{1,3}(?:\.\d{1,2})?)\s*\+?\s*(" + _LAKH_UNIT + r")" + _NOT_LAKH_CRORE,
+    re.IGNORECASE,
+)
+
+# The bare `L` suffix ("18L") is accepted ONLY with a currency marker in front of
+# it. Without one it is not distinguishable from a level notation — "L4", "L5" and
+# "18L" live in the same documents — and detect_level exists one module over
+# precisely because titles are full of numbers attached to letters.
+_SALARY_SINGLE_L_RE = re.compile(
+    _INR + r"\s*(\d{1,3}(?:\.\d{1,2})?)\s*\+?\s*l\b" + _NOT_LAKH_CRORE,
+    re.IGNORECASE,
+)
+
+_SALARY_SINGLE_CRORE_RE = re.compile(
+    _INR + r"?\s*(\d{1,2}(?:\.\d{1,2})?)\s*\+?\s*(" + _CRORE_UNIT + r")",
+    re.IGNORECASE,
+)
+
+_SALARY_SINGLE_RAW_RE = re.compile(
+    _INR + r"\s*([\d,]{5,})(?!\s*(?:-|–|—|to))",
+    re.IGNORECASE,
+)
+
+# `₹80k`, `₹80 k`. Thousands, so ×1000 before the lakh division.
+_SALARY_SINGLE_K_RE = re.compile(
+    _INR + r"\s*(\d{1,4}(?:\.\d{1,2})?)\s*k\b",
+    re.IGNORECASE,
+)
+
+
+class SalaryRead(NamedTuple):
+    """A salary verdict with its evidence, for a person reviewing a backfill.
+
+    `low`/`high` in LPA, both None when nothing was established. `marker` is the
+    literal text that produced the figure and `snippet` its surroundings, for the
+    same reason fetchers.normalize.explain_label returns its marker: a reviewer has
+    to be able to see WHY a row was priced, and re-deriving it in the report would
+    be a second implementation of the rule.
+
+    `vetoes` names every guard that fired on this description whether or not a
+    salary survived — that is what makes the guards auditable instead of merely
+    present.
+    """
+
+    low: "Decimal | None" = None
+    high: "Decimal | None" = None
+    marker: str | None = None
+    snippet: str | None = None
+    vetoes: tuple[str, ...] = ()
+
+
+def _lpa(value: str, unit: str) -> "Decimal | None":
+    """One captured number plus its unit -> LPA, or None if implausible.
+
+    The plausibility test lives here rather than at the call sites so that every
+    form — lakh, crore, raw rupees, thousands, monthly — is bounded by the same
+    two numbers. A figure that fails it is not a wage, whatever shape it arrived
+    in.
+    """
+    try:
+        amount = Decimal(value.replace(",", "").strip())
+    except (InvalidOperation, AttributeError):
+        return None
+
+    unit = unit.lower()
+    if unit == "lakh":
+        lpa = amount
+    elif unit == "crore":
+        lpa = amount * 100
+    elif unit == "rupees":
+        lpa = amount / LAKH
+    elif unit == "thousand":
+        lpa = amount * 1000 / LAKH
+    else:  # pragma: no cover — the caller passes one of the four
+        return None
+
+    if not (MIN_PLAUSIBLE_LPA <= lpa <= MAX_PLAUSIBLE_LPA):
+        return None
+
+    # TWO DECIMAL PLACES, AND NOT .normalize() ON ITS OWN. normalize() turns 150
+    # into Decimal('1.5E+2') — numerically identical and unreadable, which matters
+    # because this value is printed in the backfill sample a person reviews and
+    # interpolated into notify.match.explain's reason string, where the TypeScript
+    # port has to produce the same characters. Integral figures come back
+    # integral, fractional ones keep at most two places.
+    lpa = lpa.quantize(Decimal("0.01"))
+    integral = lpa.to_integral_value()
+    return integral if lpa == integral else lpa.normalize()
+
+
+def _figure_to_lpa(raw: str, unit: str, monthly: bool) -> "Decimal | None":
+    """One captured figure, its unit, and whether a period marker followed it.
+
+    A MONTHLY LAKH FIGURE IS REFUSED RATHER THAN ANNUALISED. "18 LPA per month"
+    is not a sentence anybody writes about a wage — LPA already says per annum —
+    so a match of that shape is evidence the regex found something other than a
+    salary, and the answer to that is silence. Only the two unit-less forms
+    (raw rupees, thousands) are annualised, and twelve months is a year by
+    definition rather than by assumption, which is why the hourly and daily forms
+    are vetoed instead of multiplied.
+    """
+    if not monthly:
+        return _lpa(raw, unit)
+
+    if unit == "rupees":
+        multiplier = Decimal(12)
+    elif unit == "thousand":
+        multiplier = Decimal(12_000)
+    else:
+        return None
+
+    try:
+        annual = Decimal(raw.replace(",", "").strip()) * multiplier
+    except (InvalidOperation, AttributeError):
+        return None
+    return _lpa(str(annual), "rupees")
+
+
+def _is_monthly(text: str, end: int) -> bool:
+    """Does a period marker follow this figure, on the same line?
+
+    Bounded to the same line for _YEARS_RE's reason: "₹80,000" ending a bullet and
+    "per month" opening the next are two statements, and reading across the break
+    invents a third.
+    """
+    line_end = text.find("\n", end)
+    tail = text[end:] if line_end == -1 else text[end:line_end]
+    return bool(_PER_MONTH_RE.search(tail[:20]))
+
+
+def explain_salary(text: Any) -> SalaryRead:
+    """The pay this description states, in LPA, with the evidence and the vetoes.
+
+    THE ORDER IS VETO, THEN RANGE, THEN SINGLE, and each stage masks what it
+    consumed so the next cannot re-read it. _mask is the same same-length blanking
+    idiom the work-mode tier uses, for the same reason: a description can state an
+    ESOP grant in one sentence and a wage in the next, and both a whole-text veto
+    and a first-hit-wins scan would get one of those two wrong.
+
+    SEVERAL DISAGREEING FIGURES MEAN NOTHING WAS ESTABLISHED, which is the one
+    place this function deliberately does the opposite of detect_min_experience.
+    That one takes min(found), because the smallest minimum is the answer that
+    KEEPS the job and a keep is the safe error. There is no safe number here: any
+    figure can put the job in a band nobody ticked and delete it, while silence
+    shows it. So ambiguity resolves to silence.
+
+    Identical restatements are not disagreement. "₹18,00,000 – ₹24,00,000 (18-24
+    LPA)" is one fact written twice and normalises to one (18, 24).
+    """
+    if not isinstance(text, str) or not text.strip():
+        return SalaryRead()
+
+    fired: list[str] = []
+    masked = text
+    for name, pattern in SALARY_VETOES:
+        if pattern.search(masked):
+            fired.append(name)
+            masked = _mask(masked, pattern)
+
+    found: dict[tuple[str, str], tuple[int, int]] = {}
+
+    def record(low: "Decimal | None", high: "Decimal | None", span: tuple[int, int]) -> None:
+        if low is None and high is None:
+            return
+        found.setdefault((str(low), str(high)), span)
+
+    for pattern, unit in (
+        (_SALARY_RANGE_CRORE_RE, "crore"),
+        (_SALARY_RANGE_LAKH_RE, "lakh"),
+        (_SALARY_RANGE_RAW_RE, "rupees"),
+    ):
+        for hit in pattern.finditer(masked):
+            monthly = _is_monthly(masked, hit.end())
+            low = _figure_to_lpa(hit.group(1), unit, monthly)
+            high = _figure_to_lpa(hit.group(2), unit, monthly)
+            if low is None or high is None or low > high:
+                continue
+            record(low, high, hit.span())
+        masked = _mask(masked, pattern)
+
+    for pattern, unit in (
+        (_SALARY_SINGLE_CRORE_RE, "crore"),
+        (_SALARY_SINGLE_LAKH_RE, "lakh"),
+        (_SALARY_SINGLE_L_RE, "lakh"),
+        (_SALARY_SINGLE_K_RE, "thousand"),
+        (_SALARY_SINGLE_RAW_RE, "rupees"),
+    ):
+        for hit in pattern.finditer(masked):
+            value = _figure_to_lpa(hit.group(1), unit, _is_monthly(masked, hit.end()))
+            if value is None:
+                continue
+            record(value, value, hit.span())
+        masked = _mask(masked, pattern)
+
+    if len(found) != 1:
+        # Nothing found, or several statements that do not agree. Both mean the
+        # same thing to every caller: this posting states no pay we are sure of.
+        return SalaryRead(vetoes=tuple(fired))
+
+    (low_text, high_text), (start, end) = next(iter(found.items()))
+    marker = " ".join(text[start:end].split())
+    window_start, window_end = max(0, start - 80), min(len(text), end + 80)
+    snippet = " ".join(text[window_start:window_end].split())
+    return SalaryRead(
+        low=Decimal(low_text),
+        high=Decimal(high_text),
+        marker=marker,
+        snippet=f"…{snippet}…",
+        vetoes=tuple(fired),
+    )
+
+
+def detect_salary(text: Any) -> tuple["Decimal | None", "Decimal | None"]:
+    """(low, high) in LPA, or (None, None) for "this posting states no pay".
+
+    The narrow question asked of explain_salary's machinery, kept as its own name
+    because it is the whole of what the enrichment pass wants — the same
+    relationship fetch_description has with read_description.
+    """
+    read = explain_salary(text)
+    return read.low, read.high
+
+
+# THE STRUCTURAL TIER, exactly as work_mode_from_row is and for the same reason: a
+# vendor that STATES the pay is a better authority on it than any regex over the
+# prose underneath, and reading it costs nothing because the row is already here.
+#
+# VERIFIED LIVE, NOT READ FROM DOCUMENTATION — the discipline the Workday country
+# facet earned. Of the nine supported ATSes, exactly two publish a comp field:
+#
+#   ashby      compensation.summaryComponents[] — but ONLY when the board URL
+#              carries ?includeCompensation=true, which is why _BOARD_URLS spells
+#              it that way. Confirmed against the live `navi` and `atlan` boards:
+#              the key appears on every job, alongside
+#              shouldDisplayCompensationOnJobPostings, and both tenants publish
+#              empty tiers because they have the display switched off.
+#   recruitee  salary {min, max, period, currency}
+#
+# AND THE OTHER SEVEN PUBLISH NOTHING, which is the fact that matters most here:
+# greenhouse (checked live against a single posting with ?content=true — the keys
+# are content/metadata/offices/questions and no pay range), workday, smartrecruiters
+# and lever all carry no comp field at all, and those four are 100% of the rows the
+# enrichment seam currently reaches. So this tier is CORRECT AND INERT on today's
+# board, and the prose tier above is doing all of the work.
+def salary_from_row(
+    ats: Any, row: Mapping[str, Any] | None
+) -> tuple["Decimal | None", "Decimal | None"]:
+    """The ATS's own salary field in LPA, or (None, None) if it publishes none.
+
+    NON-INR IS REFUSED HERE TOO, and by the same argument the prose tier makes: a
+    vendor stating $180,000 is stating a fact this tool cannot convert into a
+    point on an Indian band ladder without freezing an exchange rate into a column
+    nothing re-derives.
+    """
+    ats = str(ats or "").strip().lower()
+    if not isinstance(row, Mapping):
+        return None, None
+
+    if ats == "ashby":
+        compensation = row.get("compensation")
+        if not isinstance(compensation, Mapping):
+            return None, None
+        for component in compensation.get("summaryComponents") or []:
+            if not isinstance(component, Mapping):
+                continue
+            if str(component.get("compensationType") or "").strip().lower() != "salary":
+                continue
+            if str(component.get("currencyCode") or "").strip().upper() != "INR":
+                continue
+            interval = str(component.get("interval") or "").strip().upper()
+            per_year = {"1 YEAR": 1, "1 MONTH": 12}.get(interval)
+            if per_year is None:
+                continue
+            low = _amount_to_lpa(component.get("minValue"), per_year)
+            high = _amount_to_lpa(component.get("maxValue"), per_year)
+            if low is None and high is None:
+                continue
+            return (low or high), (high or low)
+        return None, None
+
+    if ats == "recruitee":
+        salary = row.get("salary")
+        if not isinstance(salary, Mapping):
+            return None, None
+        if str(salary.get("currency") or "").strip().upper() != "INR":
+            return None, None
+        per_year = {"year": 1, "yearly": 1, "annual": 1, "month": 12, "monthly": 12}.get(
+            str(salary.get("period") or "").strip().lower()
+        )
+        if per_year is None:
+            return None, None
+        low = _amount_to_lpa(salary.get("min"), per_year)
+        high = _amount_to_lpa(salary.get("max"), per_year)
+        if low is None and high is None:
+            return None, None
+        return (low or high), (high or low)
+
+    return None, None
+
+
+def _amount_to_lpa(value: Any, per_year: int) -> "Decimal | None":
+    """A vendor's raw rupee amount at some period -> LPA, bounded like the rest."""
+    if value is None:
+        return None
+    try:
+        amount = Decimal(str(value)) * per_year
+    except (InvalidOperation, ValueError):
+        return None
+    return _lpa(str(amount), "rupees")
+
+
 # --- fetching the description ---------------------------------------------
 #
 # Two shapes of source, and the difference is one request versus zero.
@@ -737,9 +1308,18 @@ WORKDAY_JOB_URL = "https://{host}/wday/cxs/{tenant}/{site}{path}"
 # The list endpoints, identical to the ones in fetchers/tier1.py. Duplicated as
 # a mapping rather than imported because tier1 returns NORMALISED rows, which by
 # design have already dropped the description; what is needed here is the raw row.
+#
+# ASHBY'S URL DIFFERS FROM fetchers/tier1.py's BY ONE QUERY PARAMETER, and the
+# divergence is deliberate rather than drift. `?includeCompensation=true` is what
+# makes compensation.summaryComponents appear at all (verified live: without it
+# the key is absent entirely, with it every job carries it). It is added HERE and
+# not in tier1 because tier1's fetch runs hourly for every tracked board and its
+# job is the crawl's row shape, which has no salary in it — paying for a wider
+# payload on the path that throws it away would be the ?content=true mistake the
+# Greenhouse comment above describes, one vendor over.
 _BOARD_URLS = {
     "lever": "https://api.lever.co/v0/postings/{token}?mode=json",
-    "ashby": "https://api.ashbyhq.com/posting-api/job-board/{token}",
+    "ashby": "https://api.ashbyhq.com/posting-api/job-board/{token}?includeCompensation=true",
     "workable": "https://apply.workable.com/api/v1/widget/accounts/{token}?details=true",
     "recruitee": "https://{token}.recruitee.com/api/offers/",
 }
@@ -975,24 +1555,28 @@ async def _workday_description(company: Mapping[str, Any], job: Mapping[str, Any
 
 
 class DescriptionRead(NamedTuple):
-    """What one read of a posting yielded: the prose, and the vendor's own field.
+    """What one read of a posting yielded: the prose, and the vendor's own fields.
 
-    Two values because they come from two places and only one of them is a guess.
-    `work_mode` is set when the ATS PUBLISHES the arrangement (ashby, lever,
-    smartrecruiters — see work_mode_from_row) and is None otherwise, which is
-    what makes "the structural answer wins over the prose one" expressible
-    without either tier knowing about the other.
+    Several values because they come from two places and only one of them is a
+    guess. `work_mode` is set when the ATS PUBLISHES the arrangement (ashby,
+    lever, smartrecruiters — see work_mode_from_row) and is None otherwise, which
+    is what makes "the structural answer wins over the prose one" expressible
+    without either tier knowing about the other. The salary pair says the same
+    thing about pay, for the two vendors that publish it (see salary_from_row).
 
     A NamedTuple rather than a second return value so that
     `enrich_candidates` can accept both this and a bare string: every test in
     this repo injects a fetcher returning `str | None`, and those injections are
     the point of the seam rather than an implementation detail to churn. Same
     accommodation notify.match.Preferences._as_tuple makes for asyncpg lists
-    versus the SQLite shim's JSON text.
+    versus the SQLite shim's JSON text. Every field after `text` therefore has a
+    default, so a two-field construction in a test keeps meaning what it meant.
     """
 
     text: str | None
     work_mode: str | None = None
+    salary_min: "Decimal | None" = None
+    salary_max: "Decimal | None" = None
 
 
 async def read_description(
@@ -1000,12 +1584,18 @@ async def read_description(
 ) -> DescriptionRead:
     """fetch_description, plus whatever the vendor stated about the arrangement.
 
-    THE STRUCTURAL FIELD COSTS NOTHING EXTRA, and that is why it is read here
-    rather than in a pass of its own. All three ATSes that publish it publish it
-    on the same row this function was already going to parse the description out
-    of — lever and ashby from the cached board index, smartrecruiters from the
-    single posting it fetches anyway. Greenhouse and Workday publish no such
-    field, so they come back with work_mode None and the prose tier answers.
+    THE STRUCTURAL FIELDS COST NOTHING EXTRA, and that is why they are read here
+    rather than in a pass of their own. All three ATSes that publish the
+    arrangement publish it on the same row this function was already going to
+    parse the description out of — lever and ashby from the cached board index,
+    smartrecruiters from the single posting it fetches anyway. Greenhouse and
+    Workday publish no such field, so they come back with work_mode None and the
+    prose tier answers.
+
+    THE SALARY PAIR IS NARROWER STILL: only ashby and recruitee publish one, both
+    of them board-index vendors, so the whole structural tier for pay lives in the
+    one branch below and every other ATS answers (None, None) and leaves the prose
+    parser to it. On today's board that is every row the seam reaches.
     """
     ats = str(company.get("ats") or "").strip().lower()
     token = str(company.get("token") or "").strip()
@@ -1032,7 +1622,13 @@ async def read_description(
         row = (await _board_index(ats, token)).get(str(native_id))
         if not row:
             return DescriptionRead(None)
-        return DescriptionRead(description_from_row(ats, row), work_mode_from_row(ats, row))
+        stated_low, stated_high = salary_from_row(ats, row)
+        return DescriptionRead(
+            description_from_row(ats, row),
+            work_mode_from_row(ats, row),
+            stated_low,
+            stated_high,
+        )
 
     # The custom scrapers (custom_jsonld, custom_sitemap) publish no description
     # route this module has verified. Unknown, therefore kept — and recorded as a
@@ -1157,8 +1753,9 @@ async def enrich_candidates(
     every thirty minutes forever is not persistence, it is a loop — but it is
     marked desc_fetch_failed too, so `retry_before` can bring it back tomorrow.
 
-    What this writes is deliberately five columns and no more: it must not be
-    able to disturb `seeded`, `status`, `miss_count` or `first_seen_at`. See
+    What this writes is deliberately eight columns and no more — the five
+    description facts, the salary pair and salary_checked: it must not be able to
+    disturb `seeded`, `status`, `miss_count` or `first_seen_at`. See
     SAVE_DESCRIPTION_FACTS_SQL, which has no clause that could.
 
     Sequential rather than gathered, on purpose. The set is a handful by the
@@ -1168,7 +1765,9 @@ async def enrich_candidates(
     """
     fetch = fetcher or read_description
     report: list[dict[str, Any]] = []
-    facts: list[tuple[str, int | None, bool, bool, str | None]] = []
+    facts: list[
+        tuple[str, int | None, bool, bool, str | None, "Decimal | None", "Decimal | None", bool]
+    ] = []
 
     for job in candidates:
         if not needs_description_check(job, retry_before=retry_before):
@@ -1187,6 +1786,22 @@ async def enrich_candidates(
         min_experience = detect_min_experience(text)
         is_pm_role = detect_pm_role(job.get("title"), text)
 
+        # THE VENDOR'S FIGURE WINS OVER THE PROSE, the same precedence work_mode
+        # takes on the line below and for the same reason — a stated answer beats
+        # an inferred one. `is not None` rather than truthiness: a vendor could in
+        # principle state a zero, and `or` would silently discard it.
+        parsed_low, parsed_high = detect_salary(text)
+        salary_min = read.salary_min if read.salary_min is not None else parsed_low
+        salary_max = read.salary_max if read.salary_max is not None else parsed_high
+
+        # SET WHENEVER A DESCRIPTION WAS ACTUALLY READ, and never when the fetch
+        # failed. That is the whole point of the column: "we looked and this
+        # posting states no pay" is a fact, and it is a DIFFERENT fact from "no
+        # parser has ever been near this row", which is what every row on this
+        # board says today. See db/schema.sql — the two would otherwise share one
+        # NULL, which is jobs.notified with a decimal point.
+        salary_checked = not failed
+
         # THE VENDOR'S FIELD WINS OVER THE PROSE, and it wins even when the prose
         # could not be read at all: an ashby row whose description came back
         # empty still stated `workplaceType`, and a stated answer beats no answer.
@@ -1199,10 +1814,24 @@ async def enrich_candidates(
         job["min_experience"] = min_experience  # type: ignore[index]
         job["is_pm_role"] = is_pm_role  # type: ignore[index]
         job["work_mode"] = work_mode  # type: ignore[index]
+        job["salary_min"] = salary_min  # type: ignore[index]
+        job["salary_max"] = salary_max  # type: ignore[index]
+        job["salary_checked"] = salary_checked  # type: ignore[index]
         job["desc_checked"] = True  # type: ignore[index]
         job["desc_fetch_failed"] = failed  # type: ignore[index]
 
-        facts.append((job["canonical_id"], min_experience, is_pm_role, failed, work_mode))
+        facts.append(
+            (
+                job["canonical_id"],
+                min_experience,
+                is_pm_role,
+                failed,
+                work_mode,
+                salary_min,
+                salary_max,
+                salary_checked,
+            )
+        )
         report.append(
             {
                 "canonical_id": job["canonical_id"],
@@ -1212,6 +1841,9 @@ async def enrich_candidates(
                 "is_pm_role": is_pm_role,
                 "work_mode": work_mode,
                 "work_mode_stated_by_ats": stated_mode is not None,
+                "salary_min": salary_min,
+                "salary_max": salary_max,
+                "salary_stated_by_ats": read.salary_min is not None,
                 "fetched": not failed,
             }
         )

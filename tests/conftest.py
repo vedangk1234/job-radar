@@ -39,6 +39,7 @@ from notify.match import (
     DEFAULT_EXP_RANGE_LOW,
     DEFAULT_KEYWORDS,
     DEFAULT_MAX_LEVEL,
+    DEFAULT_SALARY_BANDS,
     DEFAULT_SHOW_NO_EXPERIENCE_JOBS,
     DEFAULT_WORK_MODES,
 )
@@ -70,14 +71,21 @@ _SCHEMA = re.compile(r"\bpublic\.", re.IGNORECASE)
 # does not have would let a test arrange a state the database cannot hold, and
 # pass while asserting something untrue of anything.
 #
-# work_mode / salary_min / salary_max are the Phase-3 Step-0 columns, mirrored
-# for the OTHER direction of that same rule. Nothing reads or writes them yet —
-# their parsers are a later step — so no test needs them today; they are here
-# because a production column missing from this mirror is a state the database
-# CAN hold and a test cannot arrange, which is how the first parser test would
-# have failed for a reason that had nothing to do with the parser. REAL rather
-# than NUMERIC, and nullable with no default, matching db/schema.sql: NULL is
-# what "not yet parsed" is spelled as on both sides.
+# work_mode / salary_min / salary_max are the Phase-3 Step-0 columns and
+# salary_checked is the salary slice's addition to them. REAL rather than NUMERIC
+# for the pair, and nullable with no default, matching db/schema.sql: NULL is what
+# "no salary established" is spelled as on both sides.
+#
+# THE REAL/NUMERIC DIVERGENCE IS HANDLED IN ONE PLACE, notify.match.salary_of,
+# which coerces whatever the driver hands back through Decimal(str(...)). asyncpg
+# returns a Decimal and this mirror returns a float, and a comparison between the
+# two is a TypeError in the middle of a digest run — the same shape of divergence
+# the TEXT[]-as-JSON columns below already have, handled the same way.
+#
+# salary_checked is `INTEGER NOT NULL DEFAULT 0` because SQLite has no BOOLEAN,
+# exactly as is_pm_role and desc_checked above it. The default matters: it is what
+# makes an unenriched fixture row say "nobody has looked for a salary here",
+# which is the honest starting state and the one the parser tests need.
 JOBS_DDL = """
 CREATE TABLE jobs (
   canonical_id     TEXT PRIMARY KEY,
@@ -101,7 +109,8 @@ CREATE TABLE jobs (
   applied_at        TEXT,
   work_mode         TEXT,
   salary_min        REAL,
-  salary_max        REAL
+  salary_max        REAL,
+  salary_checked    INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -480,6 +489,10 @@ class FakeConn:
         desc_checked_at: str | None = None,
         applied: bool = False,
         applied_at: str | None = None,
+        work_mode: str | None = None,
+        salary_min: float | None = None,
+        salary_max: float | None = None,
+        salary_checked: bool = False,
     ) -> None:
         """Insert one jobs row directly.
 
@@ -498,6 +511,15 @@ class FakeConn:
         person. It is not "this was emailed": for that, and for every test that
         means it, use add_sent_job below.
 
+        `work_mode` and the salary trio default to the unenriched state for the
+        same reason the five above them do: NULL arrangement, no price, and
+        nobody having looked for one is exactly what a crawled row starts life
+        as. A test that wants a PRICED job says so — and salary_checked is a
+        separate parameter rather than being inferred from salary_min, because
+        `salary_checked=True, salary_min=None` is a real and important state
+        ("we read it, this posting states no pay") that no inference could
+        express. See db/schema.sql for why that distinction has a column.
+
         There was a `notified` parameter beside it until Phase 1g, when the
         column it wrote went. The pair existed because one boolean had been
         carrying both facts; keeping them as two parameters through 1e and 1f is
@@ -508,9 +530,9 @@ class FakeConn:
             "INSERT INTO jobs (canonical_id, company_id, title, location, city, url, "
             "first_seen_at, last_seen_at, status, seeded, "
             "min_experience, is_pm_role, desc_checked, desc_fetch_failed, desc_checked_at, "
-            "applied, applied_at) "
+            "applied, applied_at, work_mode, salary_min, salary_max, salary_checked) "
             "VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, $11, $12, $13, $14, "
-            "$15, $16)",
+            "$15, $16, $17, $18, $19, $20)",
             canonical_id,
             company_id,
             title,
@@ -527,6 +549,10 @@ class FakeConn:
             desc_checked_at,
             1 if applied else 0,
             applied_at,
+            work_mode,
+            salary_min,
+            salary_max,
+            1 if salary_checked else 0,
         )
 
     async def add_sent_job(
@@ -680,6 +706,7 @@ class FakeConn:
         selected_cities: Sequence[str] = (),
         all_india: bool = False,
         work_modes: Sequence[str] = DEFAULT_WORK_MODES,
+        salary_bands: Sequence[str] = DEFAULT_SALARY_BANDS,
     ) -> None:
         """Seed the preferences row, TEXT[] columns encoded as JSON.
 
@@ -691,6 +718,16 @@ class FakeConn:
         reason about the fixture. All three is also what the live row holds
         (scripts/backfill_onboarding_prefs.py), so the fixture and production
         agree about what "nothing is filtered on mode" looks like.
+
+        `salary_bands` DEFAULTS TO ALL SIX for the second half of that reason and
+        NOT the first. An unnamed row would arrive empty, and an empty selection
+        does NOT match nothing here — notify.match.salary_ok fails OPEN on pay, so
+        every existing test would have gone on passing either way. It is named
+        anyway because the fixture should say what the live row says
+        (scripts/backfill_onboarding_prefs.py wrote all six), and because a
+        default that happens to be harmless is not the same as one that was
+        chosen — the next person changing salary_ok should find a fixture that
+        states its answer rather than one that never had to.
 
         `user_id=None` writes the row UNOWNED, which is the half-applied
         migration state: db/schema.sql applied, the backfill not yet run. It is
@@ -714,8 +751,8 @@ class FakeConn:
         await self.execute(
             "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, "
             "user_id, exp_range_low, exp_range_high, show_no_experience_jobs, "
-            "selected_cities, all_india, work_modes) "
-            "VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            "selected_cities, all_india, work_modes, salary_bands) "
+            "VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             json.dumps(list(cities)),
             json.dumps(list(keywords)),
             json.dumps(list(exclusions)),
@@ -728,6 +765,7 @@ class FakeConn:
             json.dumps(list(selected_cities)),
             int(bool(all_india)),
             json.dumps(list(work_modes)),
+            json.dumps(list(salary_bands)),
         )
 
 
@@ -744,6 +782,7 @@ class FakeConn:
         selected_cities: Sequence[str] = (),
         all_india: bool = False,
         work_modes: Sequence[str] = DEFAULT_WORK_MODES,
+        salary_bands: Sequence[str] = DEFAULT_SALARY_BANDS,
     ) -> None:
         """A SECOND user's filter. Adds a row; deletes nothing.
 
@@ -758,8 +797,8 @@ class FakeConn:
         await self.execute(
             "INSERT INTO preferences (id, cities, keywords, exclusions, max_level, updated_at, "
             "user_id, exp_range_low, exp_range_high, show_no_experience_jobs, "
-            "selected_cities, all_india, work_modes) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            "selected_cities, all_india, work_modes, salary_bands) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
             next_id,
             json.dumps(list(cities)),
             json.dumps(list(keywords)),
@@ -773,6 +812,7 @@ class FakeConn:
             json.dumps(list(selected_cities)),
             int(bool(all_india)),
             json.dumps(list(work_modes)),
+            json.dumps(list(salary_bands)),
         )
 
 

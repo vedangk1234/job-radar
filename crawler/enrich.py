@@ -115,10 +115,15 @@ def _newly_hidden(
     stop being emailed.
 
     "For nobody" is the honest reading of a report line printed once per crawl.
-    The two facts a description yields are the same for every reader — four years
-    is four years — but max_level and the exclusion list are not, so a job hidden
-    from one person can survive for another. Reporting it as hidden then would
-    describe somebody else's screen.
+    The facts a description yields are the same for every reader — four years is
+    four years, and 18 LPA is 18 LPA — but max_level, the exclusion list and the
+    ticked salary bands are not, so a job hidden from one person can survive for
+    another. Reporting it as hidden then would describe somebody else's screen.
+
+    THE SALARY PAIR TRAVELS ON THIS REPORT AND ALMOST NEVER DECIDES IT. An
+    unpriced posting passes notify.match.salary_ok whatever anybody ticked, and
+    every posting on this board is unpriced — so a row appearing here BECAUSE of
+    its pay is the rarest of the four causes and the one worth being able to see.
     """
     return [
         {
@@ -127,6 +132,8 @@ def _newly_hidden(
             "title": job.get("title"),
             "min_experience": job.get("min_experience"),
             "is_pm_role": bool(job.get("is_pm_role")),
+            "salary_min": job.get("salary_min"),
+            "salary_max": job.get("salary_max"),
         }
         for job in jobs
         if not any(is_match(job, prefs) for prefs in filters)

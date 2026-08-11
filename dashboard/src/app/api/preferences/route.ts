@@ -4,6 +4,7 @@ import { badRequest, requireSession, serverError } from "@/lib/guard";
 import {
   CITY_LABELS,
   CITY_UMBRELLAS,
+  SALARY_BAND_VALUES,
   SELECTABLE_CITY_LABELS,
   WORK_MODE_VALUES,
 } from "@/lib/labels";
@@ -248,6 +249,37 @@ export async function PUT(request: Request) {
   }
 
   /*
+   * THE PAY BANDS — AND THIS IS THE ONE FIELD IN THAT FAMILY THAT MAY BE EMPTY.
+   *
+   * Every check above refuses a blank because a blank matches no job at all and
+   * the digest goes quiet in a way that reads as "nothing was posted". That
+   * argument does not transfer: lib/match.salaryOk fails OPEN on an empty
+   * selection, so a row saved without bands filters nothing and every job the
+   * account would otherwise see still reaches it. Refusing here would be this
+   * route inventing a requirement the matcher does not have — the mistake
+   * notify/digest.assert_self_send was narrowed to stop making, one rule over.
+   *
+   * SO "ONBOARDED IMPLIES CONFIGURED" DOES NOT EXTEND TO salary_bands, and that
+   * is worth stating because it holds for selected_cities, work_modes and the
+   * experience range BY CONSTRUCTION — this route is their only writer and it is
+   * also the only writer of onboarding_completed. An onboarded account can have
+   * an empty salary_bands forever, deliberately, exactly as it can have empty
+   * exclusions and a null years_of_experience_held.
+   *
+   * The VALUES are still checked. A typo cannot match a band bound, so it would
+   * narrow the filter to nothing-recognised and hide every priced job silently —
+   * the same reason an unknown city label is refused rather than ignored.
+   */
+  const salaryBands = cleanList(body.salary_bands, { max: 20 });
+  const unknownBands = salaryBands.filter((b) => !SALARY_BAND_VALUES.includes(b));
+  if (unknownBands.length) {
+    return badRequest(
+      `unknown salary band(s): ${unknownBands.join(", ")}. ` +
+        `Choose from: ${SALARY_BAND_VALUES.join(", ")}`,
+    );
+  }
+
+  /*
    * THE EXPERIENCE RANGE — REQUIRED, and it belongs in the same paragraph of the
    * doc comment above as the empty-cities and empty-keywords rules, because it is
    * the same failure. lib/match.experienceExcluded treats an unconfigured range as
@@ -331,6 +363,7 @@ export async function PUT(request: Request) {
       years_of_experience_held: yearsHeld,
       show_no_experience_jobs: showNoExperienceJobs,
       work_modes: workModes,
+      salary_bands: salaryBands,
     });
     return NextResponse.json({
       preferences,
@@ -339,6 +372,7 @@ export async function PUT(request: Request) {
         `${allIndia ? "all of India" : `${selectedCities.length} cit(y/ies)`}, ` +
         `${exclusions.length} exclusion(s), max_level ${maxLevel}, ` +
         `${workModes.join("/")}, ` +
+        `${salaryBands.length ? `${salaryBands.length} pay band(s)` : "any pay"}, ` +
         `looking for ${expLow}-${expHigh} years` +
         `${showNoExperienceJobs ? ", including" : ", excluding"} jobs that state no minimum. ` +
         `The next digest uses this.`,

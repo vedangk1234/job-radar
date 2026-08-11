@@ -32,6 +32,7 @@ export type Preferences = {
   years_of_experience_held: number | null;
   show_no_experience_jobs: boolean;
   work_modes: string[];
+  salary_bands: string[];
   updated_at: string;
   onboarding_completed: boolean;
 };
@@ -71,6 +72,44 @@ export const WORK_MODE_OPTIONS: ReadonlyArray<{
 
 /** Every value a person may put in work_modes. */
 export const WORK_MODE_VALUES: readonly string[] = WORK_MODE_OPTIONS.map((o) => o.value);
+
+/**
+ * THE SIX PAY BANDS A PERSON MAY TICK — the picker's vocabulary, in LPA.
+ *
+ * THE `value` STRINGS ARE NOT NEGOTIABLE AND WERE NOT CHOSEN HERE. They were
+ * written by scripts/backfill_onboarding_prefs.py when Phase 3 Step 0 landed, and
+ * that script has already run: the live preferences row holds exactly these six,
+ * and the script's own verification asserts the set still matches. Respelling them
+ * as "<10L" / "50L+" would leave a live row full of labels this vocabulary does
+ * not admit — and because the gate is a membership test the symptom would be
+ * silent, hiding every PRICED job on a board where nothing is priced yet, so it
+ * would ship green and bite on the first posting that stated pay.
+ *
+ * The `label` is where the L goes. Mirrored in notify/match.SALARY_BAND_LABELS,
+ * whose SALARY_BAND_BOUNDS carry the arithmetic; this file has no database import
+ * and no opinion about overlap, exactly as it has none about city adjacency.
+ *
+ * THE HINT ON THE PANEL SAYS THE QUIET PART, and it has to. Unlike every other
+ * filter on the screen, ticking a band here changes almost nothing: ~0% of
+ * postings state pay, an unpriced job is shown regardless, and a person who ticks
+ * `<10` expecting a short list will get the entire board. Better read than
+ * discovered — the same courtesy the on-site hint above and the "99% state no
+ * minimum" hint one panel up already pay.
+ */
+export const SALARY_BAND_OPTIONS: ReadonlyArray<{
+  value: string;
+  label: string;
+}> = [
+  { value: "<10", label: "Under ₹10L" },
+  { value: "10-15", label: "₹10L – ₹15L" },
+  { value: "15-25", label: "₹15L – ₹25L" },
+  { value: "25-40", label: "₹25L – ₹40L" },
+  { value: "40-50", label: "₹40L – ₹50L" },
+  { value: "50+", label: "₹50L and above" },
+];
+
+/** Every value a person may put in salary_bands. */
+export const SALARY_BAND_VALUES: readonly string[] = SALARY_BAND_OPTIONS.map((o) => o.value);
 
 /**
  * The most keywords one account may save. Enforced in the browser AND in

@@ -75,6 +75,7 @@ export type Preferences = {
   exp_range_high: number | null;
   show_no_experience_jobs: boolean;
   work_modes: readonly string[];
+  salary_bands: readonly string[];
 };
 
 /**
@@ -95,6 +96,19 @@ export type MatchableJob = {
   is_pm_role?: boolean | null;
   desc_checked?: boolean | null;
   desc_fetch_failed?: boolean | null;
+  /*
+   * `string | number` AND THAT IS NOT DEFENSIVE TYPING — it is what the driver
+   * actually hands over. These columns are NUMERIC, and postgres.js returns
+   * NUMERIC as a STRING, because JavaScript's number cannot hold every value the
+   * type can and silently rounding one would be worse than making the caller
+   * look. So the app's own rows arrive as "18", a hand-built row in a script
+   * arrives as 18, and salaryOf below is the one place that difference is
+   * resolved. Typing these as `number` would compile and then compare a string to
+   * a band bound at runtime, which in JavaScript is not an error — it is a wrong
+   * answer.
+   */
+  salary_min?: string | number | null;
+  salary_max?: string | number | null;
 };
 
 /** notify/match.NON_INDIA_LABEL. The one label that is never India. */
@@ -315,6 +329,72 @@ export function workModeOk(job: MatchableJob, prefs: Preferences): boolean {
   return prefs.work_modes.includes(workModeOf(job));
 }
 
+/** notify/match.SALARY_BAND_LABELS. Mirrored in lib/labels.SALARY_BAND_OPTIONS. */
+export const SALARY_BAND_LABELS = ["<10", "10-15", "15-25", "25-40", "40-50", "50+"] as const;
+
+/**
+ * notify/match.SALARY_BAND_BOUNDS — half-open [low, high) in LPA, top unbounded.
+ *
+ * `null` for the top band's ceiling rather than a large number, because a large
+ * number is a value somebody would eventually have to argue about. The Python
+ * carries the same mapping and tests/test_salary.py asserts the ladder is
+ * contiguous and gapless from both sides.
+ */
+export const SALARY_BAND_BOUNDS: Readonly<Record<string, readonly [number, number | null]>> = {
+  "<10": [0, 10],
+  "10-15": [10, 15],
+  "15-25": [15, 25],
+  "25-40": [25, 40],
+  "40-50": [40, 50],
+  "50+": [50, null],
+};
+
+/** notify/match.DEFAULT_SALARY_BANDS — all six, what the live row holds. */
+export const DEFAULT_SALARY_BANDS: readonly string[] = SALARY_BAND_LABELS;
+
+/**
+ * notify/match.salary_of — the stored pay range in LPA, both ends nullable.
+ *
+ * The one place the driver divergence described on MatchableJob is resolved.
+ * `Number("")` is 0 and `Number(null)` is 0, so both are screened before the
+ * conversion rather than after it — the same trap PUT /api/preferences documents
+ * around `Number(body.exp_range_low)`, one file over.
+ */
+export function salaryOf(job: MatchableJob): [number | null, number | null] {
+  const read = (value: string | number | null | undefined): number | null => {
+    if (value === null || value === undefined || value === "") return null;
+    const amount = Number(value);
+    return Number.isFinite(amount) ? amount : null;
+  };
+  return [read(job.salary_min), read(job.salary_max)];
+}
+
+/**
+ * This posting's pay overlaps a band this account ticked. Three branches.
+ *
+ * See notify.match.salary_ok, which carries the argument — in particular the
+ * four reasons a BLANK selection shows everything here while a blank city answer,
+ * a blank work_modes and an unconfigured experience range all match nothing. This
+ * is the one deliberate break in that pattern in either language.
+ */
+export function salaryOk(job: MatchableJob, prefs: Preferences): boolean {
+  const [low, high] = salaryOf(job);
+  if (low === null && high === null) return true;
+  if (prefs.salary_bands.length === 0) return true;
+
+  const jobLow = low ?? 0;
+  const jobHigh = high;
+
+  return prefs.salary_bands.some((band) => {
+    const bounds = SALARY_BAND_BOUNDS[band];
+    if (bounds === undefined) return false;
+    const [bandLow, bandHigh] = bounds;
+    const startsBeforeBandEnds = bandHigh === null || jobLow < bandHigh;
+    const endsAfterBandStarts = jobHigh === null || jobHigh >= bandLow;
+    return startsBeforeBandEnds && endsAfterBandStarts;
+  });
+}
+
 /**
  * Three branches — see notify.match.city_ok, which carries the argument.
  *
@@ -407,7 +487,15 @@ export function experienceExcluded(job: MatchableJob, prefs: Preferences): boole
 
 /** The title stage AND NOT a PM role AND NOT an out-of-range role. */
 export function isMatch(job: MatchableJob, prefs: Preferences): boolean {
-  return titleStageOk(job, prefs) && !pmExcluded(job) && !experienceExcluded(job, prefs);
+  // salaryOk is here and NOT in titleStageOk, mirroring notify.match.is_match —
+  // the title stage is the enrichment seam, and a pay test up there would be
+  // asking the answer to decide whether to ask the question.
+  return (
+    titleStageOk(job, prefs) &&
+    !pmExcluded(job) &&
+    !experienceExcluded(job, prefs) &&
+    salaryOk(job, prefs)
+  );
 }
 
 export function selectMatches<T extends MatchableJob>(jobs: T[], prefs: Preferences): T[] {
@@ -483,6 +571,15 @@ export function explain(job: MatchableJob, prefs: Preferences): { matched: boole
       reason = "experience unknown, and this account hides jobs stating no minimum";
     else if (years < low) reason = `minimum ${years} years below the looking range ${low}-${high}`;
     else reason = `minimum ${years} years above the looking range ${low}-${high}`;
+  } else if (!salaryOk(job, prefs)) {
+    // ONE way to fail this one — salaryOk's other two branches both return true,
+    // so a job reaching here is necessarily priced and necessarily outside every
+    // ticked band. Worded exactly as notify/match.explain words it.
+    const [low, high] = salaryOf(job);
+    const stated = low === high ? `${low} LPA` : `${low}-${high} LPA`;
+    reason =
+      `pay ${stated} is outside the selected band(s) ` +
+      prefs.salary_bands.map((b) => JSON.stringify(b)).join(", ");
   } else reason = `matched ${keywordsHit.join(", ")}`;
 
   return { matched: isMatch(job, prefs), reason };

@@ -142,6 +142,8 @@ that re-applying the schema can never reset a value the dashboard has edited.
 | `work_mode` | `onsite` \| `hybrid` \| `remote`, from the description. **NULL = never established**, read as onsite when filtering and never written down |
 | `min_experience` | years the description demands as a minimum. **NULL = unknown; whether unknown means keep is the reader's `show_no_experience_jobs`, per account, since Slice 2** |
 | `is_pm_role` | the description frames the role as product/people management |
+| `salary_min` / `salary_max` | pay the description states, **normalised to LPA**. NULL = no salary established — read as "unpriced", which SHOWS the job to everyone |
+| `salary_checked` | a parser has read this posting's prose looking for pay. **The column that stops the pair repeating `jobs.notified`**: without it, "read it, states no pay" and "nobody has looked" would share one NULL |
 | `desc_checked` | the description has been read once; never read twice |
 | `desc_fetch_failed` | we looked and could not read it — retried, occasionally |
 | `desc_checked_at` | when we last looked. NULL = never |
@@ -288,7 +290,7 @@ Step 0 added nine more; five are wired up, four are still inert:
 | `years_of_experience_held` | stored, editable, **read by no matcher, ever** — informational only |
 | `selected_cities`, `all_india` | **live** since cities Slice B — the city gate. `cities` is now the legacy fallback for a row that predates the backfill, and the contract slice drops it |
 | `work_modes` | **live** since the work-mode slice — the arrangement filter. Blank matches nothing |
-| `salary_bands` | still inert, still covered by `tests/test_phase3_columns.py`'s sweep |
+| `salary_bands` | **live** since the salary slice — the pay filter, and the one field here that is **fail-OPEN**: blank means "do not filter on pay", not "match nothing" |
 
 It lives in the database and not in a Python constant precisely so the dashboard
 can `UPDATE` it and the very next digest obeys — no redeploy, no commit.
@@ -660,12 +662,24 @@ is_match  =  city_ok                     (YOUR cities, or all of India)
          AND NOT level_excluded      (a level notation in the title)
          AND NOT is_pm_role          (a fact from the description)
          AND experience_ok           (the row's minimum vs YOUR range)
+         AND salary_ok               (the row's pay vs YOUR bands — unpriced always shows)
 ```
 
 The first four are the **title stage** (`title_stage_ok`) — free, and run over
-every open job. The last two read columns, not text, and the seam is named
+every open job. The last three read columns, not text, and the seam is named
 explicitly because the enrichment pass needs to know which jobs are worth a
 network request: the ones that already pass every title test.
+
+**The salary rule is the one filter here that fails OPEN**, and it does so twice
+over — a job with no stated pay is shown to everyone, and an account that ticked
+no bands filters on nothing. Both directions are deliberate and both are argued
+in `notify/match.salary_ok`; the short version is that the job side is silent on
+essentially the whole board, so "no opinion about pay" is this filter's resting
+state rather than an unanswered question. It is therefore also the one onboarding
+column `PUT /api/preferences` does **not** require, which means **"onboarded
+implies configured" does not extend to `salary_bands`** — unlike the city answer,
+the experience range and `work_modes`, where that implication is what makes the
+fail-closed branches unreachable.
 
 **The experience rule is per-account since Phase 3 Slice 2**, and it is three
 branches rather than one comparison:
@@ -2668,6 +2682,101 @@ Newest last. Append here as the project evolves.
 
   1,517 pytest pass (72 new in `tests/test_work_mode.py`), typecheck clean,
   `onboarding-check` and `badge-check` green.
+
+- **2026-08-10 — Phase 3, the salary slice. The last onboarding field, and the
+  first one that is honestly inert.** Two halves as usual — a parser that fills
+  `jobs.salary_min` / `salary_max`, and `preferences.salary_bands` becoming a
+  filter — and a third thing the brief did not ask for and the data demanded.
+
+  **THE MEASUREMENT CAME FIRST AND IT SHOULD BE READ BEFORE ANYTHING ELSE HERE.**
+  Before a line was written, 36 of the 102 enrichable rows were fetched through
+  the production path and grepped for money: **36 read cleanly, ZERO stated a
+  number, 22 mentioned salary/compensation/CTC without one.** Indian postings on
+  these boards do not publish pay. So this slice ships a correct filter over a
+  column that is empty and will stay empty, and success was defined up front as
+  *correct + match-parity unmoved + the synthetic probes prove the gate fires* —
+  explicitly NOT "the digest changed". It did not change, by one job.
+
+  **`jobs.salary_checked` is the column Step 0 did not know it needed**, and it is
+  the `jobs.notified` lesson applied BEFORE the mistake rather than after it. Step
+  0's comment said "NULL = not yet parsed", which is only true while nothing
+  parses. The moment a parser runs, NULL means either "read it, states no pay"
+  (100% of this board) or "nobody has looked" — one column, two facts, told apart
+  by nothing. `work_mode` dodged this by having `desc_checked` beside it; the
+  salary pair could not borrow that, because **87 of the 102 rows were read
+  cleanly before this parser existed**, so `desc_checked` is TRUE on rows no
+  salary parser has ever seen. The flag decides no match (an unpriced job shows
+  either way) — the distinction is kept on the row where it is free, not enforced
+  in the filter where it would change an inbox. It also makes the backfill
+  idempotent in COST, not just in effect.
+
+  **The structural tier is real, built, and empty.** Of the nine ATSes, exactly
+  two publish a comp field — `ashby.compensation.summaryComponents` (only with
+  `?includeCompensation=true`, which is why `notify/description._BOARD_URLS`
+  differs from `fetchers/tier1.py`'s copy by one query parameter) and
+  `recruitee.salary`. Verified live rather than from documentation: **greenhouse,
+  workday, smartrecruiters and lever publish nothing**, and those four are 100% of
+  the enrichable rows. Non-INR is refused rather than converted, in both tiers —
+  an FX rate would freeze into a column nothing re-derives, and $180k converts to
+  ~150 LPA and lands in `50+` looking like the best job on the board while being
+  in Seattle.
+
+  **THE ANCHOR IS THE MAIN GUARD, AND IT IS STRUCTURAL RATHER THAN A BLOCKLIST.**
+  Nothing is read as pay without a currency (`₹`, `Rs`, `INR`) or a unit (lakh,
+  lac, crore). That single rule makes thirteen real strings from the live sample
+  invisible — `30,000+ employees`, `200,000 people`, `3000+ strong team`, `2,500
+  companies`, `the 200,000th candidate`, `Founded in 1871`, `+1 408-536-3015`,
+  `5 years of experience` — where a list of things to avoid could always be
+  incomplete. Six vetoes then handle real money that is not this job's pay:
+  equity/ESOP, funding/revenue/valuation, benefits, foreign currency,
+  **application-form questions** (structurally guaranteed on all 46 Greenhouse
+  rows, because `_greenhouse_description` joins `questions[].label` in on purpose)
+  and hourly/daily rates. Ambiguity resolves to silence — **two disagreeing
+  figures produce nothing**, which is the deliberate inverse of
+  `detect_min_experience`'s `min(found)`: there the smallest number is the answer
+  that KEEPS the job, and here no number is safe.
+
+  **The dry run caught a false positive, which is the entire reason it exists.**
+  The first live pass priced five PhonePe postings at 150 LPA from *"an Annualized
+  Total Payment Value (TPV) of over INR 150 lakh crore"*. Every guard was working:
+  the anchor was honestly satisfied, and the figure landed inside the plausibility
+  band — because the parser had matched `INR 150 lakh`, stopped, and never seen
+  the word that changes the magnitude by seven orders. **`lakh crore` is one unit
+  and it is not lakhs.** The fix is the number's own shape (every lakh form now
+  refuses a trailing `crore`, so the compound matches nothing at all) rather than
+  a veto having to recognise "TPV" — though the funding veto learned that too.
+  Only a person reading the snippet beside the number could have caught it, which
+  is what the SAMPLE section of the report is for.
+
+  **`salary_bands` fails OPEN, and it is the first member of that family to break
+  the pattern.** An unconfigured experience range, a blank city answer and an
+  empty `work_modes` all match NOTHING; an empty `salary_bands` filters nothing.
+  Four reasons, in `notify/match.salary_ok`: the empty-digest failure the other
+  three guard against is unreachable here; fail-closed would contradict the rule's
+  own first branch (silence from the EMPLOYER shows the job, so silence from the
+  READER must not delete it); the job side is silent almost always, so blank is a
+  resting state rather than an unanswered question; and consequently `PUT
+  /api/preferences` does **not** require it, so **"onboarded implies configured"
+  does not extend to this column**. That last one is a real, deliberate hole in a
+  construction three other columns depend on, and it is stated rather than left to
+  be discovered.
+
+  **`match-parity` went 12 → 15 variants and 4 → 10 synthetic probes**, and one
+  existing assertion had to change shape. The fail-closed work-mode check read
+  `perVariant[VARIANTS.length - 1]` with a comment explaining that indexing from
+  the END made it safe against insertions ABOVE — and this slice inserted three
+  variants BELOW it, silently re-pointing it at the blank-SALARY variant, which
+  must behave the opposite way. Every reference now goes through `variantIndex(label)`.
+  The three salary variants are asserted **equal to the live total** rather than
+  empty, which is the inverse of how the other three blanks are asserted and is
+  the fail-open rule stated as a test. The coverage line is a **report, not a
+  gate**, deliberately unlike `work_mode`'s: zero priced rows is the expected
+  state, and a check nobody can make green is one people learn to ignore.
+
+  Applied: **102 rows marked `salary_checked`, 0 priced.** Fingerprint MATCH.
+  `match-parity` **34 before and 34 after** over 7,863 live rows × 15 filters.
+  1,468 pytest pass, 1 skipped (82 new in `tests/test_salary.py`), typecheck clean,
+  `onboarding-check` green.
 
 **Pending**
 

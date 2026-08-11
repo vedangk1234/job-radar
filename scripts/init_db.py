@@ -87,6 +87,11 @@ EXPECTED_COLUMNS = [
     ("jobs", "work_mode"),
     ("jobs", "salary_min"),
     ("jobs", "salary_max"),
+    # The salary slice's own column, and the one on this list whose absence would
+    # be loudest: scripts/backfill_salary.py selects it to decide what to fetch,
+    # so a database without it fails that pass at the first query rather than
+    # quietly re-reading 102 descriptions it had already read.
+    ("jobs", "salary_checked"),
     # Phase 3 Slice 1. These are read by the app from the day they exist, so
     # their absence is not silent in the way the Step 0 columns' would be — they
     # are asserted anyway because this table's whole job is to point at a file

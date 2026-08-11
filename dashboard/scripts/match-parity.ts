@@ -70,6 +70,9 @@ type Row = {
   work_mode: string | null;
   min_experience: number | null;
   is_pm_role: boolean;
+  // postgres.js returns NUMERIC as a string; see lib/match.MatchableJob.
+  salary_min: string | null;
+  salary_max: string | null;
   desc_checked: boolean;
   desc_fetch_failed: boolean;
   user_notified: boolean;
@@ -129,13 +132,20 @@ const NON_INDIA_LABEL_LOCAL = "non-india";
  * failure can only be attributable to the city gate and the work-mode rule —
  * the same discipline the VARIANTS follow by differing in one field at a time.
  */
-function synthetic(id: string, city: string, workMode: string | null): Row {
+function synthetic(
+  id: string,
+  city: string,
+  workMode: string | null,
+  salary: [string | null, string | null] = [null, null],
+): Row {
   return {
     canonical_id: id,
     company: "(synthetic)",
     title: "Backend Engineer",
     city,
     work_mode: workMode,
+    salary_min: salary[0],
+    salary_max: salary[1],
     min_experience: null,
     is_pm_role: false,
     desc_checked: true,
@@ -158,8 +168,8 @@ async function main() {
   `;
   if (!user) throw new Error("MY_EMAIL matches no row in public.users — run scripts/seed_user.py");
 
-  // The same TEN columns notify/store.PREFERENCES_SQL selects — ten since the
-  // work-mode slice added work_modes to the nine cities Slice B left.
+  // The same ELEVEN columns notify/store.PREFERENCES_SQL selects — eleven since
+  // the salary slice added salary_bands to the ten the work-mode slice left.
   // Selecting fewer would hand both matchers an undefined range or an undefined
   // city answer, which is not a state any real loader can produce — the check would
   // then be comparing two implementations on an input neither will ever see.
@@ -167,7 +177,7 @@ async function main() {
     SELECT cities, selected_cities, all_india,
            keywords, exclusions, max_level,
            exp_range_low, exp_range_high, show_no_experience_jobs,
-           work_modes
+           work_modes, salary_bands
       FROM preferences WHERE user_id = ${user.id}
   `;
   if (!prefsRow) {
@@ -190,6 +200,7 @@ async function main() {
   // `npm run badge-check` is what runs the production predicate itself.
   const jobs = await sql<Row[]>`
     SELECT j.canonical_id, c.name AS company, j.title, j.city, j.work_mode,
+           j.salary_min, j.salary_max,
            j.min_experience, j.is_pm_role, j.desc_checked, j.desc_fetch_failed,
            EXISTS (
              SELECT 1
@@ -314,7 +325,51 @@ async function main() {
       note: "nothing ticked — must match NOTHING, fail-closed",
       prefs: { ...prefsRow, work_modes: [] },
     },
+
+    /*
+     * THE SALARY VARIANTS, AND THEY ARE THE WEAKEST IN THIS MATRIX BY
+     * CONSTRUCTION — which is why they are labelled rather than trusted.
+     *
+     * Every live row is unpriced (salary_min IS NULL on all 9,823), and an
+     * unpriced job passes salary_ok whatever is ticked. So ALL THREE of these
+     * must return exactly the live row's total, and a matrix in which they did
+     * anything else would be reporting a bug rather than coverage. That makes
+     * them a regression guard against the gate accidentally consulting a NULL —
+     * the failure mode lib/jobs.salaryClause is written to avoid — and nothing
+     * more. The synthetic probes below are what actually exercise the rule.
+     */
+    {
+      label: "all bands",
+      note: "the live row's own answer, stated explicitly — the pay gate is a no-op",
+      prefs: { ...prefsRow, salary_bands: ["<10", "10-15", "15-25", "25-40", "40-50", "50+"] },
+    },
+    {
+      label: "one band only",
+      note: "a single narrow band — still the full total, because no live row is priced",
+      prefs: { ...prefsRow, salary_bands: ["15-25"] },
+    },
+    {
+      label: "no bands",
+      note: "nothing ticked — must match EVERYTHING the live row does, fail-OPEN",
+      prefs: { ...prefsRow, salary_bands: [] },
+    },
   ];
+
+  /**
+   * A variant's position, by its label.
+   *
+   * Every reference into VARIANTS goes through this. The alternative — literal
+   * indices — has already gone wrong once in this file: the fail-closed
+   * work-mode assertion read `VARIANTS.length - 1` with a comment explaining
+   * that indexing from the END made it safe against insertions ABOVE, and the
+   * salary slice then inserted three variants BELOW it, silently re-pointing the
+   * assertion at a variant that must behave the opposite way.
+   */
+  function variantIndex(label: string): number {
+    const index = VARIANTS.findIndex((v) => v.label === label);
+    if (index === -1) throw new Error(`match-parity: no variant labelled ${label}`);
+    return index;
+  }
 
   const pythonMatched = python({ variants: VARIANTS, jobs }).matched;
   let drifted = 0;
@@ -416,19 +471,84 @@ async function main() {
   }
 
   /*
+   * THE SALARY COVERAGE LINE IS A REPORT AND NOT A GATE, WHICH IS THE OPPOSITE OF
+   * THE work_mode LINE DIRECTLY ABOVE, AND THE ASYMMETRY IS DELIBERATE.
+   *
+   * Zero non-NULL work_mode means the backfill was never applied — a state
+   * somebody must fix, so it exits non-zero. Zero priced rows means Indian job
+   * boards do not publish pay, which is the measured and expected state of this
+   * board: 36 of 36 sampled candidate descriptions stated no number. Failing on
+   * that would be a permanently red check that says nothing, and a check nobody
+   * can make green is a check people learn to ignore — including on the day it
+   * starts meaning something.
+   *
+   * So the number is PRINTED, and the synthetic probes below are what hold the
+   * rule. If this ever climbs off zero, that is news worth reading rather than an
+   * error, and the band spread is what makes it legible.
+   */
+  const priced = jobs.filter((j) => j.salary_min !== null || j.salary_max !== null);
+  console.log(
+    `\nsalary: ${priced.length} of ${jobs.length} rows priced` +
+      (priced.length
+        ? `   ${priced
+            .slice(0, 8)
+            .map((j) => `${j.salary_min}-${j.salary_max}`)
+            .join("  ")}`
+        : "   (expected: Indian boards on this watch list do not publish pay)"),
+  );
+  console.log(
+    "  an unpriced job passes the pay gate whatever is ticked, so this being zero " +
+      "means the salary variants above are a no-op — see the synthetic probes",
+  );
+
+  /*
    * Fail-closed, ASSERTED rather than compared — both languages agreeing on a
    * wrong answer would pass a comparison, exactly as for the blank city answer
    * and the unconfigured range. "Ticking no arrangement matches nothing" is the
-   * property. Indexed from the end so adding a variant above cannot silently
-   * re-point this at a different one.
+   * property.
+   *
+   * BY NAME, NOT BY INDEX, and the salary slice is why. This used to read
+   * `perVariant[VARIANTS.length - 1]` with a comment saying that indexing from
+   * the end stopped a variant ADDED ABOVE from re-pointing it — which was true,
+   * and silently wrong the moment three variants were added BELOW. It then
+   * asserted "matches nothing" about the blank SALARY answer, which must match
+   * everything, and the check would have failed for the right reason by pure
+   * accident. A lookup by label cannot be re-pointed from either direction.
    */
-  const noModeAnswer = perVariant[VARIANTS.length - 1].size;
+  const sizeOf = (label: string): number => perVariant[variantIndex(label)].size;
+
+  const noModeAnswer = sizeOf("no mode answer");
   if (noModeAnswer !== 0) {
     console.error(
       `\nA BLANK WORK-MODE ANSWER MATCHED ${noModeAnswer} job(s). Ticking no ` +
         `arrangement must match nothing — see notify.match.work_mode_ok.`,
     );
     process.exitCode = 1;
+  }
+
+  /*
+   * FAIL-OPEN, ASSERTED IN THE OPPOSITE DIRECTION FROM ALL THREE ABOVE — and the
+   * direction IS the assertion. An empty salary_bands must match exactly what the
+   * live row matches, because notify.match.salary_ok treats "no bands ticked" as
+   * "do not filter on pay" while the city, range and mode rules all treat blank
+   * as "match nothing".
+   *
+   * Asserted as EQUALITY WITH THE LIVE TOTAL rather than as a non-zero count,
+   * because a clause that dropped some rows and kept others would pass a
+   * "> 0" test. The set identity is what "this filtered nothing" means.
+   */
+  const liveTotal = perVariant[0].size;
+  for (const label of ["all bands", "one band only", "no bands"]) {
+    const total = sizeOf(label);
+    if (total !== liveTotal) {
+      console.error(
+        `\nTHE ${label.toUpperCase()} VARIANT MATCHED ${total} job(s), not the ` +
+          `live row's ${liveTotal}. Every live row is unpriced and an unpriced job ` +
+          `passes the pay gate whatever is ticked — so a difference here means the ` +
+          `gate is consulting a NULL. See lib/jobs.salaryClause.`,
+      );
+      process.exitCode = 1;
+    }
   }
 
   /*
@@ -471,6 +591,57 @@ async function main() {
       job: synthetic("syn-remote-onsite-acct", "chennai", "remote"),
       prefsIndex: 8,
       expect: false,
+    },
+
+    /*
+     * THE PAY PROBES, and they carry more weight than the remote ones did.
+     *
+     * The remote branch was unreachable by live data because the PARSER was
+     * strict; the pay gate is unreachable because no Indian board on this watch
+     * list publishes a number at all, which is not a threshold anybody can tune.
+     * So these six fabricated rows are the ONLY evidence in either language that
+     * the gate does anything, and the second one is the whole slice: a priced job
+     * outside every ticked band must disappear.
+     *
+     * `prefsIndex` points at "one band only" (15-25) and "no bands", resolved by
+     * label below rather than by a literal, because this list has already been
+     * re-pointed once by an insertion above it.
+     */
+    {
+      note: "priced 18-24 LPA, account ticked 15-25 -> MATCHES (the ranges overlap)",
+      job: synthetic("syn-pay-overlap", "blr", null, ["18", "24"]),
+      prefsIndex: variantIndex("one band only"),
+      expect: true,
+    },
+    {
+      note: "priced 55-60 LPA, account ticked 15-25 -> NO (the gate is not a no-op)",
+      job: synthetic("syn-pay-outside", "blr", null, ["55", "60"]),
+      prefsIndex: variantIndex("one band only"),
+      expect: false,
+    },
+    {
+      note: "UNPRICED, account ticked 15-25 -> MATCHES (no price always shows)",
+      job: synthetic("syn-pay-null", "blr", null, [null, null]),
+      prefsIndex: variantIndex("one band only"),
+      expect: true,
+    },
+    {
+      note: "priced 12-18 LPA straddling the band floor -> MATCHES (overlap, not containment)",
+      job: synthetic("syn-pay-straddle", "blr", null, ["12", "18"]),
+      prefsIndex: variantIndex("one band only"),
+      expect: true,
+    },
+    {
+      note: "priced 55-60 LPA, account ticked NOTHING -> MATCHES (blank fails OPEN)",
+      job: synthetic("syn-pay-blank-bands", "blr", null, ["55", "60"]),
+      prefsIndex: variantIndex("no bands"),
+      expect: true,
+    },
+    {
+      note: "priced 55-60 LPA, account ticked all six -> MATCHES (the operator's no-op)",
+      job: synthetic("syn-pay-all-bands", "blr", null, ["55", "60"]),
+      prefsIndex: variantIndex("all bands"),
+      expect: true,
     },
   ];
 

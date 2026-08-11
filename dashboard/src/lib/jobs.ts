@@ -5,6 +5,7 @@ import {
   isMatch,
   NON_INDIA_LABEL,
   REMOTE_WORK_MODE,
+  SALARY_BAND_BOUNDS,
   type Preferences,
 } from "./match";
 
@@ -70,6 +71,16 @@ export type JobRow = {
   first_seen_at: string;
   applied: boolean;
   applied_at: string | null;
+  /*
+   * `string | null`, NOT `number | null`, and this is the column type telling the
+   * truth rather than the type being loose. postgres.js returns NUMERIC as a
+   * string — JavaScript's number cannot represent every value the type admits,
+   * and quietly rounding one would be worse than making the reader convert. The
+   * conversion happens once, in lib/match.salaryOf, which is also what the Python
+   * side's notify.match.salary_of exists to be.
+   */
+  salary_min: string | null;
+  salary_max: string | null;
 };
 
 /**
@@ -119,7 +130,8 @@ export type JobView = UserJobRow & { matches: boolean };
 const jobColumns = () => sql`
   j.canonical_id, j.company_id, j.title, j.city, j.work_mode, j.location, j.url,
   j.status, j.min_experience, j.is_pm_role, j.desc_checked,
-  j.desc_fetch_failed, j.first_seen_at, j.applied, j.applied_at
+  j.desc_fetch_failed, j.first_seen_at, j.applied, j.applied_at,
+  j.salary_min, j.salary_max
 `;
 
 /**
@@ -230,6 +242,7 @@ export async function matchCandidates(
        AND ${workModeClause(prefs)}
        AND j.is_pm_role = FALSE
        AND ${experienceClause(prefs)}
+       AND ${salaryClause(prefs)}
        AND (${companyId}::int IS NULL OR j.company_id = ${companyId}::int)
      ORDER BY j.first_seen_at DESC, j.title ASC
   `;
@@ -344,6 +357,67 @@ function experienceClause(prefs: Preferences) {
     return sql`(j.min_experience IS NULL OR j.min_experience BETWEEN ${low} AND ${high})`;
   }
   return sql`j.min_experience BETWEEN ${low} AND ${high}`;
+}
+
+/**
+ * salary_ok, in SQL — the transcription of lib/match.salaryOk, branch for branch.
+ *
+ * IT MUST BE EXACTLY AS WIDE AS THE MATCHER AND NEVER NARROWER, the rule the two
+ * clauses above state and the one this file exists to keep. And this clause is
+ * the most dangerous of the three to get wrong, because of what the data looks
+ * like right now.
+ *
+ * `salary_min` AND `salary_max` ARE NULL ON EVERY ROW OF THE LIVE BOARD — 9,823
+ * of 9,823 — and they will stay that way, because the parser refuses on every
+ * real description it has been shown. So the FIRST branch below is not an edge
+ * case being handled politely; it is the only branch live data ever reaches. The
+ * obvious spelling —
+ *
+ *     j.salary_min < ${bandHigh} AND j.salary_max >= ${bandLow}
+ *
+ * — makes both comparisons NULL for every one of those rows, NULL is not TRUE, so
+ * every row is EXCLUDED and Home goes from 34 jobs to zero. That is the same trap
+ * cityClause's `IS DISTINCT FROM` and workModeClause's `COALESCE` document, with
+ * one difference that matters: those two shipped with 0% and 98% of rows in the
+ * dangerous state respectively, and this one would ship with 100%. It would not
+ * be subtle, but it would be a production outage rather than a quiet drift, so
+ * the unpriced case is stated FIRST and out loud rather than being left to fall
+ * out of an expression.
+ *
+ * THE EMPTY SELECTION RETURNS `TRUE` AS ITS OWN BRANCH, and that is the fail-open
+ * decision made visible in SQL. Every other blank selection in this file resolves
+ * to FALSE through `= ANY('{}')`; this one may not, and writing it as a branch
+ * rather than relying on an expression that happens to be permissive is the same
+ * discipline experienceClause applies to `BETWEEN NULL AND NULL` — a rule that
+ * holds by accident is one a later rewrite breaks without failing anything.
+ */
+function salaryClause(prefs: Preferences) {
+  // No bands ticked -> no pay filtering at all. See notify.match.salary_ok for
+  // why this field breaks the fail-closed pattern the other three follow.
+  if (prefs.salary_bands.length === 0) return sql`TRUE`;
+
+  const overlaps = prefs.salary_bands
+    .map((band) => SALARY_BAND_BOUNDS[band])
+    .filter((bounds): bounds is readonly [number, number | null] => bounds !== undefined)
+    .map(([low, high]) => {
+      // COALESCE mirrors the matcher's `low ?? 0` and `high ?? null`: a
+      // half-stated range is unbounded on the missing side, not unknown.
+      const startsBeforeBandEnds =
+        high === null ? sql`TRUE` : sql`COALESCE(j.salary_min, 0) < ${high}`;
+      const endsAfterBandStarts = sql`(j.salary_max IS NULL OR j.salary_max >= ${low})`;
+      return sql`(${startsBeforeBandEnds} AND ${endsAfterBandStarts})`;
+    });
+
+  // A selection of nothing but unrecognised labels leaves this empty, and the
+  // matcher answers FALSE for such a row — so the prefilter must not answer TRUE.
+  if (overlaps.length === 0) {
+    return sql`(j.salary_min IS NULL AND j.salary_max IS NULL)`;
+  }
+
+  return sql`(
+    (j.salary_min IS NULL AND j.salary_max IS NULL)
+    OR ${overlaps.reduce((left, right) => sql`${left} OR ${right}`)}
+  )`;
 }
 
 /** The matching jobs for one company: the SQL prefilter, then the title rules. */

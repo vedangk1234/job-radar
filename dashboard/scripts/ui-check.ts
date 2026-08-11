@@ -560,6 +560,68 @@ async function main() {
   );
 
   /*
+   * THE PAY-BAND PICKER — Phase 3, the salary slice.
+   *
+   * The Step 5c argument in its purest form. This panel decides almost nothing:
+   * no live posting states a salary, so ticking a band changes no digest today.
+   * A feature that changes nothing is exactly the kind that gets specified,
+   * agreed, and never actually built — which is the failure ui-check was written
+   * for after the Applied checkbox and the badges went that way. match-parity's
+   * synthetic probes prove the RULE; only this can prove the CONTROL exists.
+   */
+  console.log("\nPreferences — the pay-band picker");
+  check(
+    configured.includes("Expected pay"),
+    "the pay panel renders at all",
+    "the salary band picker did not reach the markup",
+  );
+  for (const label of ["Under ₹10L", "₹15L – ₹25L", "₹50L and above"]) {
+    check(
+      configured.includes(label),
+      `the ${label} band is on the screen, labelled in rupees rather than as its stored id`,
+    );
+  }
+  check(
+    !configured.includes(">15-25<"),
+    "and the STORED identifier is not what a person reads — '15-25' is the value, " +
+      "'₹15L – ₹25L' is the label",
+  );
+  check(
+    /Optional/.test(configured) && /do not state a salary/.test(configured),
+    "the hint says the panel is optional AND why it will seem to do nothing — most " +
+      "postings state no pay, so ticking a band narrows almost nothing",
+    "the hint that stops this reading as a broken filter is missing",
+  );
+  check(
+    /leaving this blank and ticking everything do the same thing/.test(configured),
+    "and states the fail-OPEN rule outright, which is the one thing about this " +
+      "field that differs from every other filter on the screen",
+  );
+
+  /*
+   * THE BLANK CASE IS NOT AN ERROR HERE, which is the opposite of every other
+   * panel and therefore worth its own render. WorkModePicker shows a red "no job
+   * can match at all" on an empty selection; this one must not, because an empty
+   * salary_bands filters nothing rather than everything.
+   */
+  const noBands = withRouter(
+    createElement(lib.PreferencesEditor, {
+      initial: { ...prefs, salary_bands: [] },
+      resume: null,
+    }),
+  );
+  check(
+    /pay is not filtered on/.test(noBands),
+    "with no bands ticked the screen says pay is not filtered on",
+    "the empty pay selection did not explain itself",
+  );
+  check(
+    !/msg bad[^]{0,200}pay/i.test(noBands),
+    "and does NOT flag it as an error — an empty pay selection is a legitimate " +
+      "answer, unlike an empty city or work-arrangement selection",
+  );
+
+  /*
    * THE CITY PICKER — Phase 3, cities Slice B.
    *
    * The reason ui-check exists applies to this slice more than to most: the
