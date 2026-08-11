@@ -310,10 +310,28 @@ def test_the_onboarding_target_is_a_real_page_that_guards_itself():
     calls requirePage() like every other page; test_every_page_guards_itself
     covers that, and this states the pairing so the two cannot be separated by
     someone renaming the route.
+
+    THE LITERAL LIVES IN lib/labels.ts SINCE THE ONBOARDING-FORM SLICE, and
+    lib/guard.ts re-exports it. It had to move because components/Nav — a client
+    component, which hides the app tabs on that route — cannot import a value from
+    lib/guard without dragging lib/preferences and postgres.js into the browser
+    bundle. So this reads the declaration from labels and checks that guard still
+    reaches it: one string, three readers, and a rename that misses one of them is
+    a failure here rather than a person mid-setup looking at links that bounce.
     """
     guard = (SRC / "lib" / "guard.ts").read_text(encoding="utf-8")
-    target = re.search(r'ONBOARDING_PATH\s*=\s*"(/[^"]*)"', guard)
-    assert target, "lib/guard.ts does not declare ONBOARDING_PATH as a literal path"
+    labels = (SRC / "lib" / "labels.ts").read_text(encoding="utf-8")
+
+    target = re.search(r'ONBOARDING_PATH\s*=\s*"(/[^"]*)"', guard) or re.search(
+        r'ONBOARDING_PATH\s*=\s*"(/[^"]*)"', labels
+    )
+    assert target, (
+        "neither lib/guard.ts nor lib/labels.ts declares ONBOARDING_PATH as a literal path"
+    )
+    assert "ONBOARDING_PATH" in guard, (
+        "lib/guard.ts no longer names ONBOARDING_PATH — the gate has stopped "
+        "redirecting to the constant every other reader shares"
+    )
 
     page = SRC / "app" / target.group(1).strip("/") / "page.tsx"
     assert page.exists(), (

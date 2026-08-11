@@ -1269,7 +1269,10 @@ Next.js App Router + TypeScript in `dashboard/`. Read-mostly.
   `requirePage()` lets past its own gate. It redirects to Home the moment
   `onboarding_completed` is TRUE, so an onboarded account cannot sit on a setup
   screen. **A save is refused while the account watches no company** — see *The
-  onboarding gate*.
+  onboarding gate*. Since the onboarding-form slice it is **one scrolling page of
+  named sections** (resume and keywords → experience → cities → work mode → pay →
+  companies) with a **sticky save bar** naming every answer still missing, and
+  **the app tabs are hidden on this route** — Sign out is not.
 
 ### The onboarding gate
 
@@ -1364,7 +1367,7 @@ Guard 3 (`miss_count >= 3`) disappears from both screens.
 | `preferences.ts` | load/save this user's row, `cleanList` |
 | `watchlist.ts` | the per-user watch list: `watchCompany` (pair + history suppression, one transaction, per-plan cap), `unwatchCompany`, `watchesAnything`. The port of `db/watchlist.py` + `db/notifications.SUPPRESS_COMPANY_HISTORY_SQL` |
 | `currentUser.ts` | the MY_EMAIL → `public.users.id` bridge, memoised. **Temporary; deleted at Phase 2 auth** |
-| `labels.ts` | `Preferences`, `CITY_LABELS`, `KEYWORD_CAP`, `DEFAULT_PREFERENCES` (the install's filter, mirrored from Python) and `NEW_ACCOUNT_SEED` (what a signup actually gets) — **constants with no database import** |
+| `labels.ts` | `Preferences`, `CITY_LABELS`, `KEYWORD_CAP`, `DEFAULT_PREFERENCES` (the install's filter, mirrored from Python), `NEW_ACCOUNT_SEED` (what a signup actually gets) and `ONBOARDING_PATH` (re-exported by `guard.ts`; the nav needs it and cannot import that file) — **constants with no database import** |
 | `match.ts` | the port of `notify/match.py` |
 | `ats.ts` / `workday.ts` | the port of `fetchers/resolve.py` |
 | `board-url.ts` | a pasted URL → `(ats, token, config)`. Dashboard-only; no Python counterpart |
@@ -2918,6 +2921,79 @@ Newest last. Append here as the project evolves.
   sending domain is verified — see *Pending*), the matchers, the crawler, and the
   Python watch-list path, which is unchanged and still the CLI.
 
+- **2026-08-11 — Phase 3, the onboarding-form slice. Setup stops being the
+  preferences editor with different copy.** Presentation only: not one field,
+  validation rule, save gate or route behaviour changed, and that is the claim the
+  slice rests on rather than a disclaimer attached to it. `PUT /api/preferences`
+  is untouched, `savePreferences` is untouched, the Save button's `disabled`
+  expression and its label chain are the same five terms in the same order.
+
+  **What /onboarding was.** Every panel this app owns, stacked: the watch-list
+  picker, then a resume drop zone, chips, an experience panel, three multi-selects
+  and two more chip lists, ending in a button. Nine cards with no grouping and no
+  statement of what the whole thing was for — and the button that refuses, with
+  the reason written on it, at the very bottom of several screens of scrolling. A
+  person could not see why Save was greyed without leaving the answer they were in
+  the middle of giving.
+
+  **What it is.** The same panels, grouped into six named sections in a deliberate
+  reading order — resume and keywords, experience, cities, work mode, pay,
+  companies — each with a heading that asks the question and a line saying what
+  the answer does. Still ONE page: a stepper hides four answers behind a Next
+  button while asking about the fifth, and every answer here is visible to every
+  other one (how senior a job you want and what it pays are the same decision).
+
+  **The save bar is sticky, and being LAST is what makes it work.** `position:
+  sticky; bottom: 0` keeps an element pinned only while its own containing block
+  is on screen, so a bar with a section under it scrolls away exactly when the
+  form gets long enough to need one. That is why the watch-list picker is threaded
+  THROUGH the editor as `extraSections` rather than rendered beside it, and why
+  `ui-check` asserts the ordering over the shipped `OnboardingSetup` rather than
+  over the editor alone — the property is invisible in either component's own
+  markup and a mutation moving the bar above the picker was run and caught.
+
+  **The bar lists what is missing, and lists nothing it decides.** Each entry
+  restates one of the booleans the button already reads and links to the section
+  that fixes it. One entry — an empty keyword list — is deliberately NOT a term of
+  the button's gate: the route refuses it, so it genuinely blocks a save, but
+  adding it to `disabled` would change what saves rather than what is said, and
+  this slice changes nothing about what saves.
+
+  **The order reversed, and the old reason is on the record because it was not
+  wrong.** The picker used to be first, on the argument that "no keyword matched"
+  and "you watch nobody" are indistinguishable on an empty dashboard. The save bar
+  answers that better — it names every missing answer at once, permanently — and
+  what the old order cost was the opening: fifty company names as the first thing
+  a person sees, before anything asked what kind of job they want.
+
+  **THE NAV IS HIDDEN ON /onboarding, discharging the *Pending* item Slice 1b
+  left.** That note weighed two ways of telling the layout — a query per
+  navigation, or threading the flag out of a page into its own layout — and both
+  answer "is this account onboarded". The chrome's question is not that one. It is
+  "is this the setup screen", which `usePathname()` already answers on the client
+  for free, so `app/layout.tsx` still reads no database and the gate is untouched.
+  **Sign out stays on both branches**: removing the navigation from a screen a
+  person is held on is only acceptable while there is still a way off it.
+
+  `ONBOARDING_PATH` moved from `lib/guard.ts` to `lib/labels.ts` for the reason
+  that file exists — `Nav` is a client component, and importing a VALUE from
+  `guard.ts` would drag `lib/preferences` and postgres.js into the browser bundle.
+  `guard.ts` re-exports it, so the gate's destination and the route the tabs
+  vanish on are one string; `onboarding-check` asserts the equality and
+  `tests/test_dashboard_auth.py` was widened to read the literal from wherever it
+  is declared while still requiring `guard.ts` to name it.
+
+  Verification: **1,547 pytest / 2 skipped**, typecheck and `next build` clean,
+  `ui-check` **112 → 155 assertions** (the nav on three routes, the six sections,
+  the bar and its blocker list, and /onboarding's composition end to end),
+  `onboarding-check` +1 and green — a blank account is still held at the gate and
+  its first save still releases it. Two mutations run, two caught: deleting the
+  nav's hide (6 failures) and moving the save bar above the picker (1).
+
+  Deliberately **not** here: matching, the parser, `lib/preferences`, every `/api`
+  route, the crawler, and the landing page's black theme — this is the app
+  surface, styled from the same `globals.css` tokens as every other screen.
+
 **Pending**
 
 - **The Slice A relabel has never been applied to live Postgres, and the deployed
@@ -2943,12 +3019,6 @@ Newest last. Append here as the project evolves.
   — and `relabel_cities.py`'s two gates (residue, blast radius) are what say
   whether the relabel is safe to apply when it runs.
 
-- **The nav does not know about the onboarding gate.** During setup the chrome
-  still shows Home / Jobs / Add, and clicking any of them bounces back to
-  `/onboarding`. Correct, and visible rather than silent — but `app/layout.tsx`
-  reads no database at all today, so telling it would mean either a query per
-  navigation or threading the flag out of a page into its own layout. It belongs
-  with the shell work rather than with the gate.
 - **The Add flow can still turn `tracked` back ON, and can rename a company.**
   The residual half of Slice 1a, deliberately left. `POST /api/companies` →
   `lib/companies.upsertCompany` carries

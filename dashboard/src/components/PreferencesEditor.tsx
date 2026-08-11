@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 
 // From lib/labels, never lib/preferences: the latter imports postgres.js, and
 // importing a VALUE from it here would pull the driver into the client bundle.
@@ -54,12 +54,23 @@ const SELECTABLE = new Set(SELECTABLE_CITY_LABELS);
  *
  * A path, not a callback, because this is a client component rendered by a
  * server one and a function is not serialisable across that boundary.
+ *
+ * THE ONBOARDING-FORM SLICE CHANGED THE LAYOUT AND NOTHING ELSE, which is worth
+ * stating plainly because the diff is large. Every field, every validation rule,
+ * every gate on the Save button and the whole of save() are byte-for-byte what
+ * they were: the same PUT, the same body, the same disabled expression, the same
+ * label chain. What changed is that the panels are grouped into named sections in
+ * a deliberate order, and that the Save button lives in a bar that stays on screen
+ * while a person scrolls — because this form is now six sections long and a button
+ * at the bottom of it is a button nobody can see the state of.
  */
 export function PreferencesEditor({
   initial,
   resume,
   redirectOnSave,
   watchedCount,
+  extraSections,
+  watchlistHref = "/watchlist",
 }: {
   initial: Preferences;
   resume: StoredResume | null;
@@ -83,6 +94,28 @@ export function PreferencesEditor({
    * it by omission.
    */
   watchedCount?: number;
+  /**
+   * SECTIONS THIS EDITOR DOES NOT OWN, RENDERED IN ITS STACK JUST ABOVE THE SAVE
+   * BAR. /onboarding passes the watch-list picker through here; /preferences
+   * passes nothing and is one section shorter.
+   *
+   * A SLOT RATHER THAN THE PICKER ITSELF, for the reason `watchedCount` is a count
+   * rather than a list: this editor has no business knowing what a watch list is.
+   * It is a slot rather than the caller simply rendering the picker as a sibling
+   * because of where the save bar has to be — a `position: sticky; bottom: 0`
+   * element stays pinned only while its own containing block is on screen, so a
+   * bar that is not the LAST thing in the form scrolls away halfway down the page,
+   * which is the one failure a sticky bar exists to prevent.
+   */
+  extraSections?: ReactNode;
+  /**
+   * Where "watch at least one company" points when it is the answer that is
+   * missing. /preferences leaves it at the default, because the fix is genuinely
+   * on another screen; /onboarding passes the anchor of the section it renders
+   * through `extraSections`, because sending somebody to /watchlist mid-setup is a
+   * round trip the gate would bounce straight back.
+   */
+  watchlistHref?: string;
 }) {
   const router = useRouter();
 
@@ -246,6 +279,56 @@ export function PreferencesEditor({
         ? `${lowNum} to ${highNum} is inverted — the low end must not exceed the high end.`
         : null;
 
+  /*
+   * WHAT IS STILL MISSING, as a list the save bar can print without a person
+   * having to go and find it.
+   *
+   * DERIVED, NEVER DECIDED. Every entry restates one of the booleans above for a
+   * reader — `overCap`, `rangeInvalid`, `noCityAnswer`, `noWorkModeAnswer` and
+   * `noCompaniesWatched` are exactly the five terms of the Save button's own
+   * `disabled` expression, listed in the order its label chain reports them.
+   * Nothing here can block a save the button would have allowed or allow one it
+   * would have refused: the bar SAYS, the button DECIDES, and PUT
+   * /api/preferences decides again, which is where the rules actually live.
+   *
+   * THE EMPTY KEYWORD LIST IS THE ONE ENTRY THAT IS NOT A TERM OF THAT EXPRESSION,
+   * and it is listed rather than added to it. The route refuses an empty
+   * `keywords` — it matches no job at all — so it genuinely blocks a save; it has
+   * simply never been part of the button's gate, and adding it there would change
+   * what saves rather than what is said. It is listed because on a form this long
+   * the Keywords panel's own red message is several screens away from the button,
+   * and a person who presses anyway gets precisely the refusal they always got.
+   */
+  const blockers: { key: string; href: string; text: string }[] = [];
+  if (!keywords.length) {
+    blockers.push({ key: "keywords", href: "#resume", text: "Add at least one keyword" });
+  }
+  if (overCap) {
+    blockers.push({
+      key: "cap",
+      href: "#resume",
+      text: `Remove ${keywords.length - KEYWORD_CAP} keyword${
+        keywords.length - KEYWORD_CAP === 1 ? "" : "s"
+      }`,
+    });
+  }
+  if (rangeInvalid) {
+    blockers.push({
+      key: "range",
+      href: "#experience",
+      text: rangeBlank ? "Set both ends of the experience range" : "Fix the experience range",
+    });
+  }
+  if (noCityAnswer) {
+    blockers.push({ key: "cities", href: "#cities", text: "Pick a city, or choose all of India" });
+  }
+  if (noWorkModeAnswer) {
+    blockers.push({ key: "modes", href: "#work-mode", text: "Pick a work arrangement" });
+  }
+  if (noCompaniesWatched) {
+    blockers.push({ key: "watch", href: watchlistHref, text: "Watch at least one company" });
+  }
+
   /**
    * A parsed resume REPLACES the keyword list outright.
    *
@@ -350,198 +433,325 @@ export function PreferencesEditor({
   }
 
   return (
-    <>
-      <ResumePanel initial={resume} onKeywords={replaceWithSuggestions} />
+    <div className="setup-form">
+      <FormSection
+        id="resume"
+        title="Your resume and keywords"
+        lede="Upload your resume and we read it once to suggest keywords, or type your own. A job title has to contain at least one of them before anything else is even asked about it."
+      >
+        <ResumePanel initial={resume} onKeywords={replaceWithSuggestions} />
 
-      <KeywordChips values={keywords} onChange={setKeywords} />
+        <KeywordChips values={keywords} onChange={setKeywords} />
+      </FormSection>
 
-      <div className="panel">
-        <h2>Experience</h2>
-        <p className="hint">
-          A job&rsquo;s description states the minimum it wants. We keep the ones whose minimum
-          falls <em>inside</em> your range &mdash; so a posting asking for less than you want is
-          dropped too, not just one asking for more. Only the minimum is stored, so a
-          &ldquo;3&ndash;6 years&rdquo; posting counts as 3.
-        </p>
-
-        <div className="row" style={{ alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-          <label className="muted small" htmlFor="exp-low">
-            Looking for
-          </label>
-          <input
-            id="exp-low"
-            type="number"
-            min={0}
-            max={20}
-            step={1}
-            value={expLow}
-            onChange={(e) => setExpLow(e.target.value)}
-            aria-label="Lowest years of experience to look for"
-            style={{ maxWidth: 90 }}
-          />
-          <span className="muted small">to</span>
-          <input
-            id="exp-high"
-            type="number"
-            min={0}
-            max={20}
-            step={1}
-            value={expHigh}
-            onChange={(e) => setExpHigh(e.target.value)}
-            aria-label="Highest years of experience to look for"
-            style={{ maxWidth: 90 }}
-          />
-          <span className="muted small">years of experience</span>
-        </div>
-        {rangeError ? <p className="msg bad">{rangeError}</p> : null}
-
-        <div style={{ marginTop: 18 }}>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={showNoExp}
-              onChange={(e) => setShowNoExp(e.target.checked)}
-            />
-            <span>Show jobs that don&rsquo;t state a minimum</span>
-          </label>
+      <FormSection
+        id="experience"
+        title="How much experience you want"
+        lede="The years a posting asks for, against the range you are looking in."
+      >
+        <div className="panel">
+          <h2>Experience</h2>
           <p className="hint">
-            About <strong>99% of open postings state no minimum</strong> &mdash; either the
-            description never mentions years, or we could not read it. Leaving this off hides
-            almost everything, so it starts on. Turning it off gives you a much shorter list of
-            postings that said out loud what they want.
+            A job&rsquo;s description states the minimum it wants. We keep the ones whose minimum
+            falls <strong>inside</strong> your range &mdash; so a posting asking for less than you
+            want is dropped too, not just one asking for more. Only the minimum is stored, so a
+            &ldquo;3&ndash;6 years&rdquo; posting counts as 3.
           </p>
-        </div>
 
-        <div style={{ marginTop: 18 }}>
-          <label className="muted small" htmlFor="years-held">
-            Your own experience (optional)
-          </label>
-          <div className="row" style={{ alignItems: "center", gap: 10 }}>
+          <div className="row" style={{ alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <label className="muted small" htmlFor="exp-low">
+              Looking for
+            </label>
             <input
-              id="years-held"
+              id="exp-low"
               type="number"
               min={0}
-              max={50}
+              max={20}
               step={1}
-              value={yearsHeld}
-              onChange={(e) => setYearsHeld(e.target.value)}
-              placeholder="—"
-              aria-label="Years of experience you have"
+              value={expLow}
+              onChange={(e) => setExpLow(e.target.value)}
+              aria-label="Lowest years of experience to look for"
               style={{ maxWidth: 90 }}
             />
-            <span className="muted small">years</span>
+            <span className="muted small">to</span>
+            <input
+              id="exp-high"
+              type="number"
+              min={0}
+              max={20}
+              step={1}
+              value={expHigh}
+              onChange={(e) => setExpHigh(e.target.value)}
+              aria-label="Highest years of experience to look for"
+              style={{ maxWidth: 90 }}
+            />
+            <span className="muted small">years of experience</span>
           </div>
-          <p className="hint">
-            Recorded on your profile and shown back to you here. It <strong>never filters
-            anything</strong> &mdash; the range above is what decides. Leave it blank if you would
-            rather not say.
-          </p>
+          {rangeError ? <p className="msg bad">{rangeError}</p> : null}
+
+          <div style={{ marginTop: 18 }}>
+            <label className="switch">
+              <input
+                type="checkbox"
+                checked={showNoExp}
+                onChange={(e) => setShowNoExp(e.target.checked)}
+              />
+              <span>Show jobs that don&rsquo;t state a minimum</span>
+            </label>
+            <p className="hint">
+              About <strong>99% of open postings state no minimum</strong> &mdash; either the
+              description never mentions years, or we could not read it. Leaving this off hides
+              almost everything, so it starts on. Turning it off gives you a much shorter list of
+              postings that said out loud what they want.
+            </p>
+          </div>
+
+          <div style={{ marginTop: 18 }}>
+            <label className="muted small" htmlFor="years-held">
+              Your own experience (optional)
+            </label>
+            <div className="row" style={{ alignItems: "center", gap: 10 }}>
+              <input
+                id="years-held"
+                type="number"
+                min={0}
+                max={50}
+                step={1}
+                value={yearsHeld}
+                onChange={(e) => setYearsHeld(e.target.value)}
+                placeholder="—"
+                aria-label="Years of experience you have"
+                style={{ maxWidth: 90 }}
+              />
+              <span className="muted small">years</span>
+            </div>
+            <p className="hint">
+              Recorded on your profile and shown back to you here. It <strong>never filters
+              anything</strong> &mdash; the range above is what decides. Leave it blank if you would
+              rather not say.
+            </p>
+          </div>
         </div>
-      </div>
+      </FormSection>
 
-      <WorkModePicker selected={workModes} onChange={setWorkModes} />
+      <FormSection
+        id="cities"
+        title="Where you want to work"
+        lede="Pick the cities you would take a job in, or say the whole country is fine. Jobs outside India are never sent either way."
+      >
+        <CityPicker
+          selected={selectedCities}
+          onSelectedChange={setSelectedCities}
+          allIndia={allIndia}
+          onAllIndiaChange={setAllIndia}
+        />
+      </FormSection>
 
-      <SalaryBandPicker selected={salaryBands} onChange={setSalaryBands} />
+      <FormSection
+        id="work-mode"
+        title="How you want to work"
+        lede="On-site, hybrid or fully remote. A fully remote job reaches you from anywhere in the country, whichever cities you picked above."
+      >
+        <WorkModePicker selected={workModes} onChange={setWorkModes} />
+      </FormSection>
 
-      <CityPicker
-        selected={selectedCities}
-        onSelectedChange={setSelectedCities}
-        allIndia={allIndia}
-        onAllIndiaChange={setAllIndia}
-      />
+      <FormSection
+        id="pay"
+        title="What you expect to be paid"
+        lede="Optional, and the one answer here that narrows almost nothing: hardly any posting on these boards states a salary, and one that does not is shown to you regardless."
+      >
+        <SalaryBandPicker selected={salaryBands} onChange={setSalaryBands} />
+      </FormSection>
 
-      <ChipList
-        title="Exclusions"
-        hint="A title matching ANY of these is dropped, even if a keyword matched. Empty is allowed and means nothing is excluded by title."
-        values={exclusions}
-        onChange={setExclusions}
-        placeholder="e.g. intern"
-      />
+      {/*
+        THE CALLER'S OWN SECTIONS, and on /onboarding that is the watch-list
+        picker. Here rather than as a sibling of this component so that the save
+        bar below stays the LAST thing in the form — see the prop's comment.
+      */}
+      {extraSections}
 
-      <div className="panel">
-        <h2>Max level</h2>
-        <p className="hint">
-          Titles that state a seniority above this are dropped. A title that states no level at
-          all counts as 2, so lowering this below 2 filters out most ordinary postings.
-        </p>
-        <select
-          value={maxLevel}
-          onChange={(e) => setMaxLevel(Number(e.target.value))}
-          style={{ maxWidth: 320 }}
-        >
-          {Object.entries(LEVEL_LABELS).map(([value, label]) => (
-            <option key={value} value={value}>
-              {label}
-            </option>
-          ))}
-        </select>
-      </div>
+      <FormSection
+        id="tuning"
+        title="Fine-tuning"
+        lede="Two rules that take jobs back OUT of the list everything above lets in. Both are optional, and both are safe to leave alone."
+      >
+        <ChipList
+          title="Exclusions"
+          hint="A title matching ANY of these is dropped, even if a keyword matched. Empty is allowed and means nothing is excluded by title."
+          values={exclusions}
+          onChange={setExclusions}
+          placeholder="e.g. intern"
+        />
+
+        <div className="panel">
+          <h2>Max level</h2>
+          <p className="hint">
+            Titles that state a seniority above this are dropped. A title that states no level at
+            all counts as 2, so lowering this below 2 filters out most ordinary postings.
+          </p>
+          <select
+            value={maxLevel}
+            onChange={(e) => setMaxLevel(Number(e.target.value))}
+            style={{ maxWidth: 320 }}
+          >
+            {Object.entries(LEVEL_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </div>
+      </FormSection>
 
       {/*
         Said in words as well as on the button, because the fix is on ANOTHER
         SCREEN when this editor is /preferences — there is no picker here to
         point at, and a greyed button reading "pick a company to watch" with no
         company control in sight is the kind of dead end this project's other
-        blank-answer messages exist to avoid. On /onboarding the picker is
-        directly above and the link is simply redundant rather than wrong.
+        blank-answer messages exist to avoid. On /onboarding the picker is a
+        section of this same form, and `watchlistHref` points at it instead.
       */}
       {noCompaniesWatched ? (
         <p className="msg bad">
           You are not watching any company, so this filter would match nothing at all — the
           digest asks for jobs at the companies you watch first, and there are none.{" "}
-          <Link href="/watchlist">Pick some on the Watchlist tab</Link>, then save.
+          <Link href={watchlistHref}>Pick some on the Watchlist tab</Link>, then save.
         </p>
       ) : null}
 
-      <div
-        className="panel"
-        style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap" }}
-      >
-        {/*
-          * Disabled over the cap as well as when clean. The server refuses it
-          * anyway — that is where the rule lives — so this is about telling
-          * somebody why the button is not working before they press it, rather
-          * than about enforcement. The label says the number, because a greyed
-          * button with no reason is the thing people file bugs about.
-          */}
-        <button
-          className="primary"
-          onClick={save}
-          disabled={
-            busy ||
-            !dirty ||
-            overCap ||
-            rangeInvalid ||
-            noCityAnswer ||
-            noWorkModeAnswer ||
-            noCompaniesWatched
-          }
-        >
-          {busy
-            ? "Saving…"
-            : overCap
-              ? `Remove ${keywords.length - KEYWORD_CAP} keyword${
-                  keywords.length - KEYWORD_CAP === 1 ? "" : "s"
-                } to save`
-              : rangeInvalid
-                ? "Fix the experience range to save"
-                : noCityAnswer
-                  ? "Pick a city to save"
-                  : noWorkModeAnswer
-                    ? "Pick a work arrangement to save"
-                    : noCompaniesWatched
-                      ? "Pick a company to watch to save"
-                  : dirty
-                    ? "Save preferences"
-                    : "No changes"}
-        </button>
-        <span className="muted small">
-          Last saved {new Date(updatedAt).toLocaleString()}
-        </span>
-      </div>
+      {/*
+        THE SAVE BAR, AND WHY IT IS STICKY.
 
-      {message ? <p className={`msg ${message.kind}`}>{message.text}</p> : null}
-    </>
+        This form is six sections and several screens long, so a button at the
+        bottom of it is a button whose STATE nobody can see: the whole point of
+        greying Save and labelling it with the reason is lost if reading the
+        reason means scrolling past everything you were in the middle of
+        answering. Pinned to the bottom of the viewport, the answer to "can I
+        finish yet, and if not why not" is on screen the entire time.
+
+        `position: sticky; bottom: 0` rather than `fixed`: it is a member of the
+        form rather than furniture bolted over it, so it settles at the end of the
+        stack instead of hovering above the delete-account section on
+        /preferences — and it needs no compensating padding on the page below it.
+
+        THE BUTTON ITSELF IS UNCHANGED, deliberately and to the character: the
+        same `disabled` expression, the same label chain in the same order. What
+        is new beside it is the list, which restates those same booleans in words
+        and points at the section each one lives in. See `blockers`.
+      */}
+      <div className="save-bar">
+        <div className="save-bar-inner">
+          <div className="save-state">
+            {blockers.length ? (
+              <>
+                <span className="save-state-title">Still needed</span>
+                <ul className="save-blockers">
+                  {blockers.map((blocker) => (
+                    <li key={blocker.key}>
+                      <a href={blocker.href}>{blocker.text}</a>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            ) : (
+              <span className="save-state-ok">
+                {busy
+                  ? "Saving…"
+                  : dirty
+                    ? "Every answer is in. Save when it looks right."
+                    : "Everything on this page is saved."}
+              </span>
+            )}
+          </div>
+
+          <div className="save-bar-action">
+            <span className="muted small saved-at">
+              Last saved {new Date(updatedAt).toLocaleString()}
+            </span>
+            {/*
+              * Disabled over the cap as well as when clean. The server refuses it
+              * anyway — that is where the rule lives — so this is about telling
+              * somebody why the button is not working before they press it, rather
+              * than about enforcement. The label says the number, because a greyed
+              * button with no reason is the thing people file bugs about.
+              */}
+            <button
+              className="primary"
+              onClick={save}
+              disabled={
+                busy ||
+                !dirty ||
+                overCap ||
+                rangeInvalid ||
+                noCityAnswer ||
+                noWorkModeAnswer ||
+                noCompaniesWatched
+              }
+            >
+              {busy
+                ? "Saving…"
+                : overCap
+                  ? `Remove ${keywords.length - KEYWORD_CAP} keyword${
+                      keywords.length - KEYWORD_CAP === 1 ? "" : "s"
+                    } to save`
+                  : rangeInvalid
+                    ? "Fix the experience range to save"
+                    : noCityAnswer
+                      ? "Pick a city to save"
+                      : noWorkModeAnswer
+                        ? "Pick a work arrangement to save"
+                        : noCompaniesWatched
+                          ? "Pick a company to watch to save"
+                      : dirty
+                        ? "Save preferences"
+                        : "No changes"}
+            </button>
+          </div>
+        </div>
+
+        {message ? <p className={`msg ${message.kind}`}>{message.text}</p> : null}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One labelled section of the form: a heading, a line of helper text, and the
+ * panels that answer it.
+ *
+ * PURELY PRESENTATIONAL, and it owns no state at all — which is what keeps this
+ * slice a reskin. The panels inside are the same components, holding the same
+ * values, writing through the same setters. What the wrapper adds is a name for
+ * the group, an id to link to (the save bar's list points at these), and the
+ * separation that makes a long single page readable as parts rather than as one
+ * undifferentiated stack of cards.
+ *
+ * THE SECTION TITLE ASKS THE QUESTION AND THE PANEL TITLE NAMES THE FIELD, which
+ * is why the two are deliberately not the same words. "Where you want to work"
+ * over a panel headed "Cities" reads as a question and its answer; "Cities" over
+ * "Cities" would read as a bug.
+ */
+export function FormSection({
+  id,
+  title,
+  lede,
+  children,
+}: {
+  id: string;
+  title: string;
+  lede: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="form-section" id={id} aria-labelledby={`${id}-title`}>
+      <div className="section-head">
+        <h2 className="section-title" id={`${id}-title`}>
+          {title}
+        </h2>
+        <p className="section-lede">{lede}</p>
+      </div>
+      {children}
+    </section>
   );
 }
 

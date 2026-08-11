@@ -141,6 +141,24 @@ export const SALARY_BAND_VALUES: readonly string[] = SALARY_BAND_OPTIONS.map((o)
 export const KEYWORD_CAP = 25;
 
 /**
+ * WHERE AN ACCOUNT THAT HAS NOT CHOSEN A FILTER YET IS SENT.
+ *
+ * The literal used to live in lib/guard.ts, which is still the only thing that
+ * REDIRECTS to it — but it is here now because a second reader appeared and that
+ * reader is a client component. components/Nav hides the tabs on this route, and
+ * a client component importing a VALUE from lib/guard would drag lib/preferences,
+ * and therefore postgres.js, into the browser bundle: the exact failure this file
+ * exists to prevent, stated at the top of it.
+ *
+ * lib/guard re-exports it, so every existing caller is unmoved and there is still
+ * one spelling of the path in the app. That is the point rather than tidiness: the
+ * gate's destination and the route the chrome disappears on have to be the same
+ * string, or a rename leaves a person mid-setup looking at links that bounce them
+ * straight back here. `npm run onboarding-check` asserts the two are equal.
+ */
+export const ONBOARDING_PATH = "/onboarding";
+
+/**
  * HOW MANY COMPANIES A FREE ACCOUNT MAY WATCH — the pricing card's promise, made
  * enforceable.
  *

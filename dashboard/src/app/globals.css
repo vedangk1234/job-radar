@@ -169,6 +169,155 @@ h1 {
   margin: 0 0 14px;
 }
 
+/* --- the setup / preferences form ---------------------------------------
+ *
+ * One scrolling page, read top to bottom, with the fields grouped into named
+ * sections and one save bar that never leaves the screen. There is no wizard
+ * here and deliberately so: every answer on this form is visible to every other
+ * one — how senior a job you want and how much it pays are the same decision —
+ * and a stepper hides four of them behind a Next button while asking about the
+ * fifth.
+ *
+ * The sections are separated by space and a hairline rather than by boxing them:
+ * the panels inside are ALREADY cards, and a card inside a card is a border
+ * nobody reads. What the section adds is a heading, a line of help, and enough
+ * air that the eye can tell where one question ends.
+ */
+
+.form-section {
+  margin: 0 0 26px;
+  /* So the save bar's "still needed" links land under the sticky header rather
+     than behind it. Roughly the header's own height plus a little air. */
+  scroll-margin-top: 72px;
+}
+
+.form-section + .form-section {
+  padding-top: 22px;
+  border-top: 1px solid var(--line);
+}
+
+.section-head {
+  margin: 0 0 12px;
+}
+
+h2.section-title {
+  font-size: 17px;
+  letter-spacing: -0.015em;
+  margin: 0 0 4px;
+}
+
+.section-lede {
+  margin: 0;
+  max-width: 70ch;
+  color: var(--ink-2);
+  font-size: 13.5px;
+}
+
+/* The save bar.
+ *
+ * `sticky`, not `fixed`: it is the last member of the form rather than furniture
+ * bolted over the page, so it comes to rest at the end of the stack instead of
+ * hovering above whatever follows — the delete-account section on /preferences —
+ * and the page below it needs no compensating padding. It only stays pinned
+ * because it is the LAST element inside .setup-form; a sticky element scrolls
+ * away as soon as its own containing block has passed.
+ */
+.save-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 9;
+  /* The negative margins reach back over the shell's 16px gutter, so the bar and
+     its rule span the column edge to edge and read as a bar rather than as one
+     more card. They exactly cancel the gutter, so nothing overflows sideways —
+     which on Windows is the difference between a clean page and a permanent
+     horizontal scrollbar. */
+  margin: 18px -16px 0;
+  padding: 12px 16px 14px;
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+
+.save-bar-inner {
+  display: flex;
+  align-items: center;
+  gap: 12px 16px;
+  flex-wrap: wrap;
+}
+
+.save-state {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+
+.save-state-ok {
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+.save-state-title {
+  display: block;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  font-weight: 600;
+  margin-bottom: 5px;
+}
+
+/* Each missing answer is a link to the section that holds it, because on a form
+   this long "pick a city" is useless without saying where the cities are. */
+ul.save-blockers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+ul.save-blockers a {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  text-decoration: none;
+  color: var(--danger);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+}
+
+ul.save-blockers a:hover {
+  border-color: var(--danger);
+}
+
+.save-bar-action {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.saved-at {
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  /* On a phone the bar is a third of the screen if it is not disciplined: the
+     date drops (it is the least urgent thing on it) and the button takes the
+     full width, which is also the easiest thing to hit with a thumb. */
+  .saved-at {
+    display: none;
+  }
+
+  .save-bar-action {
+    width: 100%;
+  }
+
+  .save-bar-action button.primary {
+    width: 100%;
+  }
+}
+
 /* --- table / cards ------------------------------------------------------- */
 
 table {

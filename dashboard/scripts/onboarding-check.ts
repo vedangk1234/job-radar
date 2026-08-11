@@ -183,6 +183,28 @@ async function main() {
       `${DEFAULT_PREFERENCES.exclusions.length} exclusions), so the checks above are not passing vacuously`,
   );
 
+  /*
+   * THE GATE'S DESTINATION AND THE ROUTE THE NAV DISAPPEARS ON ARE ONE STRING.
+   *
+   * The onboarding-form slice hides the app tabs on /onboarding, and it decides
+   * that from the pathname rather than from this row — the chrome's question is
+   * "is this the setup screen", not "is this account onboarded", and usePathname
+   * answers it with no query. The cost of asking a different question is that the
+   * two answers can drift: rename the route and the gate keeps redirecting while
+   * the nav keeps rendering Home / Jobs / Add on the page it redirects TO.
+   *
+   * They cannot, because there is one constant — lib/labels.ONBOARDING_PATH,
+   * which lib/guard re-exports and components/Nav imports. This asserts the
+   * re-export rather than trusting it; `npm run ui-check` asserts the markup that
+   * follows from it.
+   */
+  check(
+    guard.ONBOARDING_PATH === labels.ONBOARDING_PATH,
+    `the gate redirects to ${guard.ONBOARDING_PATH}, which is the same constant the nav ` +
+      "hides its tabs on — one string, so the two cannot drift",
+    `guard says ${guard.ONBOARDING_PATH}, labels says ${labels.ONBOARDING_PATH}`,
+  );
+
   // §2 — the operator, read BEFORE the new account exists. Whatever this slice
   // does to a new signup, it must do nothing at all to the account that has been
   // running for months. Read here and re-read at the end, compared field by

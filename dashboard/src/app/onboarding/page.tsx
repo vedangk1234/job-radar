@@ -79,13 +79,14 @@ export default async function OnboardingPage() {
     <>
       <h1>Set up your radar</h1>
       <p className="lede">
-        Two things decide what reaches your inbox. First, the companies you watch — we crawl
-        every board below hourly, and you hear about the ones you pick. Then the filter: a job
-        title has to contain at least one of your keywords, and the years its description asks
-        for have to fall inside your range. Both are yours to write, and nothing has been chosen
-        for you. Upload your resume and we will read it once and suggest some keywords, or type
-        your own. Save when it looks right and the dashboard opens; you can change any of this
-        later.
+        Two things decide what reaches your inbox. The filter — a job title has to contain one of
+        your keywords, the years its description asks for have to fall inside your range, and its
+        city and arrangement have to be ones you would take. And the companies you watch: we
+        crawl every board in the catalog hourly, and you hear about the ones you pick. Both are
+        yours to write and nothing has been chosen for you. Upload your resume and we will read
+        it once and suggest some keywords, or type your own. It is one page — answer what is
+        below, and the bar at the bottom says what is still missing. Save when it looks right and
+        the dashboard opens; you can change any of this later.
       </p>
       <OnboardingSetup
         preferences={preferences}

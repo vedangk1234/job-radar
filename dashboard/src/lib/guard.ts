@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { redirect } from "next/navigation";
 
+import { ONBOARDING_PATH } from "./labels";
 import { linkUser, UnverifiedEmailError } from "./link-user";
 import { onboardingCompleted } from "./preferences";
 import { getAuthUser } from "./supabase/server";
@@ -81,8 +82,17 @@ export async function requireSession(): Promise<
   }
 }
 
-/** Where a signed-in account that has not chosen a filter yet is sent. */
-export const ONBOARDING_PATH = "/onboarding";
+/**
+ * Where a signed-in account that has not chosen a filter yet is sent.
+ *
+ * The literal moved to lib/labels with the onboarding-form slice and is re-exported
+ * here, so every caller of this module is unchanged. It had to move because
+ * components/Nav — a client component — now hides the tabs on that route, and
+ * importing a value from THIS file would pull lib/preferences and postgres.js into
+ * the browser bundle. One spelling, two readers, neither able to drift from the
+ * other; see the constant's own comment.
+ */
+export { ONBOARDING_PATH } from "./labels";
 
 /**
  * The same gate for a page: redirect rather than 401, because a browser asking

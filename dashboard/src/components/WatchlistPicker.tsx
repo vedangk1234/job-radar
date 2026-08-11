@@ -147,7 +147,7 @@ export function WatchlistPicker({
         Only these companies&rsquo; jobs reach your digest and your Home screen. Everything in
         the catalog is crawled hourly for everybody either way &mdash; watching one is how you
         ask to hear about it, not how it gets fetched. When you add a company we mark the jobs
-        it <em>already</em> has as seen, so your first email is what arrives from now on rather
+        it <strong>already</strong> has as seen, so your first email is what arrives from now on rather
         than its back catalogue.
       </p>
 

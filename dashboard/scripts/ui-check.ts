@@ -46,6 +46,9 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 // See the stub-router note in the experience-panel section for why this is needed.
 import { AppRouterContext } from "next/dist/shared/lib/app-router-context.shared-runtime";
+// The same trick one hook over: components/Nav calls usePathname(), and outside
+// Next's own render there is no PathnameContext to read. See the nav section.
+import { PathnameContext } from "next/dist/shared/lib/hooks-client-context.shared-runtime";
 
 import { CompanyList } from "../src/components/CompanyList";
 import { JobLine, type Mode } from "../src/components/JobLine";
@@ -105,21 +108,40 @@ type Lib = {
    * pool before loadEnv().
    */
   PreferencesEditor: typeof import("../src/components/PreferencesEditor").PreferencesEditor;
+  /**
+   * Deferred for exactly DeleteAccount's reason: Nav imports the sign-out server
+   * action from app/actions, which imports lib/account, which imports lib/db. A
+   * static import would build the pool before loadEnv() and throw before the first
+   * assertion. (The route constant it reads comes from lib/labels, which imports
+   * nothing — that is the whole reason the constant lives there.)
+   */
+  Nav: typeof import("../src/components/Nav").Nav;
 };
 
 async function loadLib(): Promise<Lib> {
-  const [db, currentUser, jobs, companies, preferences, watchlist, labels, deleteAccount, editor] =
-    await Promise.all([
-      import("../src/lib/db"),
-      import("./current-user"),
-      import("../src/lib/jobs"),
-      import("../src/lib/companies"),
-      import("../src/lib/preferences"),
-      import("../src/lib/watchlist"),
-      import("../src/lib/labels"),
-      import("../src/components/DeleteAccount"),
-      import("../src/components/PreferencesEditor"),
-    ]);
+  const [
+    db,
+    currentUser,
+    jobs,
+    companies,
+    preferences,
+    watchlist,
+    labels,
+    deleteAccount,
+    editor,
+    nav,
+  ] = await Promise.all([
+    import("../src/lib/db"),
+    import("./current-user"),
+    import("../src/lib/jobs"),
+    import("../src/lib/companies"),
+    import("../src/lib/preferences"),
+    import("../src/lib/watchlist"),
+    import("../src/lib/labels"),
+    import("../src/components/DeleteAccount"),
+    import("../src/components/PreferencesEditor"),
+    import("../src/components/Nav"),
+  ]);
   return {
     sql: db.sql,
     currentUserId: currentUser.currentUserId,
@@ -133,6 +155,7 @@ async function loadLib(): Promise<Lib> {
     loadPreferences: preferences.loadPreferences,
     DeleteAccount: deleteAccount.DeleteAccount,
     PreferencesEditor: editor.PreferencesEditor,
+    Nav: nav.Nav,
   };
 }
 
@@ -299,6 +322,85 @@ async function main() {
   // page or route resolves its user from the session — see lib/guard.ts.
   lib = await loadLib();
   const { currentUserId, loadPreferences, listWatchedCompanyCards, matchingJobsForCompany, openJobsWithMatchFlag } = lib;
+
+  /*
+   * --- THE APP NAV, ON /onboarding AND EVERYWHERE ELSE ---------------------
+   *
+   * CLAUDE.md carried this under *Pending* from Slice 1b: the chrome offered
+   * Home / Jobs / Add during setup and every one of them bounced straight back to
+   * /onboarding. It is asserted HERE rather than over HTTP for the reason the
+   * whole script exists — the gate section above proves the ROUTES are shut, and
+   * a shut route says nothing about whether a link to it is on the screen. A
+   * person mid-setup looking at five links that undo themselves is the failure,
+   * and only the markup can show it.
+   *
+   * BOTH DIRECTIONS, because they fail apart. Hiding the tabs is one edit and
+   * hiding them everywhere is the same edit written slightly too wide — and
+   * /preferences is the page most likely to be caught by it, since it is the OTHER
+   * screen this same editor renders on and the one exempted from the gate.
+   *
+   * SIGN OUT IS ASSERTED ON BOTH, and that is not a formality. Removing the
+   * navigation from a screen a person is held on is only acceptable while there is
+   * still a way off it; a setup form with no exit is a trap rather than a gate.
+   *
+   * The stub is PathnameContext rather than a mock of usePathname: the component
+   * calls the real hook, and providing the context is the same honest fix the
+   * router stub further down makes for the same reason.
+   */
+  console.log("\nthe app nav — hidden on /onboarding, present everywhere else");
+  const navAt = (pathname: string) =>
+    renderToStaticMarkup(
+      createElement(
+        PathnameContext.Provider,
+        { value: pathname },
+        createElement(lib!.Nav, { email: "someone@example.test" }),
+      ),
+    );
+
+  const navOnboarding = navAt("/onboarding");
+  const navPreferences = navAt("/preferences");
+  const navHome = navAt("/");
+
+  check(
+    !navOnboarding.includes('class="tabs"'),
+    "on /onboarding the tab bar is not rendered at all",
+    "the nav rendered its tabs on the one page a person is held on",
+  );
+  for (const label of ["Home", "Jobs", "Watchlist", "Add", "Preferences"]) {
+    check(
+      !navOnboarding.includes(`>${label}<`),
+      `and there is no ${label} link to bounce off the gate`,
+    );
+  }
+  check(
+    navOnboarding.includes("Sign out"),
+    "but Sign out is still there — a person must always be able to leave",
+    "onboarding is a screen with no way off it",
+  );
+  check(
+    navOnboarding.includes("someone@example.test"),
+    "and the address is still shown, so it is clear which account is being set up",
+  );
+
+  check(
+    navPreferences.includes('class="tabs"'),
+    "on /preferences — the SAME editor, after onboarding — the tab bar is back",
+    "the hide is too wide: it took the nav off an ordinary app page",
+  );
+  for (const label of ["Home", "Jobs", "Watchlist", "Add", "Preferences"]) {
+    check(
+      navPreferences.includes(`>${label}<`),
+      `and the ${label} link is on it`,
+    );
+  }
+  check(
+    navPreferences.includes('aria-current="page"'),
+    "with the current tab marked for a screen reader, unchanged by this slice",
+  );
+  check(
+    navHome.includes('class="tabs"') && navHome.includes(">Jobs<"),
+    "and Home is unaffected — only /onboarding hides anything",
+  );
 
   const userId = await currentUserId();
   console.log(`\nlive rows for the operator's account: ${userId}`);
@@ -492,7 +594,7 @@ async function main() {
     "with a per-company control labelled for a screen reader",
   );
   check(
-    /already has as seen/.test(picker) || /already<\/em> has as seen/.test(picker),
+    /already has as seen/.test(picker) || /already<\/(em|strong)> has as seen/.test(picker),
     "and it says what adding one does to that company's existing jobs — the second " +
       "half of tracking, stated where a person can read it",
     "nothing on the picker explains the history suppression",
@@ -957,6 +1059,180 @@ async function main() {
   check(
     !withCompanies.includes("Pick a company to watch to save"),
     "and an account that watches something is not blocked by it",
+  );
+
+  /*
+   * --- The sectioned form and the sticky save bar --------------------------
+   *
+   * The onboarding-form slice. Both halves are pure markup, which is exactly the
+   * kind of thing that gets agreed to and then quietly not built — and the sticky
+   * bar in particular LOOKS present in a diff whether or not it is the last
+   * element in the form, which is the one condition that makes it stay on screen.
+   *
+   * Note what is deliberately NOT asserted here: that scrolling pins it. That is
+   * CSS and a viewport, which is where this script has always stopped. What is
+   * checkable is that the bar exists, that it is the last thing in the form, and
+   * that it says what is missing — the three things a browser cannot tell you are
+   * wrong until somebody scrolls.
+   */
+  console.log("\nPreferences — the sectioned form and the sticky save bar");
+  check(
+    configured.includes('class="setup-form"'),
+    "the fields are wrapped in one form container",
+    "the sticky bar has no containing block to be sticky within",
+  );
+  for (const [id, title] of [
+    ["resume", "Your resume and keywords"],
+    ["experience", "How much experience you want"],
+    ["cities", "Where you want to work"],
+    ["work-mode", "How you want to work"],
+    ["pay", "What you expect to be paid"],
+    ["tuning", "Fine-tuning"],
+  ]) {
+    check(
+      configured.includes(`id="${id}"`) && configured.includes(title),
+      `the "${title}" section is on the page, with an id the save bar can link to`,
+    );
+  }
+  check(
+    (configured.match(/class="form-section"/g) ?? []).length >= 6,
+    "every one of them is a real section rather than a heading floating over a stack",
+    `found ${(configured.match(/class="form-section"/g) ?? []).length}`,
+  );
+  check(
+    configured.includes('class="section-lede"'),
+    "and each carries its own helper line under the heading",
+  );
+  check(
+    configured.includes('class="save-bar"'),
+    "the save bar renders",
+  );
+  check(
+    !/class="save-bar"[^]*class="form-section"/.test(configured),
+    "and no section renders after it — a sticky element that is not last stops " +
+      "being sticky the moment its containing block scrolls past",
+    "a section renders below the save bar, so the bar will scroll away mid-page",
+  );
+
+  /*
+   * WHAT THE BAR SAYS WHEN SOMETHING IS MISSING. This is the half a person on a
+   * phone actually depends on: the Keywords panel's own red message and the city
+   * picker's own red message are several screens apart, and the button that
+   * refuses because of them is at the bottom of both.
+   */
+  check(
+    blank.includes('class="save-blockers"'),
+    "on a brand-new account the bar lists what is still missing",
+    "an unfinished form says nothing about what is unfinished",
+  );
+  for (const text of [
+    "Add at least one keyword",
+    "Set both ends of the experience range",
+    "Pick a city, or choose all of India",
+  ]) {
+    check(blank.includes(text), `it names "${text}"`);
+  }
+  check(
+    blank.includes('href="#cities"') && blank.includes('href="#experience"'),
+    "and each one links to the section that fixes it, rather than just naming it",
+  );
+  check(
+    noCompanies.includes("Watch at least one company"),
+    "an empty watch list is listed there too",
+  );
+  check(
+    /class="save-blockers"[^]{0,400}href="\/watchlist"/.test(noCompanies),
+    "pointing at /watchlist by default, because on THIS page the picker is elsewhere",
+    "the watch-list blocker does not point anywhere useful",
+  );
+  check(
+    withCompanies.includes('class="save-state-ok"') &&
+      !withCompanies.includes("save-blockers"),
+    "and a form with every answer in says so instead of listing nothing",
+  );
+  check(
+    withCompanies.includes("Last saved"),
+    "with the last-saved time still on the bar, where the old panel used to carry it",
+  );
+
+  /*
+   * --- /onboarding, AS THAT PAGE ACTUALLY COMPOSES IT ----------------------
+   *
+   * Everything above renders PreferencesEditor alone, which is /preferences.
+   * /onboarding is the same editor with the watch-list picker threaded through it
+   * as a section, and the composition is the thing this slice changed — the
+   * picker moved from a sibling ABOVE the editor to a section inside its stack,
+   * so that the save bar could be the last element on the page.
+   *
+   * That ordering is not cosmetic and it is not visible in either component's own
+   * markup: a save bar with a section under it is a save bar that scrolls away.
+   * So the order is asserted here, over the shipped wrapper, with the live
+   * catalog.
+   */
+  console.log("\nOnboarding — the picker and the editor as one form");
+  const OnboardingSetup = (await import("../src/components/OnboardingSetup")).OnboardingSetup;
+  // `savable` rather than the operator's row, for the reason the watch-list gate
+  // section above gives: 43 stored keywords are over KEYWORD_CAP, so `overCap`
+  // fires first in the button's label chain and would mask the answer under test.
+  const setupBlank = withRouter(
+    createElement(OnboardingSetup, {
+      preferences: savable,
+      resume: null,
+      catalog,
+      initialWatched: [],
+      cap: lib.FREE_WATCHLIST_CAP,
+    }),
+  );
+
+  const at = (needle: string) => setupBlank.indexOf(needle);
+  check(
+    at('id="companies"') > 0,
+    "the watch-list picker renders as a section of the form, with its own heading",
+    "the picker is not a section — the save bar cannot be the last thing on the page",
+  );
+  check(
+    at('id="resume"') < at('id="experience"') &&
+      at('id="experience"') < at('id="cities"') &&
+      at('id="cities"') < at('id="work-mode"') &&
+      at('id="work-mode"') < at('id="pay"') &&
+      at('id="pay"') < at('id="companies"'),
+    "and the sections run resume -> experience -> cities -> work mode -> pay -> companies",
+    "the sections are not in the order the page is written to be read in",
+  );
+  check(
+    at('class="save-bar"') > at('id="companies"'),
+    "with the save bar after every one of them, including the picker",
+    "the save bar renders above a section, so it will stop being sticky there",
+  );
+  check(
+    setupBlank.includes("Pick a company to watch to save"),
+    "an account watching nothing cannot finish setup, and the button says so",
+  );
+  check(
+    /class="save-blockers"[^]*href="#companies"/.test(setupBlank),
+    "and the bar's link points at the picker ON THIS PAGE rather than at /watchlist, " +
+      "which the gate would bounce straight back",
+    "mid-setup the missing-companies link leads somewhere the gate refuses",
+  );
+  check(
+    setupBlank.includes('type="search"') && setupBlank.includes("not watching any company"),
+    "the picker itself is fully present in that section — search box and empty state",
+  );
+
+  const setupWatching = withRouter(
+    createElement(OnboardingSetup, {
+      preferences: { ...prefs, keywords: ["backend engineer"] },
+      resume: null,
+      catalog,
+      initialWatched: [catalog[0].id],
+      cap: lib.FREE_WATCHLIST_CAP,
+    }),
+  );
+  check(
+    !setupWatching.includes("Pick a company to watch to save") &&
+      setupWatching.includes('class="save-state-ok"'),
+    "and once a company is watched the bar reports the form as answerable",
+    "a complete onboarding form still reads as blocked",
   );
 
   // --- the ordering rule --------------------------------------------------
