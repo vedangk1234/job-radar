@@ -71,6 +71,9 @@ export function PreferencesEditor({
   watchedCount,
   extraSections,
   watchlistHref = "/watchlist",
+  fineTuning = true,
+  saveLabel = "Save preferences",
+  doneCopy,
 }: {
   initial: Preferences;
   resume: StoredResume | null;
@@ -116,6 +119,43 @@ export function PreferencesEditor({
    * round trip the gate would bounce straight back.
    */
   watchlistHref?: string;
+  /**
+   * WHETHER THE FINE-TUNING SECTION IS RENDERED — exclusions and max_level.
+   *
+   * /preferences leaves it at the default and is the ONLY place those two are
+   * editable; /onboarding passes false. Setup asks the six questions that decide
+   * whether anything reaches you at all, and two rules that take jobs back OUT of
+   * a list somebody has not seen yet are a poor use of the ninety seconds after a
+   * signup — both are optional, both are safe to leave alone, and both are one tab
+   * away for the rest of the account's life.
+   *
+   * HIDDEN, NOT REMOVED, AND THE DIFFERENCE IS THE WHOLE POINT. The state above
+   * still holds this row's `exclusions` and `max_level`, and save() still sends
+   * both — so a new account's seeded values (an empty exclusions list and the
+   * schema's max_level 2) make the round trip untouched and come back unchanged.
+   * Dropping them from the body instead would not be a smaller form: PUT
+   * /api/preferences REQUIRES max_level (an integer 0-5) and would refuse the
+   * save outright, and an omitted `exclusions` would clean to [] and silently
+   * overwrite whatever the row held. A control nobody is shown must not become an
+   * answer nobody gave.
+   */
+  fineTuning?: boolean;
+  /**
+   * The word on the button when there is something to save and nothing blocking
+   * it. /onboarding says "Finish setup" because that is what pressing it does;
+   * /preferences says "Save preferences" because that is what pressing it does
+   * there. Every OTHER label in the chain below — the five that name the reason
+   * the button is refusing — is shared, deliberately: those are the gate speaking,
+   * and the gate is the same on both screens.
+   */
+  saveLabel?: string;
+  /**
+   * The success screen, and it renders only where the caller supplies its words —
+   * which in practice means only where `redirectOnSave` is set too, because a
+   * screen saying "you're all set" on a settings page a person is staying on is a
+   * modal in the way of the thing they were doing. See the save() note.
+   */
+  doneCopy?: { title: string; body: string; action: string };
 }) {
   const router = useRouter();
 
@@ -200,6 +240,12 @@ export function PreferencesEditor({
 
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
+  /*
+   * THE SAVE THAT FINISHED SETUP, held on screen instead of navigated away from.
+   * False on every render of /preferences, and on /onboarding until the row comes
+   * back with onboarding_completed TRUE. See save() and finish().
+   */
+  const [done, setDone] = useState(false);
 
   /*
    * `initialSelectedCities` rather than `initial.selected_cities`, because the
@@ -416,13 +462,21 @@ export function PreferencesEditor({
 
       // ONLY ON A SUCCESSFUL SAVE, and only because the row now says so. The
       // response carries onboarding_completed straight from the UPDATE's
-      // RETURNING, so this navigates on what the database recorded rather than
-      // on the request having been sent. refresh() first: the destination is a
-      // server component behind the same gate, and it has to re-read the flag
-      // that just changed rather than serve a cached render from before it did.
+      // RETURNING, so what follows happens on what the database recorded rather
+      // than on the request having been sent.
+      //
+      // WHAT CHANGED WITH THE RESKIN IS WHEN, NOT WHAT. This used to call
+      // refresh() and replace() here; it now raises the success screen and those
+      // two calls move behind its button (see finish()). The ordering is not
+      // cosmetic: refresh() re-renders THIS route on the server, /onboarding
+      // redirects to "/" the moment the flag is TRUE, and a refresh fired here
+      // would therefore tear the screen down in the same tick it went up. So
+      // nothing is refreshed while the person is reading it, and the navigation
+      // is one deliberate press — which is also why the screen cannot strand
+      // anybody: the flag is already written, so every route in the app is open
+      // and even a manual reload lands on the dashboard.
       if (redirectOnSave && data.preferences.onboarding_completed) {
-        router.refresh();
-        router.replace(redirectOnSave);
+        setDone(true);
         return;
       }
     } catch (err) {
@@ -432,11 +486,26 @@ export function PreferencesEditor({
     }
   }
 
+  /**
+   * Leave the setup screen — the two calls that used to run inside save().
+   *
+   * refresh() FIRST and both of them still: the destination is a server component
+   * behind the same gate, so it has to re-read the flag that just changed rather
+   * than serve a render cached from before it did, and replace() rather than
+   * push() so the back button does not return to a setup screen the gate will
+   * bounce off. `redirectOnSave` is non-null wherever this can be reached — the
+   * success screen only renders when it is set.
+   */
+  function finish() {
+    router.refresh();
+    router.replace(redirectOnSave ?? "/");
+  }
+
   return (
     <div className="setup-form">
       <FormSection
         id="resume"
-        title="Your resume and keywords"
+        title="Resume &amp; keywords"
         lede="Upload your resume and we read it once to suggest keywords, or type your own. A job title has to contain at least one of them before anything else is even asked about it."
       >
         <ResumePanel initial={resume} onKeywords={replaceWithSuggestions} />
@@ -446,22 +515,55 @@ export function PreferencesEditor({
 
       <FormSection
         id="experience"
-        title="How much experience you want"
+        title="Experience"
         lede="The years a posting asks for, against the range you are looking in."
       >
+        {/*
+          THE TWO NUMBERS ARE ASKED IN THE DESIGN'S ORDER — what you HAVE first,
+          what you are LOOKING FOR second — and the swap is presentational. They
+          are independent fields (holding five years and looking at 0-2 roles is a
+          legitimate answer, which is why PUT /api/preferences never compares
+          them), so the order is free to be the one that reads as a conversation:
+          the easy fact about yourself, then the filter it does not feed.
+        */}
         <div className="panel">
-          <h2>Experience</h2>
+          <label className="field-label" htmlFor="years-held">
+            Years of experience you have
+          </label>
           <p className="hint">
-            A job&rsquo;s description states the minimum it wants. We keep the ones whose minimum
-            falls <strong>inside</strong> your range &mdash; so a posting asking for less than you
-            want is dropped too, not just one asking for more. Only the minimum is stored, so a
-            &ldquo;3&ndash;6 years&rdquo; posting counts as 3.
+            Recorded on your profile and shown back to you here. It <strong>never filters
+            anything</strong> &mdash; the range below is what decides. Optional; leave it blank if
+            you would rather not say.
+          </p>
+          <div className="row" style={{ alignItems: "center", gap: 10 }}>
+            <input
+              id="years-held"
+              type="number"
+              min={0}
+              max={50}
+              step={1}
+              value={yearsHeld}
+              onChange={(e) => setYearsHeld(e.target.value)}
+              placeholder="e.g. 4"
+              aria-label="Years of experience you have"
+              style={{ maxWidth: 120 }}
+            />
+            <span className="muted small">years</span>
+          </div>
+        </div>
+
+        <div className="panel">
+          <label className="field-label" htmlFor="exp-low">
+            Experience range you&rsquo;re looking in
+          </label>
+          <p className="hint">
+            The actual filter. A job&rsquo;s description states the minimum it wants, and we keep
+            the ones whose minimum falls <strong>inside</strong> your range &mdash; so a posting
+            asking for less than you want is dropped too, not just one asking for more. Only the
+            minimum is stored, so a &ldquo;3&ndash;6 years&rdquo; posting counts as 3.
           </p>
 
-          <div className="row" style={{ alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-            <label className="muted small" htmlFor="exp-low">
-              Looking for
-            </label>
+          <div className="row exp-range" style={{ alignItems: "center", gap: 12 }}>
             <input
               id="exp-low"
               type="number"
@@ -471,7 +573,7 @@ export function PreferencesEditor({
               value={expLow}
               onChange={(e) => setExpLow(e.target.value)}
               aria-label="Lowest years of experience to look for"
-              style={{ maxWidth: 90 }}
+              style={{ maxWidth: 88, textAlign: "center" }}
             />
             <span className="muted small">to</span>
             <input
@@ -483,60 +585,34 @@ export function PreferencesEditor({
               value={expHigh}
               onChange={(e) => setExpHigh(e.target.value)}
               aria-label="Highest years of experience to look for"
-              style={{ maxWidth: 90 }}
+              style={{ maxWidth: 88, textAlign: "center" }}
             />
-            <span className="muted small">years of experience</span>
+            <span className="muted small">years</span>
           </div>
           {rangeError ? <p className="msg bad">{rangeError}</p> : null}
+        </div>
 
-          <div style={{ marginTop: 18 }}>
-            <label className="switch">
-              <input
-                type="checkbox"
-                checked={showNoExp}
-                onChange={(e) => setShowNoExp(e.target.checked)}
-              />
-              <span>Show jobs that don&rsquo;t state a minimum</span>
-            </label>
-            <p className="hint">
-              About <strong>99% of open postings state no minimum</strong> &mdash; either the
-              description never mentions years, or we could not read it. Leaving this off hides
-              almost everything, so it starts on. Turning it off gives you a much shorter list of
-              postings that said out loud what they want.
-            </p>
-          </div>
-
-          <div style={{ marginTop: 18 }}>
-            <label className="muted small" htmlFor="years-held">
-              Your own experience (optional)
-            </label>
-            <div className="row" style={{ alignItems: "center", gap: 10 }}>
-              <input
-                id="years-held"
-                type="number"
-                min={0}
-                max={50}
-                step={1}
-                value={yearsHeld}
-                onChange={(e) => setYearsHeld(e.target.value)}
-                placeholder="—"
-                aria-label="Years of experience you have"
-                style={{ maxWidth: 90 }}
-              />
-              <span className="muted small">years</span>
-            </div>
-            <p className="hint">
-              Recorded on your profile and shown back to you here. It <strong>never filters
-              anything</strong> &mdash; the range above is what decides. Leave it blank if you would
-              rather not say.
-            </p>
-          </div>
+        <div className="panel">
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={showNoExp}
+              onChange={(e) => setShowNoExp(e.target.checked)}
+            />
+            <span>Show jobs that don&rsquo;t state a minimum</span>
+          </label>
+          <p className="hint" style={{ marginTop: 8 }}>
+            About <strong>99% of open postings state no minimum</strong> &mdash; either the
+            description never mentions years, or we could not read it. Leaving this off hides
+            almost everything, so it starts on. Turning it off gives you a much shorter list of
+            postings that said out loud what they want.
+          </p>
         </div>
       </FormSection>
 
       <FormSection
         id="cities"
-        title="Where you want to work"
+        title="Cities"
         lede="Pick the cities you would take a job in, or say the whole country is fine. Jobs outside India are never sent either way."
       >
         <CityPicker
@@ -549,16 +625,17 @@ export function PreferencesEditor({
 
       <FormSection
         id="work-mode"
-        title="How you want to work"
-        lede="On-site, hybrid or fully remote. A fully remote job reaches you from anywhere in the country, whichever cities you picked above."
+        title="Work mode"
+        lede="On-site, hybrid or fully remote. Jobs that do not state one are treated as on-site, and a fully remote job reaches you from anywhere in the country, whichever cities you picked above."
       >
         <WorkModePicker selected={workModes} onChange={setWorkModes} />
       </FormSection>
 
       <FormSection
         id="pay"
-        title="What you expect to be paid"
-        lede="Optional, and the one answer here that narrows almost nothing: hardly any posting on these boards states a salary, and one that does not is shown to you regardless."
+        title="Salary"
+        tag="optional"
+        lede="The one answer here that narrows almost nothing: hardly any posting on these boards states a salary, and one that does not is shown to you regardless. Pick nothing and pay is not filtered on."
       >
         <SalaryBandPicker selected={salaryBands} onChange={setSalaryBands} />
       </FormSection>
@@ -570,38 +647,57 @@ export function PreferencesEditor({
       */}
       {extraSections}
 
-      <FormSection
-        id="tuning"
-        title="Fine-tuning"
-        lede="Two rules that take jobs back OUT of the list everything above lets in. Both are optional, and both are safe to leave alone."
-      >
-        <ChipList
-          title="Exclusions"
-          hint="A title matching ANY of these is dropped, even if a keyword matched. Empty is allowed and means nothing is excluded by title."
-          values={exclusions}
-          onChange={setExclusions}
-          placeholder="e.g. intern"
-        />
+      {/*
+        FINE-TUNING — /preferences ONLY, and the values travel either way.
+        `fineTuning` is false on /onboarding, so these two controls are not on the
+        setup screen at all; `exclusions` and `maxLevel` are still in state above
+        and still in save()'s body, so a new account's seeded empty exclusions and
+        max_level 2 are written back exactly as they were loaded. See the prop.
 
-        <div className="panel">
-          <h2>Max level</h2>
-          <p className="hint">
-            Titles that state a seniority above this are dropped. A title that states no level at
-            all counts as 2, so lowering this below 2 filters out most ordinary postings.
-          </p>
-          <select
-            value={maxLevel}
-            onChange={(e) => setMaxLevel(Number(e.target.value))}
-            style={{ maxWidth: 320 }}
-          >
-            {Object.entries(LEVEL_LABELS).map(([value, label]) => (
-              <option key={value} value={value}>
-                {label}
-              </option>
-            ))}
-          </select>
-        </div>
-      </FormSection>
+        Folded shut because it is the one section that is nobody's answer to
+        anything by default: it takes jobs back OUT of a list, both halves are
+        optional, and a settings screen should open on what a person came to
+        change rather than on the two rules they have never touched.
+      */}
+      {fineTuning ? (
+        <FormSection
+          id="tuning"
+          className="aside"
+          title="Fine-tuning"
+          lede="Two rules that take jobs back OUT of the list everything above lets in. Both are optional, and both are safe to leave alone."
+        >
+          <details className="fold">
+            <summary>Exclusions and maximum level</summary>
+
+            <ChipList
+              title="Exclusions"
+              hint="A title matching ANY of these is dropped, even if a keyword matched. Empty is allowed and means nothing is excluded by title."
+              values={exclusions}
+              onChange={setExclusions}
+              placeholder="e.g. intern"
+            />
+
+            <div className="panel">
+              <h2>Max level</h2>
+              <p className="hint">
+                Titles that state a seniority above this are dropped. A title that states no level
+                at all counts as 2, so lowering this below 2 filters out most ordinary postings.
+              </p>
+              <select
+                value={maxLevel}
+                onChange={(e) => setMaxLevel(Number(e.target.value))}
+                style={{ maxWidth: 320 }}
+              >
+                {Object.entries(LEVEL_LABELS).map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </details>
+        </FormSection>
+      ) : null}
 
       {/*
         Said in words as well as on the button, because the fix is on ANOTHER
@@ -703,7 +799,7 @@ export function PreferencesEditor({
                         : noCompaniesWatched
                           ? "Pick a company to watch to save"
                       : dirty
-                        ? "Save preferences"
+                        ? saveLabel
                         : "No changes"}
             </button>
           </div>
@@ -711,6 +807,33 @@ export function PreferencesEditor({
 
         {message ? <p className={`msg ${message.kind}`}>{message.text}</p> : null}
       </div>
+
+      {/*
+        THE SUCCESS SCREEN. It renders only after a save came back with
+        onboarding_completed TRUE — so never on /preferences, which passes no
+        doneCopy and no redirectOnSave.
+
+        It is the last thing in the form rather than a portal because it needs
+        nothing from the document root: it is `position: fixed`, and being inside
+        .setup-form is what gives it the surface's palette and its serif. It is
+        also after the save bar, which keeps that bar the last SECTION in the
+        stack — the sticky property ui-check asserts is about form sections, and
+        an overlay is not one.
+      */}
+      {done && doneCopy ? (
+        <div className="setup-done" role="dialog" aria-modal="true" aria-labelledby="done-title">
+          <div className="setup-done-card">
+            <div className="setup-done-mark" aria-hidden="true">
+              ✓
+            </div>
+            <h2 id="done-title">{doneCopy.title}</h2>
+            <p>{doneCopy.body}</p>
+            <button className="primary" onClick={finish} autoFocus>
+              {doneCopy.action}
+            </button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -735,18 +858,36 @@ export function FormSection({
   id,
   title,
   lede,
+  tag,
+  className,
   children,
 }: {
   id: string;
   title: string;
   lede: ReactNode;
+  /**
+   * A word beside the heading — "optional" on Salary, per the design. It is a
+   * label rather than a rule: what makes that section optional is that
+   * lib/match.salaryOk fails open and PUT /api/preferences does not require it.
+   */
+  tag?: string;
+  /**
+   * An extra class on the section. `aside` marks a section that is not part of
+   * the numbered sequence — see setup.css, where the counter skips it.
+   */
+  className?: string;
   children: ReactNode;
 }) {
   return (
-    <section className="form-section" id={id} aria-labelledby={`${id}-title`}>
+    <section
+      className={className ? `form-section ${className}` : "form-section"}
+      id={id}
+      aria-labelledby={`${id}-title`}
+    >
       <div className="section-head">
         <h2 className="section-title" id={`${id}-title`}>
           {title}
+          {tag ? <span className="section-tag">{tag}</span> : null}
         </h2>
         <p className="section-lede">{lede}</p>
       </div>

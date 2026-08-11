@@ -1,0 +1,913 @@
+/*
+ * THE SETUP SURFACE — /onboarding and the editor it shares with /preferences.
+ *
+ * One stylesheet, no framework, matching globals.css and landing.css — and
+ * SCOPED rather than merged into globals, for the reason landing.css is scoped
+ * under `.ss`: this is a designed surface with its own palette, and letting it
+ * loose over Home, Jobs, Watchlist and Add would repaint four screens nobody
+ * asked about.
+ *
+ * TWO SCOPES, AND THE SPLIT IS EXACTLY WHAT THE TWO PAGES SHARE.
+ *
+ *   .setup-form   the EDITOR. Rendered by /onboarding AND /preferences, because
+ *                 it is one component and two looks for one form is how the two
+ *                 drift. Cards, fields, pills, chips, the save bar.
+ *   .setup-page   the PAGE, and /onboarding alone renders it: the warm paper, the
+ *                 760px column, the hero, and the section numbering.
+ *
+ * SO /preferences GETS THE SKIN AND KEEPS ITS OWN CHROME — the app nav, its own
+ * copy, the Delete account section under the rule, and no 01-06 numbering, since
+ * a settings screen is not a numbered sequence anybody is walking through.
+ *
+ * THE PALETTE IS INSTALLED BY REDEFINING THE APP'S OWN TOKEN NAMES inside the
+ * scope rather than by restating every rule in globals.css against new ones. A
+ * `.panel`, a `.msg`, a `.switch` and a `.tag` already resolve their colours
+ * through var(--panel) / var(--line) / var(--accent); rebinding those six names
+ * here repaints every one of them, in one place, and leaves the shape rules below
+ * to say only what is genuinely different. It also pins the surface to the LIGHT
+ * palette in both system schemes — the design is a warm paper page and a
+ * dark-mode inversion of it is two designs fighting over one screen, which is the
+ * argument landing.css already makes for the black one.
+ */
+
+.setup-form,
+.setup-page {
+  /* the design's palette, verbatim, bound to the names globals.css already uses */
+  --paper: #efece3;
+  --bg: #efece3;
+  --panel: #ffffff;
+  --panel-2: #faf8f3;
+  --line: rgba(27, 25, 23, 0.12);
+  --ink: #1b1917;
+  --ink-2: #6d6862;
+  --ink-3: #928c83;
+  --accent: #b9a184;
+  --accent-ink: #ffffff;
+  --accent-wash: rgba(185, 161, 132, 0.14);
+  --danger: #a9502f;
+  --warn: #8a5a12;
+  --radius: 14px;
+
+  --head: var(--ss-display), Georgia, "Times New Roman", serif;
+  --mono: var(--ss-mono), ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  color-scheme: light;
+  color: var(--ink);
+}
+
+/* --- the page (/onboarding only) ----------------------------------------- */
+
+/*
+ * The paper reaches the edges of the viewport, not just the column. `min-height`
+ * covers the short-page case on a desktop; globals.css paints the body itself
+ * through :has() so an overscroll on a phone does not flash the app's grey. Both
+ * are needed and neither is sufficient — see the note there.
+ */
+.setup-page {
+  background: var(--paper);
+  min-height: 100vh;
+  margin: 0 -16px;
+  padding: 0 22px 200px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.setup-page,
+.setup-form {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+
+.setup-page > * {
+  max-width: 760px;
+  margin-inline: auto;
+}
+
+/* the hero: eyebrow, serif headline, one paragraph */
+
+.setup-hero {
+  padding: 46px 0 0;
+  margin-bottom: 40px;
+  animation: setup-rise 0.5s ease both;
+}
+
+@keyframes setup-rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .setup-hero {
+    animation: none;
+  }
+}
+
+.setup-eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.26em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 16px;
+}
+
+.setup-page h1 {
+  font-family: var(--head);
+  font-size: clamp(38px, 9vw, 60px);
+  line-height: 1.02;
+  letter-spacing: -0.01em;
+  font-weight: 400;
+  margin: 0 0 16px;
+}
+
+.setup-page .lede {
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  max-width: 500px;
+  margin: 0;
+  text-wrap: pretty;
+}
+
+/*
+ * THE TOP BAR ON /onboarding. components/Nav already renders this branch — brand,
+ * no tabs, address and Sign out — so this restyles what is there rather than
+ * adding chrome. The `.setup` class is only on this route, so /preferences and
+ * every other screen keep the app's own bar untouched.
+ */
+header.top.setup {
+  background: rgba(239, 236, 227, 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid rgba(27, 25, 23, 0.12);
+  color: #1b1917;
+}
+
+header.top.setup .shell {
+  max-width: 760px;
+  padding-inline: 22px;
+}
+
+header.top.setup .brand {
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: -0.01em;
+  color: #1b1917;
+}
+
+header.top.setup .brand span,
+header.top.setup .whoami {
+  color: #6d6862;
+}
+
+header.top.setup .whoami button {
+  background: none;
+  border: none;
+  color: #6d6862;
+}
+
+header.top.setup .whoami button:hover {
+  color: #1b1917;
+}
+
+/* --- the form: a section IS a card --------------------------------------- */
+
+/*
+ * globals.css separates the sections with air and a hairline because the panels
+ * inside are already cards, and a card inside a card is a border nobody reads.
+ * The design answers the same problem the other way round: the SECTION is the
+ * card and the panels inside it are plain. So the panel's own box is taken off
+ * rather than a second one being drawn around it.
+ */
+.setup-form .form-section {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 30px 26px;
+  margin: 0 0 20px;
+  scroll-margin-top: 84px;
+}
+
+.setup-form .form-section + .form-section {
+  padding-top: 30px;
+  border-top: 1px solid var(--line);
+}
+
+.setup-form .section-head {
+  margin: 0 0 18px;
+}
+
+.setup-form h2.section-title {
+  font-family: var(--head);
+  font-weight: 400;
+  font-size: 27px;
+  line-height: 1;
+  letter-spacing: 0;
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+/*
+ * THE 01-06 NUMBERS ARE A COUNTER, NOT A PROP, and they live under `.setup-page`
+ * so they appear on /onboarding only. Setup is a sequence somebody is walking
+ * through once; /preferences is the same six questions as a settings screen,
+ * where numbering would imply an order that no longer means anything. Deriving
+ * them from the DOM also means the section list has one source — add a section
+ * and it is numbered, with nothing to keep in step.
+ */
+.setup-page .setup-form {
+  counter-reset: setup-section;
+}
+
+.setup-page .setup-form .form-section {
+  counter-increment: setup-section;
+}
+
+.setup-page .setup-form h2.section-title::before {
+  content: counter(setup-section, decimal-leading-zero);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--accent);
+  flex: none;
+}
+
+/* Fine-tuning is not part of the numbered sequence — see the section itself. */
+.setup-form .form-section.aside {
+  counter-increment: none;
+}
+
+.setup-form .form-section.aside h2.section-title::before {
+  content: none;
+}
+
+.setup-form .section-lede {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-3);
+  max-width: 520px;
+  margin: 10px 0 0;
+}
+
+.setup-form .section-tag {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-3);
+  font-weight: 400;
+  white-space: nowrap;
+  margin-left: auto;
+  align-self: baseline;
+}
+
+/* the panels inside a section: no box of their own */
+
+.setup-form .panel {
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  margin: 0 0 22px;
+}
+
+.setup-form .panel:last-child {
+  margin-bottom: 0;
+}
+
+.setup-form .panel h2 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 4px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.setup-form .panel h2 .muted.small,
+.setup-form .panel h2 .count-over {
+  font-family: var(--mono);
+  font-size: 12px;
+  margin-left: auto;
+}
+
+.setup-form .panel .hint,
+.setup-form .hint {
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--ink-3);
+  max-width: 520px;
+  margin: 0 0 12px;
+}
+
+/* A rule between two panels that answer the same question, per the design's
+   resume/keywords split. */
+.setup-form .panel + .panel {
+  border-top: 1px solid var(--line);
+  padding-top: 22px;
+}
+
+/* --- controls ------------------------------------------------------------ */
+
+.setup-form input[type="text"],
+.setup-form input[type="search"],
+.setup-form input[type="url"],
+.setup-form input[type="number"],
+.setup-form select {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 12px 14px;
+  font-size: 14px;
+  background: #fff;
+  color: var(--ink);
+  outline: none;
+}
+
+.setup-form input:focus,
+.setup-form select:focus {
+  border-color: var(--accent);
+}
+
+.setup-form input::placeholder {
+  color: #a8a299;
+}
+
+.setup-form button {
+  font: inherit;
+  font-size: 14px;
+  border-radius: 11px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+  padding: 11px 18px;
+}
+
+.setup-form button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.setup-form button.primary {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #fff;
+  font-weight: 600;
+}
+
+.setup-form button.primary:hover:not(:disabled) {
+  background: #000;
+  border-color: #000;
+}
+
+.setup-form button.small {
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+
+.setup-form button:disabled {
+  opacity: 1;
+  background: rgba(27, 25, 23, 0.06);
+  border-color: transparent;
+  color: #a8a299;
+  cursor: not-allowed;
+}
+
+/*
+ * THE CHECKBOXES BECOME BOXES AGAIN. globals.css draws every `.switch` input as
+ * a sliding pill, which is right for a settings screen with a handful of toggles
+ * and wrong for twenty-four cities in a grid: at that count a tick is read as a
+ * list and a row of pills is read as machinery. The two genuine switches on this
+ * form — All over India, and "show jobs with no minimum" — are boxes here too,
+ * for the reason the design draws them that way: on one surface, one control
+ * shape.
+ */
+.setup-form .switch input {
+  appearance: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  border: 1.5px solid rgba(27, 25, 23, 0.22);
+  background: #fff;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.setup-form .switch input::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: none;
+  background: none;
+  transform: none;
+}
+
+.setup-form .switch input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.setup-form .switch input:checked::after {
+  content: "";
+  position: absolute;
+  left: 7px;
+  top: 3px;
+  width: 5px;
+  height: 10px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  border-radius: 1px;
+  transform: rotate(42deg);
+  background: none;
+}
+
+.setup-form .switch input:indeterminate {
+  background: var(--accent-wash);
+  border-color: var(--accent);
+}
+
+.setup-form .switch input:indeterminate::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 9px;
+  width: 11px;
+  height: 2px;
+  border: none;
+  border-radius: 1px;
+  background: var(--accent);
+  transform: none;
+}
+
+.setup-form .switch {
+  gap: 11px;
+  font-size: 14px;
+  align-items: center;
+}
+
+.setup-form .switch input {
+  position: relative;
+}
+
+/*
+ * PILLS — work mode and pay. Same control, same setters, drawn as the design's
+ * capsules: a checkbox that has swallowed its label. The input is hidden from
+ * sight rather than removed, so the keyboard and the screen reader still meet a
+ * real checkbox.
+ */
+.setup-form .pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0;
+}
+
+.setup-form .pills .switch {
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 999px;
+  padding: 11px 18px;
+  margin: 0;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.setup-form .pills .switch:hover {
+  border-color: var(--accent);
+}
+
+.setup-form .pills .switch input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.setup-form .pills .switch:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-wash);
+  font-weight: 600;
+}
+
+.setup-form .pills .switch:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The tick the hidden input can no longer draw. */
+.setup-form .pills .switch:has(input:checked) > span::before {
+  content: "✓";
+  color: var(--accent);
+  margin-right: 8px;
+}
+
+/* chips: keywords, exclusions, watched companies */
+
+.setup-form .chips {
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.setup-form .chips li {
+  background: #f1ede4;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 7px 8px 7px 14px;
+  font-size: 13px;
+  gap: 8px;
+}
+
+.setup-form .chips li button.linky {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(27, 25, 23, 0.08);
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.setup-form .chips li button.linky:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+/* the resume drop zone and the stored file */
+
+.setup-form .dropzone {
+  border: 1.5px dashed var(--line);
+  border-radius: 14px;
+  padding: 34px 20px;
+  background: var(--panel-2);
+  gap: 6px;
+}
+
+.setup-form .dropzone:hover,
+.setup-form .dropzone:focus-within {
+  border-color: var(--accent);
+  background: #f6f2ea;
+}
+
+.setup-form .dropzone-main {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.setup-form .resume-current {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 18px;
+  background: var(--panel-2);
+  align-items: center;
+}
+
+/* messages */
+
+.setup-form .msg {
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.setup-form .msg.bad {
+  background: rgba(169, 80, 47, 0.08);
+  border-color: rgba(169, 80, 47, 0.25);
+  color: #7d3a22;
+}
+
+/* --- section 3: the city grid -------------------------------------------- */
+
+.setup-form .city-umbrellas {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.setup-form .city-group {
+  margin-bottom: 18px;
+}
+
+.setup-form .city-group-heading {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 8px;
+}
+
+.setup-form .city-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 4px 14px;
+}
+
+.setup-form .city-grid .switch {
+  padding: 9px 4px;
+  width: 100%;
+}
+
+.setup-form .city-name {
+  color: var(--ink);
+}
+
+.setup-form fieldset[disabled] .city-name {
+  color: #a8a299;
+}
+
+/* --- section 6: the company picker, search-first ------------------------- */
+
+.setup-form .picker-search {
+  margin-bottom: 14px;
+}
+
+.setup-form .picker-search input {
+  width: 100%;
+}
+
+.setup-form .picker-results {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  margin-bottom: 16px;
+  list-style: none;
+  padding: 0;
+}
+
+.setup-form .picker-results li + li button {
+  border-top: 1px solid var(--line);
+}
+
+.setup-form .picker-results button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 16px;
+  background: #fff;
+  border: none;
+  border-radius: 0;
+  font-size: 14px;
+  text-align: left;
+}
+
+.setup-form .picker-results button:hover:not(:disabled) {
+  background: var(--panel-2);
+}
+
+.setup-form .picker-results .add-mark {
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.setup-form .picker-rule {
+  height: 1px;
+  background: var(--line);
+  border: none;
+  margin: 0 0 16px;
+}
+
+.setup-form .watched-chips li {
+  background: var(--accent-wash);
+  border-color: rgba(185, 161, 132, 0.5);
+  font-weight: 500;
+  padding: 8px 9px 8px 15px;
+}
+
+.setup-form .watchlist-empty {
+  text-align: center;
+  padding: 22px 16px;
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  background: var(--panel-2);
+}
+
+.setup-form .watchlist-empty strong {
+  display: block;
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+
+.setup-form .watchlist-empty span {
+  font-size: 12.5px;
+  color: var(--ink-3);
+}
+
+/* --- fine-tuning, the one section that folds ----------------------------- */
+
+.setup-form .form-section.aside {
+  background: none;
+  border-style: dashed;
+}
+
+.setup-form .fold > summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--ink-2);
+  list-style: none;
+  padding: 4px 0;
+  width: fit-content;
+}
+
+.setup-form .fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+.setup-form .fold > summary::before {
+  content: "›";
+  display: inline-block;
+  margin-right: 8px;
+  transition: transform 0.15s ease;
+}
+
+.setup-form .fold[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.setup-form .fold > summary:hover {
+  color: var(--ink);
+}
+
+.setup-form .fold[open] > summary {
+  margin-bottom: 18px;
+}
+
+/* --- the save bar -------------------------------------------------------- */
+
+/*
+ * STILL `sticky`, AND DELIBERATELY NOT THE DESIGN'S `fixed`. The reference is one
+ * page with nothing under the bar; this component is also /preferences, where the
+ * Delete account section sits below it — a fixed bar would hover over the one
+ * control in this app that cannot be taken back. Sticky reaches the bottom of the
+ * viewport in exactly the same way while it is the last thing in the form, which
+ * is the property ui-check asserts.
+ */
+.setup-form .save-bar {
+  margin: 24px -22px 0;
+  padding: 14px 22px;
+  background: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-top: 1px solid var(--line);
+}
+
+.setup-form .save-bar-inner {
+  max-width: 760px;
+  margin: 0 auto;
+  gap: 16px;
+}
+
+.setup-form .save-state-ok {
+  font-size: 13px;
+  color: #3f7a4b;
+  font-weight: 600;
+}
+
+.setup-form .save-state-title {
+  font-family: inherit;
+  font-size: 12.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--danger);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.setup-form ul.save-blockers a {
+  color: var(--danger);
+  border-color: rgba(169, 80, 47, 0.25);
+  background: rgba(169, 80, 47, 0.08);
+  padding: 3px 11px;
+}
+
+.setup-form .save-bar-action button.primary {
+  font-size: 14.5px;
+  font-weight: 700;
+  padding: 13px 24px;
+  white-space: nowrap;
+}
+
+.setup-form .saved-at {
+  color: var(--ink-3);
+}
+
+/* --- the success screen -------------------------------------------------- */
+
+/*
+ * Shown after the save that sets onboarding_completed, INSTEAD of navigating on
+ * the spot. See PreferencesEditor for the ordering argument — the redirect and
+ * the router refresh are the same two calls, moved behind the button.
+ */
+.setup-done {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(27, 25, 23, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.setup-done-card {
+  background: #fff;
+  border-radius: 18px;
+  padding: 38px 34px;
+  max-width: 380px;
+  text-align: center;
+  animation: setup-rise 0.3s ease both;
+}
+
+.setup-done-mark {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  margin: 0 auto 18px;
+}
+
+.setup-done-card h2 {
+  font-family: var(--head);
+  font-weight: 400;
+  font-size: 28px;
+  line-height: 1.1;
+  margin: 0 0 10px;
+}
+
+.setup-done-card p {
+  font-size: 14px;
+  color: var(--ink-2);
+  line-height: 1.6;
+  margin: 0 0 22px;
+}
+
+.setup-done-card button.primary {
+  padding: 13px 26px;
+  font-weight: 600;
+}
+
+/* --- phones -------------------------------------------------------------- */
+
+/*
+ * Most signups happen on a phone, and the reference was drawn at 760px. Nothing
+ * here reflows differently — the card padding tightens, the city grid falls to
+ * two columns at 375px and one at 320, and the save bar stacks (globals.css
+ * already drops the last-saved date and widens the button below 640px).
+ */
+@media (max-width: 640px) {
+  .setup-page {
+    padding: 0 14px 190px;
+  }
+
+  .setup-hero {
+    padding-top: 32px;
+    margin-bottom: 30px;
+  }
+
+  .setup-form .form-section {
+    padding: 24px 18px;
+    border-radius: 16px;
+  }
+
+  .setup-form h2.section-title {
+    font-size: 24px;
+  }
+
+  .setup-form .save-bar {
+    margin-inline: -14px;
+    padding-inline: 14px;
+  }
+
+  .setup-form .city-grid {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  }
+
+  header.top.setup .shell {
+    padding-inline: 14px;
+  }
+}
+
+@media (max-width: 360px) {
+  .setup-form .city-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -51,22 +51,36 @@ export function WorkModePicker({
         remote. A job only reaches you if its arrangement is one you tick here.
       </p>
 
-      {WORK_MODE_OPTIONS.map((option) => (
-        <div key={option.value} style={{ marginTop: 12 }}>
-          <label className="switch">
+      {/*
+        THREE PILLS RATHER THAN THREE ROWS — presentation, per the design. The
+        controls are the same checkboxes with the same setters; what moved is the
+        hint, which now sits under the row instead of under each option, because
+        three explanations stacked between three capsules is a paragraph with
+        buttons in it. Nothing here is lost: the on-site hint is the one that
+        matters (a NULL work_mode reads as onsite, so unticking it hides most of
+        the board) and it leads the line below.
+      */}
+      <div className="pills">
+        {WORK_MODE_OPTIONS.map((option) => (
+          <label className="switch" key={option.value} title={option.hint}>
             <input
               type="checkbox"
               checked={selected.includes(option.value)}
               onChange={(e) => toggle(option.value, e.target.checked)}
               aria-label={option.label}
             />
-            <span>
-              <strong>{option.label}</strong>
-            </span>
+            <span>{option.label}</span>
           </label>
-          <p className="hint">{option.hint}</p>
-        </div>
-      ))}
+        ))}
+      </div>
+
+      <ul className="hint mode-hints">
+        {WORK_MODE_OPTIONS.map((option) => (
+          <li key={option.value}>
+            <strong>{option.label}</strong> — {option.hint}
+          </li>
+        ))}
+      </ul>
 
       {none ? (
         <p className="msg bad">

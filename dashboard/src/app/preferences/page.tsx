@@ -1,9 +1,15 @@
+import { display, mono } from "@/fonts";
 import { requirePage } from "@/lib/guard";
 import { accountFootprint } from "@/lib/account";
 import { loadPreferences } from "@/lib/preferences";
 import { loadResume } from "@/lib/resume";
 import { DeleteAccount } from "@/components/DeleteAccount";
 import { PreferencesEditor } from "@/components/PreferencesEditor";
+
+// The editor's own stylesheet, shared with /onboarding — one form, one look. It
+// is scoped to `.setup-form`, so this page's heading, its rule and the delete
+// section below keep the app's chrome. See app/setup.css.
+import "../setup.css";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -47,8 +53,11 @@ export default async function PreferencesPage({
     searchParams,
   ]);
 
+  // The font variables the editor's stylesheet reads, on an ancestor of it. The
+  // faces are the self-hosted pair src/fonts.ts already ships for /signin; see
+  // the note on /onboarding for why they are not fetched from Google.
   return (
-    <>
+    <div className={`${display.variable} ${mono.variable}`}>
       <h1>Preferences</h1>
       <p className="lede">
         The single row that decides what reaches your inbox. The jobs table stores everything,
@@ -74,6 +83,6 @@ export default async function PreferencesPage({
       <hr className="rule" />
 
       <DeleteAccount email={email} footprint={footprint} notice={params.delete} />
-    </>
+    </div>
   );
 }

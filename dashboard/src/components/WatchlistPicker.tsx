@@ -53,6 +53,7 @@ export function WatchlistPicker({
   initialWatched,
   cap,
   onWatchedChange,
+  variant = "browse",
 }: {
   catalog: PickerCompany[];
   initialWatched: number[];
@@ -60,6 +61,26 @@ export function WatchlistPicker({
   cap: number | null;
   /** Told about every change, so a parent (onboarding) can gate its Save on it. */
   onWatchedChange?: (ids: number[]) => void;
+  /**
+   * TWO PRESENTATIONS OF ONE PICKER, and the difference is what the screen is FOR.
+   *
+   *   browse   /watchlist. The whole catalog, listed, yours sorted to the top —
+   *            because that screen's question is "what is there, and which of it
+   *            is mine", and answering it with a search box and an empty page
+   *            would hide the fifty companies the screen exists to show.
+   *   search   /onboarding. A search box, up to six results, and the companies
+   *            you have picked as chips beneath it. Setup asks a person for a
+   *            handful of employers they already have in mind; fifty names to
+   *            scroll past mid-signup is the opening the form slice moved the
+   *            picker down the page to avoid in the first place.
+   *
+   * IT IS PRESENTATION AND NOTHING ELSE. Both branches call the same toggle(),
+   * against the same route, under the same per-plan cap, with the same optimistic
+   * rollback and the same suppression count reported back — the list below is
+   * rendered from one state either way. The default is `browse`, so /watchlist is
+   * unchanged by omission.
+   */
+  variant?: "browse" | "search";
 }) {
   const [watched, setWatched] = useState<number[]>(initialWatched);
   const [query, setQuery] = useState("");
@@ -132,6 +153,116 @@ export function WatchlistPicker({
     } finally {
       setPending(null);
     }
+  }
+
+  /*
+   * THE SEARCH BRANCH. Six results at most, already-watched names left out of
+   * them (they are chips below, and offering "+ Add" for something already added
+   * is a button whose only possible outcome is a no-op), and nothing listed at
+   * all until somebody types — the design's own rule, and the reason the section
+   * is short enough to sit inside a form.
+   */
+  const results = needle ? shown.filter((c) => !watchedSet.has(c.id)).slice(0, 6) : [];
+  const watchedRows = ordered.filter((c) => watchedSet.has(c.id));
+
+  if (variant === "search") {
+    return (
+      <div className="panel">
+        {cap !== null && watched.length > cap ? (
+          <p className="msg warn">
+            You watch {watched.length} companies and the limit on your plan is {cap}. Nothing has
+            been removed &mdash; every one of them still counts and still emails you &mdash; but
+            you cannot add another until you remove some.
+          </p>
+        ) : null}
+
+        {error ? <p className="msg bad">{error}</p> : null}
+        {note ? <p className="msg ok">{note}</p> : null}
+
+        <div className="picker-search">
+          <input
+            type="search"
+            value={query}
+            placeholder="Search companies — e.g. Razorpay, Flipkart, Zoho"
+            onChange={(e) => setQuery(e.target.value)}
+            aria-label="Search companies"
+          />
+        </div>
+
+        {results.length ? (
+          <ul className="picker-results">
+            {results.map((company) => (
+              <li key={company.id}>
+                <button
+                  type="button"
+                  disabled={pending === company.id || full}
+                  onClick={() => toggle(company, true)}
+                  aria-label={`Watch ${company.name}`}
+                  title={
+                    full ? `You are already watching ${cap}, the limit on your plan.` : undefined
+                  }
+                >
+                  <span>
+                    {company.name}{" "}
+                    <span className="muted small mono">
+                      {company.open_jobs} open job{company.open_jobs === 1 ? "" : "s"}
+                    </span>
+                  </span>
+                  <span className="add-mark">
+                    {pending === company.id ? "…" : full ? "Limit reached" : "+ Add"}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+
+        {needle && !results.length ? (
+          <p className="muted small" style={{ margin: "0 0 16px" }}>
+            No company in the catalog matches &ldquo;{query}&rdquo; yet. Add its board on the Add
+            tab once you are set up &mdash; that puts it in the shared catalog, which is a
+            different act from watching it.
+          </p>
+        ) : null}
+
+        <hr className="picker-rule" />
+
+        {watchedRows.length ? (
+          <ul className="chips watched-chips">
+            {watchedRows.map((company) => (
+              <li key={company.id}>
+                {company.name}
+                <button
+                  className="linky"
+                  disabled={pending === company.id}
+                  onClick={() => toggle(company, false)}
+                  aria-label={`Stop watching ${company.name}`}
+                  title={`Stop watching ${company.name}`}
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="watchlist-empty">
+            <strong>Your watchlist is empty</strong>
+            <span>
+              You are not watching any company yet, so nothing can match: your digest would be
+              empty and Home would be blank. Search above to add one.
+            </span>
+          </div>
+        )}
+
+        <p className="hint" style={{ marginTop: 14, marginBottom: 0 }}>
+          When you add a company we mark the jobs it <strong>already</strong> has as seen, so your
+          first email is what arrives from now on rather than its back catalogue.{" "}
+          {cap === null
+            ? "Your plan has no limit on how many companies you can watch."
+            : `Free accounts watch up to ${cap}. The limit is checked on the server, so it holds however the request is made.`}
+        </p>
+      </div>
+    );
   }
 
   return (

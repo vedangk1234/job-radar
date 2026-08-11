@@ -902,10 +902,24 @@ async function main() {
     configured.includes("All Mumbai areas") && configured.includes("All of Delhi/NCR"),
     "and both umbrella controls, so a region is one tick rather than four",
   );
-  for (const label of ["blr", "mumbai", "navi-mumbai", "noida", "other-india", "belagavi"]) {
+  /*
+   * THE NAME IS FOR THE READER, THE LABEL IS THE ANSWER — the reskin's one change
+   * to this picker. Each cell prints "Bengaluru" and carries `blr` on the
+   * control's title and in its accessible name, so both halves are asserted: a
+   * grid of friendly names with no slug behind it would be a screen nobody can
+   * check against jobs.city, and a slug with no name is what the design replaced.
+   */
+  for (const [label, name] of [
+    ["blr", "Bengaluru"],
+    ["mumbai", "Mumbai"],
+    ["navi-mumbai", "Navi Mumbai"],
+    ["noida", "Noida"],
+    ["other-india", "Elsewhere in India"],
+    ["belagavi", "Belagavi"],
+  ]) {
     check(
-      configured.includes(`>${label}<`),
-      `the ${label} checkbox exists — Slice A's vocabulary reached the picker`,
+      configured.includes(`>${name}<`) && configured.includes(`aria-label="${name} (${label})"`),
+      `the ${label} checkbox exists as "${name}", with the label itself in its accessible name`,
     );
   }
   check(
@@ -960,8 +974,19 @@ async function main() {
     "the grid stayed live, so a person could set two answers that contradict each other",
   );
   check(
-    allIndia.includes(">blr<"),
+    allIndia.includes(">Bengaluru<"),
     "and still visible — disabled, not hidden, so the selection underneath is legible",
+  );
+  /*
+   * THE UMBRELLAS MOVED OUT OF THAT FIELDSET with the reskin — they are the
+   * design's pill row now, above the grid rather than inside it — so they no
+   * longer inherit its `disabled` and carry their own. Without it, All over India
+   * would leave two live controls writing a selection it ignores.
+   */
+  check(
+    (allIndia.match(/disabled=""/g) ?? []).length >= 2,
+    "and the two umbrella controls are disabled with it, now that they sit outside the grid",
+    "an umbrella stayed live under All over India, so two contradictory answers are on screen",
   );
   check(
     !allIndia.includes("Pick a city to save"),
@@ -1081,12 +1106,15 @@ async function main() {
     "the fields are wrapped in one form container",
     "the sticky bar has no containing block to be sticky within",
   );
+  // The section headings the reskin adopted from the design reference. They are
+  // asserted as strings because they are also the anchors the save bar's list
+  // points at — a heading that quietly changed is a link that lands nowhere.
   for (const [id, title] of [
-    ["resume", "Your resume and keywords"],
-    ["experience", "How much experience you want"],
-    ["cities", "Where you want to work"],
-    ["work-mode", "How you want to work"],
-    ["pay", "What you expect to be paid"],
+    ["resume", "Resume &amp; keywords"],
+    ["experience", "Experience"],
+    ["cities", "Cities"],
+    ["work-mode", "Work mode"],
+    ["pay", "Salary"],
     ["tuning", "Fine-tuning"],
   ]) {
     check(
@@ -1094,10 +1122,13 @@ async function main() {
       `the "${title}" section is on the page, with an id the save bar can link to`,
     );
   }
+  // `class="form-section` without the closing quote: Fine-tuning carries the
+  // `aside` modifier that keeps it out of the numbered sequence, so an exact
+  // match would count five and read as a missing section.
   check(
-    (configured.match(/class="form-section"/g) ?? []).length >= 6,
+    (configured.match(/class="form-section[ "]/g) ?? []).length >= 6,
     "every one of them is a real section rather than a heading floating over a stack",
-    `found ${(configured.match(/class="form-section"/g) ?? []).length}`,
+    `found ${(configured.match(/class="form-section[ "]/g) ?? []).length}`,
   );
   check(
     configured.includes('class="section-lede"'),
@@ -1217,6 +1248,77 @@ async function main() {
   check(
     setupBlank.includes('type="search"') && setupBlank.includes("not watching any company"),
     "the picker itself is fully present in that section — search box and empty state",
+  );
+
+  /*
+   * --- FINE-TUNING IS /preferences ONLY, AND THE VALUES STILL TRAVEL ---------
+   *
+   * The reskin took exclusions and max_level off the setup screen. What makes
+   * that a hidden SECTION rather than a dropped FIELD is invisible in the markup
+   * of either page, which is exactly the kind of thing this script exists to
+   * catch: PUT /api/preferences REQUIRES max_level and would refuse the save, and
+   * an omitted exclusions list would clean to [] and overwrite whatever the row
+   * held. So both halves are asserted — absent from the screen, present in the
+   * state the save reads.
+   */
+  check(
+    !setupBlank.includes('id="tuning"') && !setupBlank.includes("Max level"),
+    "onboarding does not show exclusions or max level — setup asks the six questions " +
+      "that decide whether anything reaches you at all",
+    "a fine-tuning control is on the setup screen",
+  );
+  check(
+    configured.includes('id="tuning"') && configured.includes("Max level"),
+    "/preferences still has both, which is now the only place they are editable",
+    "the fine-tuning section is gone from the screen that owns it",
+  );
+  check(
+    configured.includes('id="tuning"') && /<details class="fold"/.test(configured),
+    "folded shut there, because it is nobody's answer to anything by default",
+  );
+  /*
+   * The seeded values of a BRAND-NEW account, rendered by the editor onboarding
+   * actually uses — max_level 2 from the schema default and no exclusions. This
+   * is the state that has to survive a save made on a screen that shows neither.
+   */
+  const setupSeeded = withRouter(
+    createElement(OnboardingSetup, {
+      preferences: { ...savable, exclusions: [], max_level: 2 },
+      resume: null,
+      catalog,
+      initialWatched: [catalog[0].id],
+      cap: lib.FREE_WATCHLIST_CAP,
+    }),
+  );
+  check(
+    !setupSeeded.includes("Exclusions") && !setupSeeded.includes("Max level"),
+    "a fresh account sees neither control during setup",
+  );
+  check(
+    !setupSeeded.includes("Pick a company to watch to save") &&
+      setupSeeded.includes('class="save-state-ok"'),
+    "and can still finish setup with both left exactly as they were seeded — " +
+      "the save is not blocked on an answer nobody was asked for",
+    "a fresh account cannot complete onboarding without the hidden fields",
+  );
+
+  /*
+   * --- THE SUCCESS SCREEN ---------------------------------------------------
+   *
+   * It replaces an immediate router.replace(), so the failure it can have is
+   * being on screen when nothing has been saved — a modal over a form somebody is
+   * still filling in. It is client state set only by a response carrying
+   * onboarding_completed, so on a first render it must be absent everywhere.
+   */
+  check(
+    !setupBlank.includes("setup-done") && !setupSeeded.includes("setup-done"),
+    "the success screen is not rendered before a save — it is raised by the response, " +
+      "not by the page",
+    "the 'you're all set' screen is over a form nobody has saved yet",
+  );
+  check(
+    !configured.includes("setup-done") && !configured.includes("You&#x27;re all set"),
+    "and /preferences never renders it at all — it passes no success copy and no redirect",
   );
 
   const setupWatching = withRouter(

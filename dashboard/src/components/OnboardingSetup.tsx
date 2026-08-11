@@ -67,17 +67,36 @@ export function OnboardingSetup({
       redirectOnSave="/"
       watchedCount={watched.length}
       watchlistHref="#companies"
+      /*
+       * EXCLUSIONS AND MAX LEVEL ARE NOT ON THIS SCREEN, and they are not dropped
+       * from the save either — see the prop's own comment in PreferencesEditor.
+       * The editor still holds this row's values and still sends them, so a brand
+       * new account writes back the empty exclusions list and the max_level 2 it
+       * was seeded with, untouched. Both are editable on /preferences, which is
+       * now the only place they are.
+       */
+      fineTuning={false}
+      saveLabel="Finish setup"
+      doneCopy={{
+        title: "You're all set",
+        body:
+          "Your filter is saved. We'll start watching your companies and email you the moment " +
+          "a matching role appears.",
+        action: "Go to dashboard",
+      }}
       extraSections={
         <FormSection
           id="companies"
           title="Companies to watch"
-          lede="The first question the digest asks about a job is whose board it came from. Pick at least one company here or nothing above can match, however good the filter is."
+          tag={cap === null ? undefined : `${watched.length} of ${cap}`}
+          lede="We only email you jobs from companies you watch. The first question the digest asks about a job is whose board it came from, so pick at least one here or nothing above can match, however good the filter is."
         >
           <WatchlistPicker
             catalog={catalog}
             initialWatched={initialWatched}
             cap={cap}
             onWatchedChange={setWatched}
+            variant="search"
           />
         </FormSection>
       }

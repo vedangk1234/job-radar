@@ -334,6 +334,55 @@ export const CITY_LABEL_GROUPS: ReadonlyArray<{
   { heading: "Elsewhere in India", labels: ["other-india"] },
 ];
 
+/**
+ * HOW A CITY LABEL IS SPELLED ON A SCREEN — presentation, and nothing else.
+ *
+ * `blr` is the vocabulary: it is what `jobs.city` holds, what `selected_cities`
+ * stores, and what both matchers compare. It is also not what anybody calls the
+ * place, and a person choosing where they would take a job should not have to
+ * learn this project's slugs to do it. So the picker reads "Bengaluru" and keeps
+ * the slug on the control's `title` and `aria-label`, which is the same direction
+ * LEVEL_LABELS took for `max_level`: the number decides, the words are for the
+ * reader.
+ *
+ * IT IS DELIBERATELY NOT A SECOND VOCABULARY, and the lookup is one-way. Nothing
+ * parses these back into labels, nothing sends them, and a name missing from this
+ * map falls back to the slug rather than throwing — a city added to
+ * CITY_LABEL_GROUPS and forgotten here renders as `hubballi` and still works,
+ * which is the failure mode worth having.
+ */
+export const CITY_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+  blr: "Bengaluru",
+  hyd: "Hyderabad",
+  pune: "Pune",
+  mumbai: "Mumbai",
+  "navi-mumbai": "Navi Mumbai",
+  "mumbai-suburban": "Mumbai Suburban",
+  thane: "Thane",
+  "new-delhi": "New Delhi",
+  gurugram: "Gurugram",
+  noida: "Noida",
+  chennai: "Chennai",
+  kolkata: "Kolkata",
+  ahmedabad: "Ahmedabad",
+  indore: "Indore",
+  nagpur: "Nagpur",
+  nashik: "Nashik",
+  "chhatrapati-sambhajinagar": "Chhatrapati Sambhajinagar",
+  coimbatore: "Coimbatore",
+  madurai: "Madurai",
+  hubballi: "Hubballi",
+  mangaluru: "Mangaluru",
+  mysuru: "Mysuru",
+  belagavi: "Belagavi",
+  "other-india": "Elsewhere in India",
+};
+
+/** The name to print for a label, falling back to the label itself. */
+export function cityDisplayName(label: string): string {
+  return CITY_DISPLAY_NAMES[label] ?? label;
+}
+
 /** Every label a person may put in selected_cities, flattened from the groups. */
 export const SELECTABLE_CITY_LABELS: readonly string[] = CITY_LABEL_GROUPS.flatMap(
   (group) => group.labels,

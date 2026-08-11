@@ -360,7 +360,65 @@ async function main() {
       `requirePage() would redirect this account to ${guard.ONBOARDING_PATH} instead of the dashboard`,
     );
 
-    // §6 — the exit. Every value here is written out rather than taken from
+    /*
+     * §6a — THE ONBOARDING SAVE, IN THE SHAPE THE SETUP SCREEN ACTUALLY SENDS.
+     *
+     * The reskin took exclusions and max_level OFF /onboarding: they are editable
+     * on /preferences and nowhere else. What makes that a hidden section rather
+     * than a dropped field is this save — the editor still holds both values and
+     * still sends them, so the row's own seeded blanks make the round trip and
+     * come back untouched.
+     *
+     * IT IS NOT A COSMETIC DISTINCTION AND THE FAILURE MODE IS TWO-SIDED. Omit
+     * max_level and PUT /api/preferences refuses the save outright (it requires an
+     * integer 0-5), so the one act that finishes onboarding would fail for every
+     * new account — the Slice 1b keyword-cap collision exactly, arriving through a
+     * different field. Omit exclusions and cleanList turns it into [], which
+     * happens to equal the seed today and would silently erase a real list the
+     * moment somebody edits their filter on /preferences and then touches
+     * anything on setup.
+     *
+     * So the values passed here are read off the row §4 just checked rather than
+     * written out as literals: this asserts a PASS-THROUGH, and a literal []
+     * would pass whether the editor forwarded the row's value or invented one.
+     */
+    console.log("\n§6a the onboarding save — six answers, and two fields nobody was shown");
+    const released = await savePreferences(newUserId, {
+      cities: ["blr"],
+      selected_cities: ["blr"],
+      all_india: false,
+      keywords: ["backend engineer"],
+      exclusions: [...seeded.exclusions],
+      max_level: seeded.max_level,
+      exp_range_low: 1,
+      exp_range_high: 4,
+      years_of_experience_held: null,
+      show_no_experience_jobs: true,
+      work_modes: ["hybrid"],
+      salary_bands: [],
+    });
+    check(
+      released.onboarding_completed === true,
+      "a save that never mentions the two hidden fields still releases the gate",
+      "the setup screen cannot finish onboarding without them",
+    );
+
+    // Read back from the database rather than from the RETURNING, for the reason
+    // the Slice 2 invariant below is: this is a claim about a ROW.
+    const [afterOnboarding] = await sql<{ exclusions: string[]; max_level: number }[]>`
+      SELECT exclusions, max_level FROM preferences WHERE user_id = ${newUserId}
+    `;
+    check(
+      afterOnboarding.exclusions.length === 0 && afterOnboarding.max_level === 2,
+      "and the seeded exclusions and max_level are exactly as they were — a control " +
+        "nobody was shown did not become an answer nobody gave",
+      `got [${afterOnboarding.exclusions.join(", ")}] / ${afterOnboarding.max_level}`,
+    );
+
+    // §6 — the exit, and since the reskin also the /preferences half of that split:
+    // these two fields are editable there and nowhere else, so a save carrying
+    // `intern` and level 3 is the assertion that the screen which still shows them
+    // can still change them. Every value here is written out rather than taken from
     // DEFAULT_PREFERENCES, and that is the point of the slice made literal: these
     // are the answers a PERSON supplies at onboarding, and after this slice there
     // is no longer any overlap between what they choose and what they were seeded.
@@ -424,6 +482,12 @@ async function main() {
         saved.max_level === 3,
       "and their cities, exclusions and max_level — every field on the row is now theirs",
       `got [${saved.cities.join(", ")}] / [${saved.exclusions.join(", ")}] / ${saved.max_level}`,
+    );
+    check(
+      saved.exclusions.join() === "intern" && saved.max_level === 3,
+      "the two fields /preferences owns alone are still editable there — §6a left them " +
+        "at the seed, this changed both",
+      `got [${saved.exclusions.join(", ")}] / ${saved.max_level}`,
     );
 
     /*

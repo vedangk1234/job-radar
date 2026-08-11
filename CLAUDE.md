@@ -1262,7 +1262,10 @@ Next.js App Router + TypeScript in `dashboard/`. Read-mostly.
   subscribing to it, and no `user_companies` row is created here yet.
 - **Preferences (`/preferences`)** — edits **this user's** `preferences` row,
   found by owner since 1b rather than at `id = 1`. `PUT` rather than `PATCH`,
-  because the editor sends the full lists it is showing.
+  because the editor sends the full lists it is showing. Since the reskin it is
+  also the **only** screen carrying `exclusions` and `max_level`, and it wears the
+  same designed skin as /onboarding (the editor is one component) while keeping
+  the app nav, its own copy and the delete-account section.
 - **Onboarding (`/onboarding`)** — the same `WatchlistPicker` and the same
   `PreferencesEditor` (wrapped by `OnboardingSetup`, which carries one number
   between them), with setup copy and no delete-account section, and the one page
@@ -1272,7 +1275,11 @@ Next.js App Router + TypeScript in `dashboard/`. Read-mostly.
   onboarding gate*. Since the onboarding-form slice it is **one scrolling page of
   named sections** (resume and keywords → experience → cities → work mode → pay →
   companies) with a **sticky save bar** naming every answer still missing, and
-  **the app tabs are hidden on this route** — Sign out is not.
+  **the app tabs are hidden on this route** — Sign out is not. Since the reskin it
+  wears the design surface in `app/setup.css`, opens on a *Welcome — one-time
+  setup* header, ends on a **success screen** rather than an immediate redirect,
+  and does **not** show `exclusions` or `max_level` — both still travel in the
+  save, and both are edited on /preferences.
 
 ### The onboarding gate
 
@@ -2993,6 +3000,83 @@ Newest last. Append here as the project evolves.
   Deliberately **not** here: matching, the parser, `lib/preferences`, every `/api`
   route, the crawler, and the landing page's black theme — this is the app
   surface, styled from the same `globals.css` tokens as every other screen.
+
+- **2026-08-11 — Phase 3, the onboarding reskin. The setup form gets a designed
+  surface, and two fields leave it.** A RESKIN OF A WORKING SCREEN, not a rebuild:
+  every field component, every setter, every validation rule, the keyword cap, the
+  city umbrella and All-India exclusivity, the watch-list cap and its
+  history-suppression transaction, the sticky-save gate's five terms and the `PUT
+  /api/preferences` body are what they were. The save that flips
+  `onboarding_completed` is untouched, and `api/`, the matchers, the parsers and
+  the crawler are not in the diff at all.
+
+  **The design is a de-bundled static reference** kept at
+  `dashboard/design-reference/showstencil-onboarding-reference.html` — warm paper
+  (`#efece3`), white cards, `#b9a184` accent, Instrument Serif headings over an
+  IBM Plex Mono eyebrow. Both faces were ALREADY committed as latin-subset woff2
+  in `src/fonts/` for the landing page, so the reskin added no font files and the
+  page makes no `fonts.googleapis` request; the production build emits three
+  `.woff2` and contains no Google reference.
+
+  **SCOPED, THE WAY landing.css IS.** `app/setup.css` is scoped under two classes
+  rather than merged into `globals.css`: `.setup-form` (the editor — rendered by
+  BOTH /onboarding and /preferences, because one component with two looks is how
+  the two drift) and `.setup-page` (the paper, the hero and the 01-06 numbering,
+  which /onboarding alone renders). Home, Jobs, Watchlist and Add are untouched.
+  The palette is installed by REBINDING the app's own token names inside the scope
+  — `--panel`, `--line`, `--accent` and the rest — so every existing `.panel`,
+  `.msg`, `.chips` and `.switch` rule repaints in one place, and `color-scheme` is
+  pinned light for the reason the black landing page pins dark.
+
+  **The section numbers are a CSS counter, not a prop.** Setup is a sequence
+  somebody walks through once; /preferences is the same questions as a settings
+  screen, where numbering implies an order that no longer means anything. Deriving
+  them from the DOM also means adding a section cannot leave a number behind.
+
+  **EXCLUSIONS AND max_level ARE OFF THE SETUP SCREEN, AND THE VALUES STILL
+  TRAVEL.** `fineTuning={false}` hides the section on /onboarding; /preferences
+  leaves it at the default and is now the only place either is editable. The state
+  and `save()`'s body are unchanged, which is the whole of what makes it a hidden
+  SECTION rather than a dropped FIELD — and the failure mode is two-sided: `PUT
+  /api/preferences` REQUIRES `max_level`, so omitting it would refuse the one save
+  that finishes onboarding for every new account (the Slice 1b cap collision,
+  arriving through a different field), and an omitted `exclusions` cleans to `[]`,
+  which equals the seed today and would silently erase a real list tomorrow. A
+  control nobody is shown must not become an answer nobody gave.
+  `onboarding-check` §6a is the proof, and it passes the row's OWN seeded values
+  through rather than literals, so it asserts a pass-through rather than a
+  coincidence.
+
+  **The success screen replaced an immediate redirect, and the ordering is the
+  point.** `redirectOnSave` used to call `router.refresh()` and `router.replace()`
+  the instant the response carried `onboarding_completed`. Both calls now sit
+  behind the "Go to dashboard" button: refresh() re-renders THIS route on the
+  server, where the page redirects to "/" the moment the flag is TRUE, so firing
+  it on arrival would tear the screen down in the tick it went up. Nobody can be
+  stranded there — the flag is already written, so a reload lands on the
+  dashboard.
+
+  **The city grid reads "Bengaluru" and stores `blr`.** `CITY_DISPLAY_NAMES` is
+  presentation and the lookup is one-way; the slug is on every control's `title`
+  and in its accessible name, and a label missing from the map renders as itself.
+  The two umbrellas moved out of the `fieldset` into the design's pill row, so
+  they now carry their own `disabled` — without it, All over India would leave two
+  live controls writing a selection it ignores.
+
+  **The picker gained a second presentation, not a second picker.**
+  `variant="search"` is /onboarding: a search box, six results, chips for what you
+  picked. `browse` is the default and /watchlist is unchanged. Both call the same
+  `toggle()` against the same route under the same cap.
+
+  The save bar stays `sticky` rather than the design's `fixed`, deliberately:
+  /preferences renders the delete-account section below it, and a fixed bar would
+  hover over the one control in this app that cannot be taken back.
+
+  Verification: **1,547 pytest / 2 skipped**, typecheck and `next build` clean,
+  `ui-check` 155 → 163 assertions (the new section copy, the friendly city names
+  with their slugs, the disabled umbrellas, fine-tuning present on /preferences
+  and absent from setup, a seeded account still savable, and the success screen
+  absent before a save), `onboarding-check` +3 and green.
 
 **Pending**
 

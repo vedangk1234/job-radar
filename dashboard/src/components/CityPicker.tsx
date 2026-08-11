@@ -1,6 +1,6 @@
 "use client";
 
-import { CITY_LABEL_GROUPS } from "@/lib/labels";
+import { CITY_LABEL_GROUPS, cityDisplayName } from "@/lib/labels";
 
 /**
  * The city half of the preferences screen — Phase 3, cities Slice B.
@@ -61,25 +61,61 @@ export function CityPicker({
 
   return (
     <div className="panel">
-      <h2>Cities</h2>
+      {/*
+        THE THREE WIDE ANSWERS, TOGETHER AND FIRST — the design's pill row. All
+        over India is the exclusive switch; the two umbrellas are tick-one-get-all
+        over their own group and nothing else.
 
-      <label className="switch">
-        <input
-          type="checkbox"
-          checked={allIndia}
-          onChange={(e) => onAllIndiaChange(e.target.checked)}
-          aria-label="All over India"
-        />
-        <span>
-          <strong>All over India</strong> &mdash; anywhere in the country
-        </span>
-      </label>
+        THE UMBRELLAS CARRY THEIR OWN `disabled` NOW, and that is load-bearing
+        rather than tidy. They used to sit inside the fieldset below, which
+        disabled them for free while All over India was on; lifting them out of it
+        would otherwise leave two live controls writing a city selection the
+        all-India answer ignores — two answers on screen at once, which is exactly
+        what PUT /api/preferences refuses a body for stating.
+      */}
+      <div className="city-umbrellas pills">
+        <label className="switch">
+          <input
+            type="checkbox"
+            checked={allIndia}
+            onChange={(e) => onAllIndiaChange(e.target.checked)}
+            aria-label="All over India"
+          />
+          <span>All over India</span>
+        </label>
+
+        {CITY_LABEL_GROUPS.filter((group) => group.umbrella).map((group) => {
+          const allOn = group.labels.every((l) => selected.includes(l));
+          const someOn = group.labels.some((l) => selected.includes(l));
+          return (
+            <label className="switch" key={group.umbrella}>
+              <input
+                type="checkbox"
+                checked={allOn}
+                disabled={allIndia}
+                // Indeterminate is a DOM property, not an attribute, so React
+                // cannot set it from JSX — hence the ref. It is what shows a
+                // half-ticked group honestly rather than as "off", which is
+                // the state an account lands in when a city is added to a
+                // group after they last saved. See expandUmbrellas.
+                ref={(el) => {
+                  if (el) el.indeterminate = !allOn && someOn;
+                }}
+                onChange={(e) => toggleUmbrella(group.labels, e.target.checked)}
+                aria-label={group.umbrella}
+              />
+              <span>{group.umbrella}</span>
+            </label>
+          );
+        })}
+      </div>
+
       <p className="hint">
-        Matches every Indian posting, including the ones whose location we could not pin to a
-        city (&ldquo;Remote&rdquo;, bare &ldquo;India&rdquo;, a state name) and the ones in
-        towns outside the list below. Jobs outside India are never sent either way. While this
-        is on, the city list is ignored entirely &mdash; it is one answer or the other, not
-        both.
+        <strong>All over India</strong> matches every Indian posting, including the ones whose
+        location we could not pin to a city (&ldquo;Remote&rdquo;, bare &ldquo;India&rdquo;, a
+        state name) and the ones in towns outside the list below. Jobs outside India are never
+        sent either way. While it is on, the city list is ignored entirely &mdash; it is one
+        answer or the other, not both.
       </p>
 
       <fieldset
@@ -90,54 +126,35 @@ export function CityPicker({
           Or pick the cities you want. A posting is labelled with the city it names, and
           <strong> only a posting labelled with one of your cities is sent</strong> &mdash; a
           job whose location we could not read does not slip through. Choose{" "}
-          <code>other-india</code> for named Indian places outside this list (Lucknow, Mohali,
-          Patna).
+          <strong>Elsewhere in India</strong> for named Indian places outside this list
+          (Lucknow, Mohali, Patna).
         </p>
 
-        {CITY_LABEL_GROUPS.map((group) => {
-          const allOn = group.labels.every((l) => selected.includes(l));
-          const someOn = group.labels.some((l) => selected.includes(l));
-          return (
-            <div key={group.heading} style={{ marginBottom: 10 }}>
-              <p className="hint" style={{ margin: "0 0 4px" }}>
-                {group.heading}
-              </p>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
-                {group.umbrella ? (
-                  <label className="switch">
-                    <input
-                      type="checkbox"
-                      checked={allOn}
-                      // Indeterminate is a DOM property, not an attribute, so React
-                      // cannot set it from JSX — hence the ref. It is what shows a
-                      // half-ticked group honestly rather than as "off", which is
-                      // the state an account lands in when a city is added to a
-                      // group after they last saved. See expandUmbrellas.
-                      ref={(el) => {
-                        if (el) el.indeterminate = !allOn && someOn;
-                      }}
-                      onChange={(e) => toggleUmbrella(group.labels, e.target.checked)}
-                      aria-label={group.umbrella}
-                    />
-                    <span>
-                      <strong>{group.umbrella}</strong>
-                    </span>
-                  </label>
-                ) : null}
-                {group.labels.map((label) => (
-                  <label key={label} className="switch">
-                    <input
-                      type="checkbox"
-                      checked={selected.includes(label)}
-                      onChange={(e) => toggleCity(label, e.target.checked)}
-                    />
-                    <span className="mono">{label}</span>
-                  </label>
-                ))}
-              </div>
+        {/*
+          THE NAME IS FOR THE READER, THE LABEL IS THE ANSWER. Every cell prints
+          `cityDisplayName(label)` and carries the slug on `title` and in the
+          accessible name — `blr` is what jobs.city holds and what
+          selected_cities stores, and nothing about that changed here. See
+          lib/labels.CITY_DISPLAY_NAMES.
+        */}
+        {CITY_LABEL_GROUPS.map((group) => (
+          <div key={group.heading} className="city-group">
+            <p className="city-group-heading">{group.heading}</p>
+            <div className="city-grid">
+              {group.labels.map((label) => (
+                <label key={label} className="switch" title={label}>
+                  <input
+                    type="checkbox"
+                    checked={selected.includes(label)}
+                    onChange={(e) => toggleCity(label, e.target.checked)}
+                    aria-label={`${cityDisplayName(label)} (${label})`}
+                  />
+                  <span className="city-name">{cityDisplayName(label)}</span>
+                </label>
+              ))}
             </div>
-          );
-        })}
+          </div>
+        ))}
       </fieldset>
 
       {!allIndia && !selected.length ? (

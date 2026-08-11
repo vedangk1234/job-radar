@@ -1,11 +1,14 @@
 import { redirect } from "next/navigation";
 
+import { display, mono } from "@/fonts";
 import { listCompanies } from "@/lib/companies";
 import { requirePage } from "@/lib/guard";
 import { loadPreferences } from "@/lib/preferences";
 import { loadResume } from "@/lib/resume";
 import { watchlistState } from "@/lib/watchlist";
 import { OnboardingSetup } from "@/components/OnboardingSetup";
+
+import "../setup.css";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -75,19 +78,25 @@ export default async function OnboardingPage() {
 
   if (preferences.onboarding_completed) redirect("/");
 
+  /*
+   * THE FONTS ARE THE LANDING PAGE'S, SELF-HOSTED, AND THAT IS THE SAME PRODUCT
+   * ARGUMENT MADE TWICE. src/fonts.ts explains it for /signin: a page whose whole
+   * promise is that the reader is not the product should not make every visitor's
+   * browser announce itself to a Google font CDN before the headline paints. This
+   * screen is thirty seconds later in the same session, so it makes no
+   * third-party request either — the two .woff2 files are committed, and
+   * `next build` needs no network.
+   */
   return (
-    <>
-      <h1>Set up your radar</h1>
-      <p className="lede">
-        Two things decide what reaches your inbox. The filter — a job title has to contain one of
-        your keywords, the years its description asks for have to fall inside your range, and its
-        city and arrangement have to be ones you would take. And the companies you watch: we
-        crawl every board in the catalog hourly, and you hear about the ones you pick. Both are
-        yours to write and nothing has been chosen for you. Upload your resume and we will read
-        it once and suggest some keywords, or type your own. It is one page — answer what is
-        below, and the bar at the bottom says what is still missing. Save when it looks right and
-        the dashboard opens; you can change any of this later.
-      </p>
+    <div className={`${display.variable} ${mono.variable} setup-page`}>
+      <header className="setup-hero">
+        <p className="setup-eyebrow">Welcome — one-time setup</p>
+        <h1>Set up your filter</h1>
+        <p className="lede">
+          This decides which jobs reach your inbox. Nothing gets emailed until it is done — and
+          you can change any of it later from your dashboard.
+        </p>
+      </header>
       <OnboardingSetup
         preferences={preferences}
         resume={resume}
@@ -95,6 +104,6 @@ export default async function OnboardingPage() {
         initialWatched={watchlist.companyIds}
         cap={watchlist.cap}
       />
-    </>
+    </div>
   );
 }

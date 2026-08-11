@@ -57,9 +57,12 @@ export function SalaryBandPicker({
         pay, so leaving this blank and ticking everything do the same thing.
       </p>
 
-      <div className="chips" style={{ marginTop: 12 }}>
+      {/* Pills, like the work-arrangement row above and for the same reason: one
+          control shape on one surface. Same checkboxes, same setter, same six
+          values. */}
+      <div className="pills" style={{ marginTop: 12 }}>
         {SALARY_BAND_OPTIONS.map((option) => (
-          <label key={option.value} className="switch" style={{ marginRight: 16 }}>
+          <label key={option.value} className="switch">
             <input
               type="checkbox"
               checked={selected.includes(option.value)}

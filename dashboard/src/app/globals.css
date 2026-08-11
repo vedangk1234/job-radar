@@ -59,6 +59,23 @@ a {
   color: var(--accent);
 }
 
+/*
+ * THE SETUP PAGE PAINTS THE BODY, NOT JUST ITS OWN BOX. /onboarding is a warm
+ * paper surface (app/setup.css) rendered inside the shell, so the two edges the
+ * shell does not cover — an overscroll bounce on a phone, and the strip below a
+ * short page — would otherwise flash the dashboard's grey behind it.
+ *
+ * `:has()` rather than a class on <body>, because the layout is shared and server
+ * -rendered: it reads the session, deliberately not the route. The wrapper also
+ * carries its own background and min-height, so a browser without :has() gets the
+ * page correctly and loses only the bounce. See components/Nav for the same
+ * question answered on the client, and for why the layout stays route-blind.
+ */
+body:has(.setup-page) {
+  background: #efece3;
+  color-scheme: light;
+}
+
 code,
 .mono {
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
