@@ -32,6 +32,22 @@ Every page and every API route is behind it. `src/middleware.ts` matches
 so a page added later is protected by default. Each API route additionally calls
 `requireSession()` for itself.
 
+**`ALLOWED_EMAIL` and `MY_EMAIL` are different jobs**, and both are required.
+`ALLOWED_EMAIL` is the sign-in gate: which Google account may sign in. `MY_EMAIL`
+is
+the identity — since Phase 1b `src/lib/currentUser.ts` looks up
+`public.users WHERE lower(email) = lower(MY_EMAIL)`, and every preferences read,
+job list and badge is keyed on the id it finds. There is no fallback on that path
+(the User-Agent path in `lib/ats.ts` still has one): a wrong or missing value
+resolves to nobody, and Home and the preferences page error rather than quietly
+showing you somebody else's answer. **It must be set on Vercel**, which never
+sees the parent `.env`.
+
+That arrangement is temporary. Phase 2 adds magic-link auth, the user id comes
+from the session, and `currentUser.ts` is deleted along with its Python twin
+`db/users.py`. It reuses `MY_EMAIL` rather than adding a second identity variable
+precisely so the two runtimes cannot disagree about who you are.
+
 Redirect URIs that must exist in the Google Cloud console:
 
 | Environment | URI |
@@ -87,32 +103,63 @@ to every open posting including the sales roles, and is the screen that answers
 Neither ships job rows with the page. Both ship counts; a row fetches its own
 jobs from `/api/companies/:id/jobs?filter=matches|all` the first time it opens.
 
-`notified` is deliberately absent from the Home **filter**. Home is "what fits me
-right now", not "what has not been emailed yet" — a job sent in this morning's
-digest is still a job worth applying to this afternoon. It is shown as a
-**badge** instead, which is the same flag reported rather than acted on.
+**The company list is the shared catalog, not your watch list.** Phase 1 made the
+watch list per-user in the database (`user_companies`) and stopped there
+deliberately; 1f moved the badge and explicitly left this list alone. So both
+screens show every catalog company, there is no picker for adding or removing
+one, and `scripts/track_companies.py` is the only supported way to create a
+tracking row until that screen exists. The Add screen writes `companies` and only
+`companies` — which means a company added here is crawled from the next hour and
+reaches nobody's digest until it is tracked for somebody.
+
+Whether a job has been emailed is deliberately absent from the Home **filter**.
+Home is "what fits me right now", not "what has not been emailed yet" — a job
+sent in this morning's digest is still a job worth applying to this afternoon. It
+is shown as a **badge** instead, which is the same fact reported rather than
+acted on.
 
 ### Status badges
 
 One per row, derived at render from data the row already has. There is no column
 for any of them and there must not be: a badge is a reading of the match rules
-plus `notified`, and the match rules depend on the `preferences` row, which is
-editable from another tab. A stored badge would be a cached answer to a question
-whose inputs change under it.
+plus one per-user fact, and the match rules depend on the `preferences` row,
+which is editable from another tab. A stored badge would be a cached answer to a
+question whose inputs change under it.
 
 | Badge | Where | Means |
 | --- | --- | --- |
-| **NEW** | Home | a match with `notified = false` — in the digest queue, not yet emailed |
-| **NOTIFIED** | Home | a match with `notified = true` — already went out in a digest |
+| **NEW** | Home | a match **I** have not been told about — no `user_job_notifications` row for me and this job |
+| **NOTIFIED** | Home | a match **I** have been told about — such a row exists |
 | **SUGGESTED** | Jobs | this raw-list row also passes the filter |
 
 Non-matching rows on Jobs get no badge at all, which is the point: that screen is
 several hundred postings including the sales roles, and SUGGESTED is how the few
 that fit are findable in it.
 
-Every match in the database is currently `notified = true`, because the table was
-silently seeded and the digest cron does not exist yet — so Home reads NOTIFIED
-everywhere until the cron starts leaving fresh jobs unsent.
+**"Told me", not "told somebody".** The first two badges read `jobs.notified`
+until Phase 1f — one boolean on the job, meaning "somebody was emailed about
+this". That is a faithful paraphrase of "I was emailed about this" for exactly as
+long as there is one account; with two, the first person's digest turns the
+second person's NEW into NOTIFIED, asserting an email that person never got. So
+`user_notified` now comes from `lib/jobs.notifiedToUser(userId)`, the `EXISTS`
+mirror of the predicate the digest queue asks as `NOT EXISTS` in
+`notify/store.CANDIDATES_SQL`: the queue asks it to decide what to send, the
+badge asks it to decide what to say. The column itself was dropped in 1g, and
+this screen being its last reader is why 1f had to come first.
+
+Prove it with `npm run badge-check`: it asserts the column is gone from both the
+schema and this codebase, then creates a second account inside a
+always-rolled-back transaction and checks the badge differs correctly in both
+directions. For the one real account the old and new readings cover the same set
+of jobs, which is why nothing on screen moved.
+
+Most matches read NOTIFIED today, because most of the table is back catalogue: a
+company's first-ever crawl stores its whole board silently, and the 1d backfill
+recorded every job the old boolean covered as already-notified for the one
+existing account. NEW is not speculative — since the hourly cron a genuinely new
+posting arrives with no row for anybody and reads NEW until that hour's digest
+sends. A job **somebody else's** digest sent stays NEW here, which is the whole
+point of the change.
 
 ### The Applied checkbox
 
@@ -142,14 +189,19 @@ and running whole crawl cycles — close, reopen, rename — over it.
 | `npm run db:check` | proves the transaction pooler works with `prepare: false` |
 | `npm run parity` | diffs the TS ports against the Python originals |
 | `npm run match-parity` | diffs the match filter against `notify/match.py` over the live table |
+| `npm run badge-check` | proves the NEW / NOTIFIED badge is per-user, with a second account inside a rolled-back transaction |
+| `npm run config-roundtrip` | proves a company added here stores `config` as a jsonb **object**, not a double-encoded string |
 | `npm run ui-check` | renders the real job row over live rows from a **running** dev server and asserts the checkbox and badges are actually in the markup |
 | `npm run mint-session` | a local test session cookie — see the file header |
 
 ## What this app does not do
 
 No cron, no email, no writes to the crawler's Python code. It cannot touch the
-lifecycle of a job: the crawler owns `jobs.notified` and `jobs.status`, and a
-dashboard able to edit either could silently un-send or re-send a digest.
+lifecycle of a job: the crawler owns `jobs.seeded` and `jobs.status`, and a
+dashboard able to edit either could silently un-send or re-send a digest. Nor can
+it write `user_companies` or `user_job_notifications` — it reads the second for
+the badge and does not touch the first at all, so it cannot subscribe you to a
+company and cannot mark a job as sent.
 
 It also never fetches a job description. The `desc not checked` hint on Home
 reports that `desc_checked` is still false for that row and stops there —
@@ -158,6 +210,7 @@ there in Step 5d), so the hint marks the minutes between a job appearing and the
 next crawl reaching it. Doing it from a page load would make opening a screen
 cost a few hundred network requests.
 
-The writes it performs are `companies.tracked`, `companies.category`, the single
-`preferences` row, inserting a company, and `jobs.applied` / `jobs.applied_at` —
-see below for why those last two are the exception that proves the rule.
+The writes it performs are `companies.tracked`, `companies.category`, **this
+user's** `preferences` row (found by owner since Phase 1b, not at `id = 1`),
+inserting a company, and `jobs.applied` / `jobs.applied_at` — see above for why
+those last two are the exception that proves the rule.
