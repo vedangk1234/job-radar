@@ -12,6 +12,15 @@ fixtures/
 # Rendered digest from scripts/preview_digest.py. Regenerated on every dry run.
 digest_preview.html
 
+# Location survey from scripts/survey_all_locations.py. Regenerated on demand,
+# 200 KB of derived text — the markers it justifies are what gets committed.
+survey.txt
+
+# The hero source artwork. Deliberately untracked: dashboard/scripts/build-hero.cjs
+# is a manual step whose OUTPUTS (dashboard/public/hero/) are committed, so Vercel
+# builds from a checkout that has never seen this file.
+Homepage_background_image.png
+
 # Python
 __pycache__/
 *.pyc
