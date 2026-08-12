@@ -42,21 +42,27 @@ export type CompanyCard = CompanyRow & { match_jobs: number; applied_jobs: numbe
 /**
  * The company rows and their open/total counts. One aggregate, no job rows.
  *
- * `watchedBy` NARROWS THE CATALOG TO ONE PERSON'S WATCH LIST, and it is the whole
- * of what the picker slice changed in this file. Passing null asks the old
- * question — "every company in the shared catalog" — which is what the Add flow,
- * GET /api/companies and the picker itself still want. Passing a user id asks
- * "the companies THIS person watches", which is what Home and Jobs want now that
- * the two lists can differ.
+ * IT TOOK A `watchedBy` PARAMETER UNTIL THE FILTER-FIRST SLICE, and the parameter
+ * is gone rather than left defaulting to null. It narrowed the list to one
+ * person's watch list and had exactly one caller — listWatchedCompanyCards, which
+ * Home and Jobs used — because those two screens print a per-user "for you" count
+ * and a count over a company you did not watch counted jobs that could never reach
+ * your inbox.
  *
- * EXISTS rather than a join to user_companies, the same choice
- * notify/store.CANDIDATES_SQL makes and for the same reason: the question is
- * existence, and a join invites the reader to wonder whether a company can come
- * back twice. It cannot — UNIQUE (user_id, company_id) — but EXISTS says so
- * without being asked, and this query is already grouping.
+ * That reasoning was sound and its premise is gone: the digest queue no longer
+ * reads user_companies, so a match at ANY company can reach any inbox and the "for
+ * you" count is honest over the whole catalog. Which is what it was computing all
+ * along — matchCountsByCompany has never been scoped to a watch list, so the
+ * narrowing only ever affected which company ROWS got printed beside numbers that
+ * already spanned the catalog. Removing it makes the list agree with the figures
+ * on it.
+ *
+ * Deleted rather than kept as an unused option, on the standing argument: a
+ * convenient parameter that restores a superseded model is a loaded gun aimed at
+ * whichever future caller reaches for it.
  */
 async function companyRows(
-  { id = null, watchedBy = null }: { id?: number | null; watchedBy?: string | null } = {},
+  { id = null }: { id?: number | null } = {},
 ): Promise<CompanyRow[]> {
   return sql<CompanyRow[]>`
     SELECT c.id,
@@ -72,11 +78,6 @@ async function companyRows(
       FROM companies c
       LEFT JOIN jobs j ON j.company_id = c.id
      WHERE (${id}::int IS NULL OR c.id = ${id}::int)
-       AND (${watchedBy}::uuid IS NULL
-            OR EXISTS (SELECT 1
-                         FROM user_companies uc
-                        WHERE uc.user_id = ${watchedBy}::uuid
-                          AND uc.company_id = c.id))
      GROUP BY c.id
      ORDER BY c.name ASC
   `;
@@ -103,46 +104,33 @@ export async function listCompanyCards(userId: string): Promise<CompanyCard[]> {
   return rows.map((row) => withCounts(row, counts));
 }
 
-/**
- * The same cards, narrowed to the companies THIS person watches — what Home and
- * Jobs render since the watch-list picker exists.
+/*
+ * listWatchedCompanyCards() STOOD HERE AND WENT WITH THE WATCH-LIST GATE.
  *
- * WHY THE TWO SCREENS MOVED AND THE CATALOG DID NOT. Until this slice there was
- * one list, because there was only one list to have: `user_companies` had no
- * writer in the web app, so "the catalog" and "your companies" were the same
- * fifty rows for everybody. They are different lists now, and the two screens
- * that print a "for you" count are the ones that have to follow the person rather
- * than the install — a count computed over companies you do not watch is a count
- * of jobs that can never reach your inbox, which is precisely the disagreement
- * between Home and the digest this slice exists to close.
+ * It was listCompanyCards narrowed by `companyRows({ watchedBy: userId })`, and
+ * Home and Jobs were its only callers. The rule it embodied was not "narrow
+ * everything" — it was that a screen printing a per-user number has to follow the
+ * person, because a "for you" count over a company you did not watch counted jobs
+ * that could never arrive by email. That was true while the digest queue opened
+ * with `EXISTS (user_companies …)`.
  *
- * The full catalog is still browsable, on /watchlist, which is where adding and
- * removing happens. Nothing about the catalog is hidden; it moved to the screen
- * whose question it answers.
- *
- * AN EMPTY WATCH LIST RETURNS AN EMPTY LIST, and that is the honest answer rather
- * than a fallback to the catalog. Falling back would show a brand-new account
- * fifty companies' worth of matches that its digest will never contain — the
- * "seeded defaults" failure Slices 1b and 1c spent two commits removing from the
- * preferences row, arriving one table over. The screens say so in words and point
- * at the picker.
+ * It is false now. A match at any company in the catalog can reach any inbox, so
+ * the honest list for a screen that prints "for you" is the catalog — which is
+ * also what the number itself has always been computed over. Both screens call
+ * listCompanyCards again, which is what they called before the picker slice, and
+ * an account watching nothing sees the whole catalog with real counts on it rather
+ * than an empty page pointing at /watchlist.
  */
-export async function listWatchedCompanyCards(userId: string): Promise<CompanyCard[]> {
-  const prefs = await loadPreferences(userId);
-  const [rows, counts] = await Promise.all([
-    companyRows({ watchedBy: userId }),
-    matchCountsByCompany(prefs, userId),
-  ]);
-  return rows.map((row) => withCounts(row, counts));
-}
 
 /**
  * One company, with every count. For the response to a PATCH.
  *
- * Catalog-scoped rather than watch-list-scoped on purpose: the caller has just
- * edited a company's category, which is a fact about the shared catalog, and
- * answering "no such company" because the editor does not happen to watch it
- * would be a 404 about the wrong thing.
+ * It was already catalog-scoped while the two list screens were not, on the
+ * argument that the caller has just edited a company's CATEGORY — a fact about
+ * the shared catalog — and answering "no such company" because the editor did not
+ * happen to watch it would be a 404 about the wrong thing. That distinction has
+ * stopped mattering now the lists are catalog-scoped too; the paragraph stays
+ * because the reason it gives is still the reason, and would be again.
  */
 export async function companyCard(id: number, userId: string): Promise<CompanyCard | null> {
   const prefs = await loadPreferences(userId);

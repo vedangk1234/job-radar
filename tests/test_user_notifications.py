@@ -46,9 +46,13 @@ from pathlib import Path
 import pytest
 
 from db.notifications import count_notified_for_user, record_notified
-from db.watchlist import track_companies
 from notify.digest import run_digest
-from notify.store import fetch_candidates, record_sent
+from notify.store import (
+    fetch_candidates,
+    load_preferences,
+    record_sent,
+    suppress_filter_backlog,
+)
 from tests.conftest import TEST_USER_ID
 
 OTHER_USER_ID = "00000000-0000-4000-8000-000000000002"
@@ -129,6 +133,29 @@ async def unseeded_history(conn, count: int) -> list[str]:
         await conn.add_job(cid, title="Backend Engineer")
         ids.append(cid)
     return ids
+
+
+async def widen_filter(conn, user_id: str, **narrowed):
+    """Give this user a filter, and return (before, after) around the change.
+
+    THE SHAPE EVERY SUPPRESSION TEST BELOW NEEDS, and it is a helper rather than
+    six copies because the interesting part is what the delta does, not how a row
+    is replaced. `narrowed` is the filter they hold FIRST; they end on the seeded
+    default, which wants a Bengaluru backend role and therefore matches everything
+    unseeded_history() stores.
+
+    Deleting and re-inserting rather than UPDATEing is what conftest.same_filter_as_a
+    does one file over, and for the same reason: preferences_one_per_user_idx
+    refuses a second row per user, so a replacement is genuinely two statements.
+    """
+    await conn.execute("DELETE FROM preferences WHERE user_id = $1", user_id)
+    await conn.add_preferences_for(user_id, **narrowed)
+    before = await load_preferences(conn, user_id)
+
+    await conn.execute("DELETE FROM preferences WHERE user_id = $1", user_id)
+    await conn.add_preferences_for(user_id)
+    after = await load_preferences(conn, user_id)
+    return before, after
 
 
 # --- the table behaving ---------------------------------------------------
@@ -418,133 +445,205 @@ def test_no_crawl_path_module_mentions_per_user_notification_state(relative_path
     assert forbidden not in source, f"{relative_path} must not reference {forbidden!r}"
 
 
-def test_the_queue_predicate_asks_three_questions_and_not_the_old_boolean():
-    """The statement itself, because the change of predicate IS the sub-phase.
+def test_the_queue_predicate_asks_two_questions_and_not_the_watch_list():
+    """The statement itself, because the change of predicate IS the slice.
 
     The behavioural tests above prove what the queue returns. This one proves
     what it asks, and exists because the two failure modes differ: a predicate
     that returns the right rows today by coincidence of the data is one seeded
     company away from returning the wrong ones.
 
-    `j.notified` must be ABSENT. While it was there, one user's send silenced a
-    job for everybody — the flattening 1d documented and 1e removed — and leaving
-    it in alongside the new clauses would look like belt-and-braces while being
-    exactly the bug.
+    `user_companies` MUST BE ABSENT, and asserting the absence is the load-bearing
+    half. The clause was the gate — "is this job's company one you asked about" —
+    and while it was there an account that had pinned nothing matched nothing
+    however good its keywords were. Company tracking is unlimited and free now, so
+    every account effectively sees the whole catalog and a person's FILTER is what
+    decides their inbox. A revert would be silent: the digest would simply go quiet
+    for everyone who had not pinned anything, which reads exactly like a slow week.
+
+    `j.notified` must be absent for the older reason. While it was there, one
+    user's send silenced a job for everybody — the flattening 1d documented and 1e
+    removed.
     """
-    from notify.store import CANDIDATES_IGNORING_NOTIFIED_SQL, CANDIDATES_SQL
+    from notify.store import (
+        CANDIDATES_IGNORING_NOTIFIED_SQL,
+        CANDIDATES_SQL,
+        SUPPRESSION_CANDIDATES_SQL,
+    )
 
     assert "j.notified" not in CANDIDATES_SQL
-    assert "FROM user_companies uc" in CANDIDATES_SQL      # whose
-    assert "j.seeded = FALSE" in CANDIDATES_SQL            # what kind
+    assert "user_companies" not in CANDIDATES_SQL, (
+        "the queue is asking the watch list again. An account that has pinned "
+        "nothing then matches nothing, and the digest goes quiet for them with "
+        "nothing on any screen explaining why."
+    )
+    assert "j.seeded = FALSE" in CANDIDATES_SQL               # what kind
     assert "FROM user_job_notifications n" in CANDIDATES_SQL  # who already knows
+    assert "j.status = 'open'" in CANDIDATES_SQL              # and the lifecycle
 
     # The preview query is deliberately none of the above: it answers "what would
     # my filter pick out of everything open", which is the question
-    # `npm run match-parity` asks of the live database. Narrowing it to one
-    # person's watch list would make the two totals stop being comparable.
+    # `npm run match-parity` asks of the live database. It never carried the gate,
+    # which is what made its total comparable across this slice.
     for clause in ("user_companies", "seeded", "user_job_notifications", "notified"):
         assert clause not in CANDIDATES_IGNORING_NOTIFIED_SQL
 
+    # THE SUPPRESSION READ IS THE QUEUE MINUS ONE CLAUSE, and which one is the
+    # whole of its correctness. It shares seeded and the notification anti-join —
+    # so "already handled" means the same thing to both — and drops open-only, so a
+    # closed job that reopens cannot arrive as news. See _ANY_STATUS.
+    assert "j.seeded = FALSE" in SUPPRESSION_CANDIDATES_SQL
+    assert "FROM user_job_notifications n" in SUPPRESSION_CANDIDATES_SQL
+    assert "status" not in SUPPRESSION_CANDIDATES_SQL, (
+        "the suppression read filters on status. A closed job that reopens keeps "
+        "its canonical_id, so an open-only suppression leaves a hole one flap wide."
+    )
+    assert "user_companies" not in SUPPRESSION_CANDIDATES_SQL
 
-# --- the other half of the history hazard: starting to track ---------------
+
+# --- the other half of the history hazard: saving a filter -----------------
+#
+# It was "starting to track" until the filter-first slice, and every test below is
+# the test that was here with its trigger changed. The hazard is unchanged and is
+# the one jobs.seeded does not cover: a company crawled normally for weeks
+# accumulates perfectly ordinary open rows — not seeded, never emailed to anybody —
+# and something has to stop them all arriving in one email the moment somebody
+# becomes entitled to them. What changed is what makes a person entitled. It used
+# to be creating a (user, company) pair; it is now having, or widening, a filter.
 
 
-async def test_tracking_a_company_does_not_deliver_its_history(digest_conn):
-    """THE 1e HAZARD, second ordering: the history is already there.
+async def test_saving_a_filter_does_not_deliver_the_catalogue(digest_conn):
+    """THE 1e HAZARD, THIRD ORDERING: the history is already there, and the filter
+    is what reaches it.
 
     jobs.seeded covers a company's FIRST-EVER crawl. It says nothing about the
-    weeks of ordinary crawling afterwards, which leave perfectly normal open rows
-    that were never emailed to anybody — and the instant somebody starts tracking
-    that company, every one of them is in their queue. Two hundred jobs in one
-    email is the same cry-wolf failure by a different door.
+    weeks of ordinary crawling afterwards, which leave normal open rows that were
+    never emailed to anybody — and the instant somebody's filter admits them, every
+    one is in their queue. Twenty jobs in one email is the cry-wolf failure by a
+    door the silent seed does not watch.
 
-    So creating the pair records them. Note that these rows are NOT seeded and NOT
-    notified: nothing about them is special, which is exactly why the suppression
-    has to be attached to the act of tracking rather than to a property of a job.
+    So the save records them. Note that these rows are NOT seeded and NOT notified:
+    nothing about them is special, which is exactly why the suppression has to be
+    attached to the act that admits them rather than to a property of a job.
     """
     await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
     await unseeded_history(digest_conn, 20)
 
-    await track_companies(digest_conn, OTHER_USER_ID, [1])
+    before, after = await widen_filter(
+        digest_conn, OTHER_USER_ID, cities=["pune"], keywords=["machine learning"]
+    )
+    assert len(await suppress_filter_backlog(digest_conn, OTHER_USER_ID, before, after)) == 20
 
     queued = await fetch_candidates(digest_conn, OTHER_USER_ID)
-    assert queued == [], "a new watch list is a subscription, not a backfill"
+    assert queued == [], "a new filter is a subscription, not a backfill"
     assert await count_notified_for_user(digest_conn, OTHER_USER_ID) == 20
 
 
-async def test_a_job_arriving_after_you_track_still_reaches_you(digest_conn):
+async def test_a_job_arriving_after_you_save_still_reaches_you(digest_conn):
     """The other direction, and the reason the suppression is a snapshot.
 
-    Suppressing "everything currently stored" is only correct if it happens once,
-    at the moment the pair is created. A job that appears afterwards is the whole
-    point of tracking the company, and it must come through — otherwise the
+    Suppressing "everything the new filter admits" is only correct if it happens
+    once, at the moment the filter changes. A job that appears afterwards is the
+    whole point of having a filter, and it must come through — otherwise the
     suppression would be an off switch nobody could see.
     """
     await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
     await unseeded_history(digest_conn, 5)
 
-    await track_companies(digest_conn, OTHER_USER_ID, [1])
+    before, after = await widen_filter(
+        digest_conn, OTHER_USER_ID, cities=["pune"], keywords=["machine learning"]
+    )
+    await suppress_filter_backlog(digest_conn, OTHER_USER_ID, before, after)
     await digest_conn.add_job("posted-later", title="Backend Engineer")
 
     queued = [j["canonical_id"] for j in await fetch_candidates(digest_conn, OTHER_USER_ID)]
     assert queued == ["posted-later"]
 
 
-async def test_tracking_twice_does_not_swallow_the_jobs_that_arrived_since(digest_conn):
-    """The sharp edge, asserted rather than described.
+async def test_saving_twice_does_not_swallow_the_jobs_that_arrived_since(digest_conn):
+    """THE SHARP EDGE, and it is sharper here than it was for tracking.
 
-    Suppression records everything the company has RIGHT NOW. Running it against
-    a pair that already exists would therefore eat the person's actual queue,
-    silently. track_companies drives it from RETURNING — a company already
-    tracked yields no row and so suppresses nothing — which is what makes a
-    second run genuinely idempotent instead of idempotent-looking.
+    Suppression records what a filter newly admits. Run against a filter that has
+    not changed it would record everything the filter matches RIGHT NOW — which
+    is the person's actual queue, eaten silently, every time they touch the form.
+    Tracking could only do this on a re-add of the same company; a filter is saved
+    whenever anybody edits anything, so the delta is not an optimisation here, it
+    is the correctness.
+
+    NEW \\ OLD is what makes the second save a genuine no-op rather than an
+    idempotent-looking one: with before == after the difference is empty by
+    construction, whatever the catalogue has done in between.
     """
     await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
     await unseeded_history(digest_conn, 3)
-    await track_companies(digest_conn, OTHER_USER_ID, [1])
+
+    before, after = await widen_filter(
+        digest_conn, OTHER_USER_ID, cities=["pune"], keywords=["machine learning"]
+    )
+    await suppress_filter_backlog(digest_conn, OTHER_USER_ID, before, after)
 
     await digest_conn.add_job("arrived-since", title="Backend Engineer")
-    assert await track_companies(digest_conn, OTHER_USER_ID, [1]) == []
+    assert await suppress_filter_backlog(digest_conn, OTHER_USER_ID, after, after) == []
 
     queued = [j["canonical_id"] for j in await fetch_candidates(digest_conn, OTHER_USER_ID)]
-    assert queued == ["arrived-since"], "re-tracking must not eat the queue"
+    assert queued == ["arrived-since"], "re-saving must not eat the queue"
 
 
-async def test_untracking_and_tracking_again_does_not_re_flood(digest_conn):
-    """Remove the pair, add it back. The history stays history.
+async def test_narrowing_then_widening_again_does_not_re_flood(digest_conn):
+    """Narrow the filter, widen it back. The history stays history.
 
-    The suppression rows survive the tracking row — they are about a person and a
-    job, not about a subscription — so the second track re-records a set that is
-    already recorded and inserts nothing. Anything stored in the meantime is
-    history the person genuinely did not ask to hear about, which is the same
-    answer they got the first time.
+    The suppression rows survive a narrowing — they are about a person and a job,
+    not about a filter — so widening back re-records a set that is already recorded
+    and inserts nothing. Anything stored in the meantime is history this person's
+    filter did not want at the time, which is the same answer they got the first
+    time.
+
+    This is the untrack/re-track case, one axis over, and it is still the case that
+    proves the design rather than a corner of it.
     """
     await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
     await unseeded_history(digest_conn, 4)
-    await track_companies(digest_conn, OTHER_USER_ID, [1])
 
-    await digest_conn.execute(
-        "DELETE FROM user_companies WHERE user_id = $1 AND company_id = $2", OTHER_USER_ID, 1
+    narrow_prefs, wide_prefs = await widen_filter(
+        digest_conn, OTHER_USER_ID, cities=["pune"], keywords=["machine learning"]
     )
-    await digest_conn.add_job("while-away", title="Backend Engineer")
-    await track_companies(digest_conn, OTHER_USER_ID, [1])
+    await suppress_filter_backlog(digest_conn, OTHER_USER_ID, narrow_prefs, wide_prefs)
+
+    await digest_conn.add_job("while-narrow", title="Backend Engineer")
+    # Narrowing suppresses nothing — the delta is empty in that direction.
+    assert await suppress_filter_backlog(digest_conn, OTHER_USER_ID, wide_prefs, narrow_prefs) == []
+    # And widening back re-admits `while-narrow`, which genuinely IS history now.
+    assert await suppress_filter_backlog(
+        digest_conn, OTHER_USER_ID, narrow_prefs, wide_prefs
+    ) == ["while-narrow"]
 
     assert await fetch_candidates(digest_conn, OTHER_USER_ID) == []
 
 
 async def test_suppression_covers_closed_jobs_too(digest_conn):
-    """Every job of the company, not only the open ones.
+    """EVERY job the filter admits, not only the open ones.
 
     A closed job is one reappearance away from being open again: UPSERT_SEEN sets
     status='open' and miss_count=0 while keeping the row's identity. Scoping the
     suppression to open rows would leave a hole exactly one flap wide, and
-    `reappeared` is the set the crawler most deliberately refuses to treat as
-    news.
+    `reappeared` is the set the crawler most deliberately refuses to treat as news.
+
+    THIS IS THE ONE PROPERTY THE REPLACEMENT HAD TO RE-EARN. The old
+    SUPPRESS_COMPANY_HISTORY_SQL got it for free by selecting on company_id alone;
+    the filter-backlog read had to be given a status-blind variant on purpose, and
+    would have shipped green without one — the failure needs a vendor to re-list a
+    posting weeks later.
     """
     await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
     await digest_conn.add_job("was-closed", title="Backend Engineer", status="closed")
 
-    await track_companies(digest_conn, OTHER_USER_ID, [1])
+    before, after = await widen_filter(
+        digest_conn, OTHER_USER_ID, cities=["pune"], keywords=["machine learning"]
+    )
+    assert await suppress_filter_backlog(
+        digest_conn, OTHER_USER_ID, before, after
+    ) == ["was-closed"]
+
     await digest_conn.execute(
         "UPDATE jobs SET status = 'open', miss_count = 0 WHERE canonical_id = $1", "was-closed"
     )
@@ -552,16 +651,28 @@ async def test_suppression_covers_closed_jobs_too(digest_conn):
     assert await fetch_candidates(digest_conn, OTHER_USER_ID) == []
 
 
-async def test_tracking_suppresses_only_that_company(digest_conn):
-    """One company's history, not the catalog's. The pair is the unit."""
+async def test_suppression_covers_only_what_the_filter_admits(digest_conn):
+    """The delta is the unit — not the company, and not everything open.
+
+    The old test was test_tracking_suppresses_only_that_company, and the pair was
+    the unit because tracking was what admitted jobs. The filter is the unit now,
+    so the boundary is what the new answer newly matches: a job the widened filter
+    still does not want must not be recorded, or the person would be silently
+    barred from it if they ever widened far enough to want it.
+    """
     await digest_conn.add_company(2, "Otherco")
     await digest_conn.add_user(OTHER_USER_ID, OTHER_EMAIL)
-    await digest_conn.add_job("theirs", title="Backend Engineer", company_id=1)
-    await digest_conn.add_job("elsewhere", title="Backend Engineer", company_id=2)
+    await digest_conn.add_job("wanted", title="Backend Engineer", company_id=2)
+    await digest_conn.add_job("not-wanted", title="Senior Sales Director", company_id=1)
 
-    await track_companies(digest_conn, OTHER_USER_ID, [1])
+    before, after = await widen_filter(
+        digest_conn, OTHER_USER_ID, cities=["pune"], keywords=["machine learning"]
+    )
+    await suppress_filter_backlog(digest_conn, OTHER_USER_ID, before, after)
 
-    assert await digest_conn.notification_pairs() == {(OTHER_USER_ID, "theirs")}
+    # `wanted` is at a company this account has never pinned, which is the point:
+    # the filter reaches across the catalog, so the suppression has to as well.
+    assert await digest_conn.notification_pairs() == {(OTHER_USER_ID, "wanted")}
 
 
 async def test_a_silent_day_sends_nothing_and_writes_nothing(digest_conn):

@@ -883,16 +883,27 @@ def conn() -> FakeConn:
 async def digest_conn() -> FakeConn:
     """One user, one company they watch, and the seeded preferences.
 
-    The ordinary case, as of Phase 1e: a fully migrated database where the filter
-    has an owner AND the user's watch list contains the company their jobs belong
-    to. The tracking row is not decoration — since 1e the digest queue requires
-    it, so without it every test in this suite would read an empty queue and pass
-    or fail for a reason none of them is about.
+    The ordinary case: a fully migrated database where the filter has an owner
+    and the user watches the company their jobs belong to.
+
+    THE TRACKING ROW NO LONGER DECIDES ANYTHING, SINCE THE FILTER-FIRST SLICE,
+    and it is kept rather than deleted. The queue used to open with
+    `EXISTS (user_companies …)`, so without this row every test in the suite
+    would have read an empty queue and passed or failed for a reason none of them
+    was about. The queue asks two questions now — is this back catalogue, have you
+    been told — and neither of them is about a company. The row stays because it
+    is still a true statement about this account (/watchlist still writes one, and
+    the picker is still the overlay it always was), and because deleting it would
+    make this fixture describe an account no screen in the app can produce.
+
+    Note also what this fixture's shape now buys for free: there is exactly ONE
+    company, and A watches it — so "every company A watches" and "the whole
+    catalog" are the same set, and every single-user test in this suite reads the
+    identical queue under either model.
 
     Tracked with a direct INSERT rather than through db.watchlist.track_companies
-    on purpose: that function also suppresses the company's stored history, which
-    is exactly right in production and would silence every job a test adds
-    afterwards. Tests about tracking-time suppression call the real function.
+    on purpose: the direct helper carries no ON CONFLICT, so a test about
+    idempotence has to run the production statement instead of this.
     """
     conn = FakeConn()
     await conn.add_user()
@@ -966,10 +977,17 @@ async def two_users(digest_conn) -> FakeConn:
     (id 2) for machine-learning roles in Pune. Nothing about the two overlaps, so
     any leak between them is unambiguous rather than a matter of interpretation.
 
-    The tracking rows go in directly rather than through track_companies, because
-    that function suppresses the company's stored history — correct in production
-    and fatal to a fixture, which adds its jobs afterwards. The one test that is
-    ABOUT that suppression calls the real function on top of this.
+    THE RIG IS DELIBERATELY OVER-DETERMINED, AND SINCE THE FILTER-FIRST SLICE
+    ONLY ONE OF THE TWO AXES STILL SEPARATES ANYBODY. The two accounts differ in
+    their watch list AND in their filter, which was redundant while the queue's
+    first clause was `EXISTS (user_companies …)` and is load bearing now that it
+    is not: the filter is what keeps A's job out of B's digest, and the watch
+    lists are inert. Tests that need the two to differ in exactly one way call
+    same_filter_as_a() and then separate them by NOTIFICATION STATE instead.
+
+    The tracking rows stay for the reason digest_conn's do — they are still true
+    statements about these accounts — and they go in directly rather than through
+    track_companies because that helper carries no ON CONFLICT.
     """
     await digest_conn.add_company(2, "Otherco")
     await digest_conn.add_user(USER_B_ID, USER_B_EMAIL)

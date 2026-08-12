@@ -36,18 +36,17 @@ export default async function WatchlistPage() {
       <h1>Watchlist</h1>
       <p className="lede">
         <strong>{state.companyIds.length}</strong> of {catalog.length} companies in the catalog
-        are yours. Your digest and your Home screen are built from these and nothing else &mdash;
-        the rest are crawled hourly all the same, for everybody, and simply do not reach you. Add
-        one and its existing postings are recorded as already seen, so the first email you get
-        about it is a genuinely new job.
+        are pinned to your account. Pinning is optional and it narrows nothing: your digest and
+        your Home screen are built from your <em>filter</em>, matched against every board we
+        crawl. This is for keeping the companies you care about most in view.
       </p>
       <WatchlistPicker catalog={catalog} initialWatched={state.companyIds} cap={state.cap} />
       <p className="muted small" style={{ marginTop: 14 }}>
-        Watching a company is a setting on <em>your account</em>. It does not start or stop the
+        Pinning a company is a setting on <em>your account</em>. It does not start or stop the
         crawler for anybody &mdash; that is the <code>tracked</code> flag on the shared catalog
-        row, which the dashboard may read and never write. Removing a company here leaves the
-        jobs you were already told about alone; re-adding it later will not re-send anything you
-        have already seen.
+        row, which the dashboard may read and never write. It does not decide what reaches your
+        inbox either: unpinning a company here does not stop its jobs matching your filter, and
+        pinning one does not add anything your filter was not already going to catch.
       </p>
     </>
   );

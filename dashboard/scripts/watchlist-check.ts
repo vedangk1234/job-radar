@@ -1,38 +1,33 @@
 /**
- * Does adding a company actually do BOTH halves of what tracking means?
+ * Does pinning a company write the pair, hold the cap, and touch nothing else?
  *
  *     npm run watchlist-check
  *
- * WHY THIS EXISTS
- * ---------------
- * `user_companies` had exactly one writer for two phases —
- * scripts/track_companies.py — and that script is a thin argument parser over
- * db/watchlist.track_companies, whose whole reason to be a function rather than
- * an INSERT is the second obligation: recording the company's stored jobs as
- * already-notified for that person, in the same transaction, so their first
- * digest is not an archive dump of everything the crawler ever stored for that
- * employer.
+ * WHY THIS EXISTS, AND WHAT IT STOPPED BEING
+ * ------------------------------------------
+ * It used to ask whether adding a company did BOTH halves of what tracking meant:
+ * the pair, and the suppression of that company's stored history in the same
+ * transaction. Its headline was "1,180 and 0" — adding Continental to a fresh
+ * account recorded 1,180 rows as already-seen and left the queue at zero, where
+ * without the second half 212 open postings would have been that account's first
+ * email.
  *
- * The picker is a SECOND writer, in a second language, in a runtime that cannot
- * call the first one. tests/test_watchlist_write.py compares the two statements
- * textually and can prove they say the same thing; only this can prove that what
- * they say is true of the live database — that the rows land, that the queue is
- * empty afterwards, and that the cap refuses the sixth company without writing
- * anything.
+ * The filter-first slice removed the watch-list gate from the digest queue, and
+ * the suppression went with it: a pair admits nothing now, so suppressing on the
+ * strength of one takes away jobs a person's FILTER already earned them. The
+ * hazard did not go away — it moved to the filter, and so did the check.
+ * `npm run filter-first-check` is where the "N and 0" number lives now.
  *
- * WHAT IT RUNS. lib/link-user.linkUser, lib/watchlist.watchCompany /
- * unwatchCompany / watchesAnything and lib/companies.listWatchedCompanyCards —
- * imported and called, never restated, which is the discipline
- * scripts/onboarding-check.ts and scripts/badge-check.ts already follow. A check
- * that wrote its own INSERT would prove that INSERT works.
+ * WHAT IS LEFT HERE IS STILL WORTH A CHECK, and it is the half that was never
+ * about suppression: the pair lands, the per-plan cap is enforced on the server
+ * and refuses the sixth company WITHOUT WRITING ANYTHING (the refusal is a throw
+ * inside the transaction that had already inserted the row), unwatching removes
+ * exactly one row, and none of it disturbs the operator.
  *
- * The ONE thing it restates is the digest queue, in §5, and it says so where it
- * does it: notify/store.CANDIDATES_SQL is Python, on the other side of a boundary
- * with no bridge, so the four clauses are transcribed here with the original
- * quoted beside them. That transcription is the point of the section — it asks
- * the question the crawler's digest will ask an hour from now, of a user that
- * has just added a company holding hundreds of jobs, and the answer has to be
- * zero.
+ * WHAT IT RUNS. lib/link-user.linkUser and lib/watchlist.watchCompany /
+ * unwatchCompany / watchlistState — imported and called, never restated, which is
+ * the discipline scripts/onboarding-check.ts and scripts/badge-check.ts already
+ * follow. A check that wrote its own INSERT would prove that INSERT works.
  *
  * REAL ROWS, DELETED AFTERWARDS, for the reason onboarding-check documents:
  * these functions bind the pool rather than a transaction handle, so a
@@ -55,11 +50,9 @@ type Lib = {
   linkUser: typeof import("../src/lib/link-user").linkUser;
   watchCompany: typeof import("../src/lib/watchlist").watchCompany;
   unwatchCompany: typeof import("../src/lib/watchlist").unwatchCompany;
-  watchesAnything: typeof import("../src/lib/watchlist").watchesAnything;
   watchlistState: typeof import("../src/lib/watchlist").watchlistState;
   WatchlistFullError: typeof import("../src/lib/watchlist").WatchlistFullError;
-  listWatchedCompanyCards: typeof import("../src/lib/companies").listWatchedCompanyCards;
-  listCompanies: typeof import("../src/lib/companies").listCompanies;
+  listCompanyCards: typeof import("../src/lib/companies").listCompanyCards;
   currentUserId: typeof import("./current-user").currentUserId;
   FREE_WATCHLIST_CAP: typeof import("../src/lib/labels").FREE_WATCHLIST_CAP;
 };
@@ -78,11 +71,9 @@ async function loadLib(): Promise<Lib> {
     linkUser: link.linkUser,
     watchCompany: watchlist.watchCompany,
     unwatchCompany: watchlist.unwatchCompany,
-    watchesAnything: watchlist.watchesAnything,
     watchlistState: watchlist.watchlistState,
     WatchlistFullError: watchlist.WatchlistFullError,
-    listWatchedCompanyCards: companies.listWatchedCompanyCards,
-    listCompanies: companies.listCompanies,
+    listCompanyCards: companies.listCompanyCards,
     currentUserId: currentUser.currentUserId,
     FREE_WATCHLIST_CAP: labels.FREE_WATCHLIST_CAP,
   };
@@ -95,6 +86,30 @@ let failures = 0;
 function check(ok: boolean, label: string, detail = "") {
   console.log(`  ${ok ? "ok  " : "FAIL"}  ${label}${detail && !ok ? `\n        ${detail}` : ""}`);
   if (!ok) failures += 1;
+}
+
+/**
+ * The digest's own queue for one account, counted.
+ *
+ * notify/store.CANDIDATES_SQL transcribed — it is Python, and the two runtimes
+ * share no code. Two clauses since the filter-first slice; the `EXISTS
+ * (user_companies …)` gate that stood first is what this script exists to prove
+ * is gone, so its absence here is deliberate rather than an omission.
+ */
+async function digestQueue(sql: Lib["sql"], userId: string): Promise<number> {
+  const [{ queued }] = await sql<{ queued: number }[]>`
+    SELECT count(*)::int AS queued
+      FROM jobs j
+     WHERE j.status = 'open'
+       AND j.seeded = FALSE
+       AND NOT EXISTS (
+             SELECT 1
+               FROM user_job_notifications n
+              WHERE n.user_id = ${userId}
+                AND n.canonical_id = j.canonical_id
+           )
+  `;
+  return queued;
 }
 
 /** The shape linkUser reads. Not a session and not a forgery — see onboarding-check. */
@@ -178,32 +193,36 @@ async function main() {
       "it watches nothing and has no notification history — signup creates neither",
       `companies=${fresh.companies} notifications=${fresh.notifications}`,
     );
+    // PUT /api/preferences used to REFUSE to finish this account's onboarding
+    // for exactly this state, and the filter-first slice removed that refusal —
+    // an account pinning nothing now matches the whole catalog, so there was no
+    // missing answer to refuse for. Home correspondingly shows it every company
+    // rather than none, which is what the last check here says.
     check(
-      (await lib.watchesAnything(newUserId)) === false,
-      "so PUT /api/preferences would REFUSE to finish its onboarding — an account " +
-        "watching nothing matches nothing, whatever its keywords say",
-    );
-    check(
-      (await lib.listWatchedCompanyCards(newUserId)).length === 0,
-      "and Home shows it no companies at all, rather than the 50-company shared catalog",
+      (await lib.listCompanyCards(newUserId)).length > 0,
+      "and Home shows it the whole catalog — pinning nothing is not a narrowed view",
+      "an account that pins nothing sees no companies; the watch-list gate is back",
     );
 
-    // --- §4 the add, and its second half ----------------------------------
-    console.log("\n§4 watching one company — the pair AND the suppression");
+    // --- §4 the add — the pair, AND NOTHING ELSE --------------------------
+    //
+    // "Nothing else" is the assertion that changed. This section used to check
+    // that the add ALSO wrote a notification row per stored job; it now checks
+    // that it writes NONE, because a pin no longer admits anything and
+    // suppressing on one would remove jobs the person's filter already earned.
+    // See lib/watchlist.watchCompany for the sequence that makes that a real bug
+    // rather than harmless insurance.
+    console.log("\n§4 pinning one company — the pair, and nothing else");
     const target = richest[0];
+    const queueBefore = await digestQueue(sql, newUserId);
     const result = await lib.watchCompany(newUserId, target.id);
+    const queueAfterPin = await digestQueue(sql, newUserId);
     console.log(
       `  ${target.name}: ${target.stored} stored jobs, of which ${target.queueable} ` +
         `are open and not back catalogue`,
     );
 
     check(result.inserted === true, "the pair was genuinely inserted");
-    check(
-      result.suppressed === target.stored,
-      `and ${result.suppressed} job(s) were recorded as already-seen — EVERY stored row for ` +
-        `that company, not only the open ones (a closed job that reopens keeps its identity)`,
-      `suppressed ${result.suppressed}, company holds ${target.stored}`,
-    );
 
     const [pair] = await sql<{ n: number }[]>`
       SELECT count(*)::int AS n FROM user_companies
@@ -213,65 +232,50 @@ async function main() {
 
     const afterAdd = await footprint(newUserId);
     check(
-      afterAdd.notifications === target.stored,
-      `user_job_notifications holds ${afterAdd.notifications} rows for this account, all written ` +
-        `by the add and none of them a receipt for an email that was sent`,
-      `got ${afterAdd.notifications}, expected ${target.stored}`,
+      afterAdd.notifications === 0,
+      `and NOT ONE notification row was written, though ${target.name} holds ` +
+        `${target.stored} stored jobs — pinning withholds nothing`,
+      `got ${afterAdd.notifications} notification row(s); watchCompany is suppressing ` +
+        `history again, which silently removes jobs this account's filter already matched`,
     );
 
-    // --- §5 THE PROOF THAT MATTERS: the first digest is not flooded --------
+    // --- §5 the queue is indifferent to the pin ---------------------------
     //
-    // The four clauses below are notify/store.CANDIDATES_SQL, transcribed. The
-    // original:
+    // THE SECTION THAT INVERTED. It used to be "THE PROOF THAT MATTERS": the
+    // digest queue for this account had to be ZERO after the add, because the
+    // suppression had just recorded everything the newly-watched company held.
+    //
+    // The queue does not read user_companies at all now, so pinning cannot change
+    // it in either direction — and that is what is asserted instead. The clauses
+    // below are notify/store.CANDIDATES_SQL, transcribed, minus the gate that went:
     //
     //     WHERE j.status = 'open'
-    //       AND EXISTS     (user_companies uc WHERE uc.user_id = $1
-    //                                           AND uc.company_id = j.company_id)
     //       AND j.seeded = FALSE
     //       AND NOT EXISTS (user_job_notifications n WHERE n.user_id = $1
     //                                                  AND n.canonical_id = j.canonical_id)
     //
     // Restated rather than imported because it lives in Python and the two
-    // runtimes share no code. What it asks here is the question the hourly cron
-    // will ask an hour from now, of an account that has just started watching a
-    // company holding hundreds of postings.
-    console.log("\n§5 what this account's next digest would contain");
-    const [queue] = await sql<{ candidates: number }[]>`
-      SELECT count(*)::int AS candidates
-        FROM jobs j
-       WHERE j.status = 'open'
-         AND EXISTS (SELECT 1 FROM user_companies uc
-                      WHERE uc.user_id = ${newUserId} AND uc.company_id = j.company_id)
-         AND j.seeded = FALSE
-         AND NOT EXISTS (SELECT 1 FROM user_job_notifications n
-                          WHERE n.user_id = ${newUserId} AND n.canonical_id = j.canonical_id)
-    `;
+    // runtimes share no code. What made the queue safe for a new account is now
+    // the filter save, and npm run filter-first-check is what proves it.
+    console.log("\n§5 the digest queue, before and after the pin");
     check(
-      queue.candidates === 0,
-      `ZERO candidates — the first digest is not an archive dump. Without the suppression it ` +
-        `would have queued ${target.queueable} posting(s) from ${target.name} alone`,
-      `${queue.candidates} job(s) are in this account's queue`,
-    );
-    check(
-      target.queueable > 0,
-      `and that number is not zero for a boring reason: ${target.name} really does hold ` +
-        `${target.queueable} open, non-seeded rows that WOULD have been queued`,
-      `${target.name} has no queueable rows, so §5 proves nothing — pick another company`,
+      queueBefore === queueAfterPin,
+      `pinning changed nothing about the queue (${queueBefore} both sides) — it is ` +
+        `the filter that decides, and this account has not saved one`,
+      `${queueBefore} -> ${queueAfterPin}: pinning moved the queue, so something is ` +
+        `reading user_companies to decide an email again`,
     );
 
-    // --- §6 re-adding suppresses nothing ----------------------------------
+    // --- §6 re-adding writes nothing --------------------------------------
     //
-    // The sharp edge from db/watchlist.track_companies: running the suppression
-    // over a pair that already exists would swallow every job that arrived since
-    // — somebody's actual queue, silently.
-    console.log("\n§6 adding the same company again");
+    // ON CONFLICT DO NOTHING, and RETURNING is what makes the report honest. The
+    // sharp edge this used to guard — running the suppression over a pair that
+    // already existed would swallow every job that arrived since — is gone with
+    // the suppression, but the idempotence is still the table's UNIQUE doing real
+    // work and a second insert would be a real bug.
+    console.log("\n§6 pinning the same company again");
     const again = await lib.watchCompany(newUserId, target.id);
     check(again.inserted === false, "the second add inserts nothing — ON CONFLICT DO NOTHING");
-    check(
-      again.suppressed === 0,
-      "and suppresses NOTHING, so the jobs that arrive between two clicks are still queued",
-      `it suppressed ${again.suppressed} more`,
-    );
     const afterRepeat = await footprint(newUserId);
     check(
       afterRepeat.companies === 1 && afterRepeat.notifications === afterAdd.notifications,
@@ -329,23 +333,29 @@ async function main() {
     `;
     check(orphan.n === 0, "and no row for the refused company exists", `got ${orphan.n}`);
 
-    // --- §8 Home now shows the watch list and nothing else ----------------
+    // --- §8 Home shows the catalog, pinned or not -------------------------
+    //
+    // THE OTHER SECTION THAT INVERTED. It asserted that Home listed exactly the
+    // five pinned companies and NOT the shared catalog, which was right while the
+    // digest was computed from the watch list: a "for you" count over a company
+    // you did not watch counted jobs that could never arrive.
+    //
+    // A match at any company can reach any inbox now, so the honest list is the
+    // catalog — and the count beside it was always computed over the catalog
+    // anyway (lib/jobs.matchCountsByCompany has never been watch-list-scoped), so
+    // this is the page agreeing with its own figures. An account at the cap must
+    // see MORE than five companies, not exactly five.
     console.log("\n§8 what this account's Home shows");
-    const cards = await lib.listWatchedCompanyCards(newUserId);
-    const catalog = await lib.listCompanies();
+    const cards = await lib.listCompanyCards(newUserId);
     check(
-      cards.length === lib.FREE_WATCHLIST_CAP,
-      `Home lists ${cards.length} companies — the ones it watches`,
-      `got ${cards.length}`,
+      cards.length > lib.FREE_WATCHLIST_CAP,
+      `Home lists ${cards.length} companies — the whole catalog, not the ` +
+        `${lib.FREE_WATCHLIST_CAP} it pinned`,
+      `got ${cards.length}, which is the watch list rather than the catalog`,
     );
     check(
-      catalog.length > cards.length,
-      `and NOT the ${catalog.length}-company shared catalog, which is what it would have shown ` +
-        `before this slice`,
-    );
-    check(
-      cards.every((card) => atCap.companyIds.includes(card.id)),
-      "every company on Home is one this account actually watches",
+      atCap.companyIds.every((id) => cards.some((card) => card.id === id)),
+      "including every company it did pin — nothing was hidden by widening the list",
     );
 
     // --- §9 removing one -------------------------------------------------
@@ -361,8 +371,7 @@ async function main() {
     );
     check(
       afterRemove.notifications === beforeRemove.notifications,
-      "and the suppression rows STAY — otherwise removing and re-adding would re-deliver " +
-        "everything that company held in between",
+      "and it touches no notification row in either direction",
       `${beforeRemove.notifications} -> ${afterRemove.notifications}`,
     );
     check(
@@ -372,11 +381,17 @@ async function main() {
     // And the cap frees up again, which is what makes the limit usable rather
     // than a one-way ratchet.
     const readd = await lib.watchCompany(newUserId, target.id);
+    const afterReadd = await footprint(newUserId);
     check(
-      readd.inserted === true && readd.suppressed === 0,
-      "re-adding it is allowed again AND suppresses nothing new — every job it names is " +
-        "already recorded, which is why an untrack/re-track cycle cannot flood an inbox",
-      `inserted=${readd.inserted} suppressed=${readd.suppressed}`,
+      readd.inserted === true,
+      "re-pinning it is allowed again, so the cap is a limit rather than a one-way ratchet",
+      `inserted=${readd.inserted}`,
+    );
+    check(
+      afterReadd.notifications === beforeRemove.notifications,
+      "and the unpin/re-pin cycle wrote no notification row at any point — the thing " +
+        "that used to make this cycle dangerous is not there to be got wrong",
+      `${beforeRemove.notifications} -> ${afterReadd.notifications}`,
     );
   } finally {
     // By the id this script generated. preferences, user_companies,

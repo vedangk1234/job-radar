@@ -68,9 +68,7 @@ export function PreferencesEditor({
   initial,
   resume,
   redirectOnSave,
-  watchedCount,
   extraSections,
-  watchlistHref = "/watchlist",
   fineTuning = true,
   saveLabel = "Save preferences",
   doneCopy,
@@ -79,31 +77,14 @@ export function PreferencesEditor({
   resume: StoredResume | null;
   redirectOnSave?: string;
   /**
-   * HOW MANY COMPANIES THIS ACCOUNT WATCHES, since the picker slice — the fifth
-   * member of the family this button already gates on (city answer, keywords,
-   * experience range, work arrangement).
-   *
-   * It belongs here for the same reason those four do: PUT /api/preferences
-   * refuses a save that would leave the account matching nothing, and this is the
-   * screen saying why before somebody presses. An empty watch list matches
-   * nothing by construction rather than by rule — the digest queue's first clause
-   * is `EXISTS (user_companies …)` — so an onboarded account without one gets an
-   * empty digest and a blank Home with nothing on screen explaining it.
-   *
-   * A COUNT, NOT THE LIST, and optional. This editor has no business knowing what
-   * a watch list is; it needs to know whether there is one. Undefined means "the
-   * caller is not telling me", and the gate is then not applied — the route still
-   * refuses, so the rule holds either way and no caller can accidentally weaken
-   * it by omission.
-   */
-  watchedCount?: number;
-  /**
    * SECTIONS THIS EDITOR DOES NOT OWN, RENDERED IN ITS STACK JUST ABOVE THE SAVE
    * BAR. /onboarding passes the watch-list picker through here; /preferences
    * passes nothing and is one section shorter.
    *
-   * A SLOT RATHER THAN THE PICKER ITSELF, for the reason `watchedCount` is a count
-   * rather than a list: this editor has no business knowing what a watch list is.
+   * A SLOT RATHER THAN THE PICKER ITSELF: this editor has no business knowing what
+   * a watch list is. It took a `watchedCount` alongside this until the filter-first
+   * slice — a count rather than a list, for the same reason — and now takes
+   * nothing, because the watch list is no longer one of the answers it gates on.
    * It is a slot rather than the caller simply rendering the picker as a sibling
    * because of where the save bar has to be — a `position: sticky; bottom: 0`
    * element stays pinned only while its own containing block is on screen, so a
@@ -111,14 +92,6 @@ export function PreferencesEditor({
    * which is the one failure a sticky bar exists to prevent.
    */
   extraSections?: ReactNode;
-  /**
-   * Where "watch at least one company" points when it is the answer that is
-   * missing. /preferences leaves it at the default, because the fix is genuinely
-   * on another screen; /onboarding passes the anchor of the section it renders
-   * through `extraSections`, because sending somebody to /watchlist mid-setup is a
-   * round trip the gate would bounce straight back.
-   */
-  watchlistHref?: string;
   /**
    * WHETHER THE FINE-TUNING SECTION IS RENDERED — exclusions and max_level.
    *
@@ -296,11 +269,13 @@ export function PreferencesEditor({
   const noWorkModeAnswer = workModes.length === 0;
 
   /*
-   * And the fifth: an account watching no company matches nothing, whatever else
-   * is on this screen. `undefined` means the caller did not say, and an unstated
-   * count is not a claim that the list is empty — see the prop's own comment.
+   * THE FIFTH TERM STOOD HERE — `noCompaniesWatched` — and the filter-first slice
+   * removed it along with the refusal in PUT /api/preferences that it restated. An
+   * account watching no company used to match nothing whatever else was on this
+   * screen, because the digest queue asked the watch list first. It now matches the
+   * whole catalog, so there is no answer missing and nothing to grey the button
+   * for. The companies section stays on /onboarding; it is simply not a gate.
    */
-  const noCompaniesWatched = watchedCount !== undefined && watchedCount === 0;
 
   /*
    * The same rule PUT /api/preferences enforces, restated for the button. The
@@ -330,9 +305,10 @@ export function PreferencesEditor({
    * having to go and find it.
    *
    * DERIVED, NEVER DECIDED. Every entry restates one of the booleans above for a
-   * reader — `overCap`, `rangeInvalid`, `noCityAnswer`, `noWorkModeAnswer` and
-   * `noCompaniesWatched` are exactly the five terms of the Save button's own
-   * `disabled` expression, listed in the order its label chain reports them.
+   * reader — `overCap`, `rangeInvalid`, `noCityAnswer` and `noWorkModeAnswer` are
+   * exactly the four terms of the Save button's own `disabled` expression, listed
+   * in the order its label chain reports them. (There were five until the
+   * filter-first slice; see where `noCompaniesWatched` was derived.)
    * Nothing here can block a save the button would have allowed or allow one it
    * would have refused: the bar SAYS, the button DECIDES, and PUT
    * /api/preferences decides again, which is where the rules actually live.
@@ -370,9 +346,6 @@ export function PreferencesEditor({
   }
   if (noWorkModeAnswer) {
     blockers.push({ key: "modes", href: "#work-mode", text: "Pick a work arrangement" });
-  }
-  if (noCompaniesWatched) {
-    blockers.push({ key: "watch", href: watchlistHref, text: "Watch at least one company" });
   }
 
   /**
@@ -700,22 +673,6 @@ export function PreferencesEditor({
       ) : null}
 
       {/*
-        Said in words as well as on the button, because the fix is on ANOTHER
-        SCREEN when this editor is /preferences — there is no picker here to
-        point at, and a greyed button reading "pick a company to watch" with no
-        company control in sight is the kind of dead end this project's other
-        blank-answer messages exist to avoid. On /onboarding the picker is a
-        section of this same form, and `watchlistHref` points at it instead.
-      */}
-      {noCompaniesWatched ? (
-        <p className="msg bad">
-          You are not watching any company, so this filter would match nothing at all — the
-          digest asks for jobs at the companies you watch first, and there are none.{" "}
-          <Link href={watchlistHref}>Pick some on the Watchlist tab</Link>, then save.
-        </p>
-      ) : null}
-
-      {/*
         THE SAVE BAR, AND WHY IT IS STICKY.
 
         This form is six sections and several screens long, so a button at the
@@ -780,8 +737,7 @@ export function PreferencesEditor({
                 overCap ||
                 rangeInvalid ||
                 noCityAnswer ||
-                noWorkModeAnswer ||
-                noCompaniesWatched
+                noWorkModeAnswer
               }
             >
               {busy
@@ -796,11 +752,9 @@ export function PreferencesEditor({
                       ? "Pick a city to save"
                       : noWorkModeAnswer
                         ? "Pick a work arrangement to save"
-                        : noCompaniesWatched
-                          ? "Pick a company to watch to save"
-                      : dirty
-                        ? saveLabel
-                        : "No changes"}
+                        : dirty
+                          ? saveLabel
+                          : "No changes"}
             </button>
           </div>
         </div>

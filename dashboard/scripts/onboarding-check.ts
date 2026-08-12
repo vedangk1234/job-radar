@@ -383,7 +383,11 @@ async function main() {
      * would pass whether the editor forwarded the row's value or invented one.
      */
     console.log("\n§6a the onboarding save — six answers, and two fields nobody was shown");
-    const released = await savePreferences(newUserId, {
+    // DESTRUCTURED SINCE THE FILTER-FIRST SLICE: savePreferences returns the row
+    // AND the count of back-catalogue jobs that save just admitted, because the
+    // write is now two statements in one transaction rather than one. Only the row
+    // is asserted on here; filter-first-check.ts is what asserts the count.
+    const { preferences: released } = await savePreferences(newUserId, {
       cities: ["blr"],
       selected_cities: ["blr"],
       all_india: false,
@@ -425,7 +429,7 @@ async function main() {
     // Passing the install's defaults in here would still pass, and would read as
     // though the row arrived carrying them.
     console.log("\n§6 the first save — a person answering, from a blank row");
-    const saved = await savePreferences(newUserId, {
+    const { preferences: saved } = await savePreferences(newUserId, {
       // CITIES SLICE B: `cities` is the legacy column, still written so the
       // deployed digest keeps working, and `selected_cities` is the gate. The
       // route derives the first from the second; this calls the writer directly,
@@ -614,13 +618,38 @@ async function main() {
       `with show_no_experience_jobs ${before.show_no_experience_jobs}`,
     `now ${after.exp_range_low}..${after.exp_range_high} show=${after.show_no_experience_jobs}`,
   );
+  /*
+   * THIS PINNED THE LITERAL 0..2 AND THAT WAS A LATENT BUG, not a regression this
+   * slice caused. Slice 2 seeded the operator's row at `(0, 2)` with unknowns kept
+   * because that reproduces the pre-Slice-2 ceiling exactly, and the assertion
+   * recorded the fact by hardcoding the numbers. But the row is EDITABLE FROM THE
+   * DASHBOARD, which is the entire point of it being a row — and on 2026-08-11 a
+   * person edited it to 0..3 through the screen. The check then failed with "this
+   * account's digest has CHANGED", which was true, deliberate, and none of its
+   * business.
+   *
+   * A check that fails when somebody uses the product is a check people learn to
+   * ignore. What this section is actually for is that THIS SCRIPT changed nothing
+   * — every other assertion here is a before/after against the same run — so what
+   * is asserted now is that the range is CONFIGURED, which is the invariant Slice 2
+   * really established ("onboarded implies configured", enforced by
+   * savePreferences' non-null parameter types). The specific numbers are printed
+   * rather than pinned.
+   *
+   * The same trap bit scripts/match-parity.ts one file over, in the same week, for
+   * the same reason: a check that hardcodes a value a person can edit through the
+   * UI has a fuse on it.
+   */
+  console.log(
+    `  (this account's experience rule is ${before.exp_range_low}..${before.exp_range_high}, ` +
+      `unknowns ${before.show_no_experience_jobs ? "kept" : "dropped"})`,
+  );
   check(
-    before.exp_range_low === 0 &&
-      before.exp_range_high === 2 &&
-      before.show_no_experience_jobs === true,
-    "and that rule is the one that reproduces the pre-Slice-2 ceiling: 0-2, unknowns kept",
-    `got ${before.exp_range_low}..${before.exp_range_high} ` +
-      `show=${before.show_no_experience_jobs} — this account's digest has CHANGED`,
+    before.exp_range_low !== null &&
+      before.exp_range_high !== null &&
+      before.exp_range_low <= before.exp_range_high,
+    "and that rule is CONFIGURED — an onboarded account can never hold an unset range",
+    `got ${before.exp_range_low}..${before.exp_range_high}, which matches no job at all`,
   );
   check(
     String(after.updated_at) === String(before.updated_at),

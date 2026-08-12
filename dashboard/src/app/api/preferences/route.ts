@@ -10,7 +10,6 @@ import {
 } from "@/lib/labels";
 import { NON_INDIA_LABEL } from "@/lib/match";
 import { cleanList, KEYWORD_CAP, loadPreferences, savePreferences } from "@/lib/preferences";
-import { watchesAnything } from "@/lib/watchlist";
 
 /**
  * Tick-one-get-all, applied at the ROUTE and not only in the browser.
@@ -352,47 +351,32 @@ export async function PUT(request: Request) {
   }
 
   /*
-   * THE WATCH LIST — REQUIRED, AND IT IS THE FIFTH MEMBER OF THE FAMILY ABOVE
-   * RATHER THAN A NEW KIND OF RULE.
+   * THE WATCH LIST WAS A SIXTH REQUIRED ANSWER HERE AND THE FILTER-FIRST SLICE
+   * REMOVED IT.
    *
-   * Every other refusal in this route guards the same failure: a row that matches
-   * no job at all, producing a digest that goes quiet and reads as "nothing was
-   * posted". An empty watch list is that failure in its purest form, and it does
-   * not even need a matcher to produce it — notify/store.CANDIDATES_SQL asks
-   * `EXISTS (user_companies …)` FIRST, so an account watching nothing has an empty
-   * queue however good its keywords are.
+   * The refusal read `if (!(await watchesAnything(userId))) return badRequest(…)`
+   * and it belonged to the family above on a real argument: every other refusal in
+   * this route guards a row that matches NO JOB AT ALL, and an empty watch list was
+   * that failure in its purest form — notify/store.CANDIDATES_SQL asked
+   * `EXISTS (user_companies …)` FIRST, so an account watching nothing had an empty
+   * queue however good its keywords were.
    *
-   * IT IS ALSO WHAT THIS SLICE EXISTS TO FIX. Until the picker there was no writer
-   * for that table in the web app at all, so EVERY account that completed
-   * onboarding was in exactly this state — filter chosen, inbox permanently empty,
-   * and a Home screen showing the whole shared catalog as though those companies
-   * were theirs. Letting a save through without one would leave the hole open on
-   * the commit that built the control for closing it.
+   * The queue does not ask that any more. Company tracking is unlimited and free,
+   * so an account watching nothing matches the whole catalog, and the refusal
+   * guarded a failure that can no longer happen. What it would still do is require
+   * an answer that changes no outcome — and on a setup screen a required question
+   * whose answer decides nothing is worse than no question, because a person
+   * reasonably concludes it must matter.
    *
-   * WHY REFUSE RATHER THAN DEFAULT TO SOMETHING. The obvious alternative is to
-   * auto-watch the catalog (or its top N) for a new account, and it is the
-   * archive-dump failure with a friendly face: fifty companies' stored history
-   * suppressed on somebody's behalf, a digest whose contents nobody chose, and the
-   * "seeded defaults" mistake Slices 1b and 1c spent two commits removing from the
-   * preferences row. Fail-closed is the same answer the city selection gets, for
-   * the same reason.
-   *
-   * CHECKED LAST, after every field-level validation, so a body that is also
-   * malformed is told about the malformation first — this is the one refusal here
-   * that is about the STATE of the account rather than about the request, and
-   * reporting it before a typo'd city label would send somebody to the wrong
-   * screen.
+   * THE PICKER STAYS, AND THAT IS NOT A CONTRADICTION. /watchlist still writes
+   * user_companies, the per-plan cap is still enforced in lib/watchlist.watchCompany,
+   * and the companies section is still on /onboarding. It is an overlay a person
+   * may use, rather than a gate they must pass — which is what it will go on being
+   * until something reads it to decide an email again.
    */
-  if (!(await watchesAnything(gate.session.userId))) {
-    return badRequest(
-      "you are not watching any company, so this filter would match nothing at all. " +
-        "Pick at least one on the Watchlist tab and save again — your digest is built " +
-        "from the companies you watch first, and the filter narrows those.",
-    );
-  }
 
   try {
-    const preferences = await savePreferences(gate.session.userId, {
+    const { preferences, suppressed } = await savePreferences(gate.session.userId, {
       cities: [...legacyCities],
       selected_cities: selectedCities,
       all_india: allIndia,
@@ -408,6 +392,16 @@ export async function PUT(request: Request) {
     });
     return NextResponse.json({
       preferences,
+      /*
+       * REPORTED TO THE SCREEN AND NOT ONLY TO A LOG, which is the one piece of UI
+       * opinion in this route — and it is the same argument POST /api/watchlist
+       * used to make about the number it printed when a company was first watched.
+       * "Saved" says nothing about the several hundred stored postings that just
+       * became history; a person who was not told would reasonably expect them in
+       * the morning, and a digest that then carries two jobs looks broken rather
+       * than correct. See lib/preferences.suppressFilterBacklog.
+       */
+      suppressed,
       message:
         `Saved. ${keywords.length} keyword(s), ` +
         `${allIndia ? "all of India" : `${selectedCities.length} cit(y/ies)`}, ` +
@@ -416,6 +410,10 @@ export async function PUT(request: Request) {
         `${salaryBands.length ? `${salaryBands.length} pay band(s)` : "any pay"}, ` +
         `looking for ${expLow}-${expHigh} years` +
         `${showNoExperienceJobs ? ", including" : ", excluding"} jobs that state no minimum. ` +
+        (suppressed
+          ? `${suppressed} job(s) already on the board were marked as already seen, so your ` +
+            `digest carries only what arrives from now on — they are all still on Home. `
+          : "") +
         `The next digest uses this.`,
     });
   } catch (err) {

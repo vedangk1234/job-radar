@@ -1,5 +1,6 @@
 import { sql } from "./db";
 import { CITY_LABELS, type Preferences } from "./labels";
+import { isMatch, type Preferences as MatchPreferences } from "./match";
 
 /**
  * The current user's preferences row — the filter that decides what reaches an
@@ -174,32 +175,173 @@ export async function savePreferences(
     work_modes: string[];
     salary_bands: string[];
   },
-): Promise<Preferences> {
-  const [row] = await sql<Preferences[]>`
-    UPDATE preferences
-       SET cities                   = ${next.cities}::text[],
-           selected_cities          = ${next.selected_cities}::text[],
-           all_india                = ${next.all_india},
-           keywords                 = ${next.keywords}::text[],
-           exclusions               = ${next.exclusions}::text[],
-           max_level                = ${next.max_level},
-           exp_range_low            = ${next.exp_range_low},
-           exp_range_high           = ${next.exp_range_high},
-           years_of_experience_held = ${next.years_of_experience_held},
-           show_no_experience_jobs  = ${next.show_no_experience_jobs},
-           work_modes               = ${next.work_modes}::text[],
-           salary_bands             = ${next.salary_bands}::text[],
-           onboarding_completed     = TRUE,
-           updated_at               = now()
-     WHERE user_id = ${userId}
-    RETURNING cities, selected_cities, all_india,
-              keywords, exclusions, max_level,
-              exp_range_low, exp_range_high, years_of_experience_held,
-              show_no_experience_jobs, work_modes, salary_bands,
-              updated_at, onboarding_completed
+): Promise<SaveResult> {
+  return sql.begin(async (tx) => {
+    // The filter as it stands, read INSIDE the transaction and before the write.
+    // Outside it, a concurrent save could land between the read and the UPDATE and
+    // the delta would be computed against a filter that no longer existed.
+    const [before] = await tx<Preferences[]>`
+      SELECT cities, selected_cities, all_india,
+             keywords, exclusions, max_level,
+             exp_range_low, exp_range_high, years_of_experience_held,
+             show_no_experience_jobs, work_modes, salary_bands,
+             updated_at, onboarding_completed
+        FROM preferences
+       WHERE user_id = ${userId}
+    `;
+    if (!before) return explainMissingRow();
+
+    const [row] = await tx<Preferences[]>`
+      UPDATE preferences
+         SET cities                   = ${next.cities}::text[],
+             selected_cities          = ${next.selected_cities}::text[],
+             all_india                = ${next.all_india},
+             keywords                 = ${next.keywords}::text[],
+             exclusions               = ${next.exclusions}::text[],
+             max_level                = ${next.max_level},
+             exp_range_low            = ${next.exp_range_low},
+             exp_range_high           = ${next.exp_range_high},
+             years_of_experience_held = ${next.years_of_experience_held},
+             show_no_experience_jobs  = ${next.show_no_experience_jobs},
+             work_modes               = ${next.work_modes}::text[],
+             salary_bands             = ${next.salary_bands}::text[],
+             onboarding_completed     = TRUE,
+             updated_at               = now()
+       WHERE user_id = ${userId}
+      RETURNING cities, selected_cities, all_india,
+                keywords, exclusions, max_level,
+                exp_range_low, exp_range_high, years_of_experience_held,
+                show_no_experience_jobs, work_modes, salary_bands,
+                updated_at, onboarding_completed
+    `;
+    if (!row) return explainMissingRow();
+
+    const suppressed = await suppressFilterBacklog(tx, userId, before, row);
+    return { preferences: row, suppressed };
+  });
+}
+
+/** What a save did: the row it wrote, and the history that row admitted. */
+export type SaveResult = { preferences: Preferences; suppressed: number };
+
+/**
+ * Record what a NEW OR WIDENED filter has just admitted as already-notified.
+ *
+ * THE PORT OF notify/store.suppress_filter_backlog, and the obligation that used
+ * to belong to tracking a company. Read that function first — the argument is
+ * stated there in full and is not restated here, for the reason lib/watchlist.ts
+ * gives about its own port: a rule written out twice drifts twice.
+ *
+ * The short form. The digest queue used to open with `EXISTS (user_companies …)`,
+ * so watching a company admitted its whole stored history to somebody's queue and
+ * lib/watchlist.watchCompany suppressed it in the same transaction. There is no
+ * gate now, so a brand-new account matches the WHOLE CATALOG the instant it has a
+ * filter, and a widening one admits every stored row the new answer covers. Same
+ * archive-dump hazard, bigger blast radius, different trigger — so the suppression
+ * hangs off the filter changing, which is here.
+ *
+ *     OLD  = what the row as it stands matches
+ *     NEW  = what the row being saved matches
+ *     suppress (NEW \ OLD)
+ *
+ * Day one is not a case in that rule, it FALLS OUT of it: a brand-new row is blank
+ * on every field, and every blank in this app is fail-closed — no city answer
+ * matches nothing, an empty work_modes matches nothing, an unconfigured range
+ * matches nothing. So OLD is empty and the first save records the whole current
+ * match set. Narrowing suppresses nothing; an unrelated edit suppresses nothing,
+ * which is why this is a DELTA and not "everything matching right now" — the
+ * latter would silently eat whatever arrived since the last digest every time
+ * anybody touched the form.
+ *
+ * ═══ THREE THINGS THAT ARE DECISIONS RATHER THAN DETAILS ═══
+ *
+ * IT RUNS ON `tx`, NOT ON `sql`. A statement bound to the pool inside a
+ * `sql.begin` callback runs on a DIFFERENT connection and is therefore outside the
+ * transaction entirely — the one mistake in this shape that looks completely
+ * correct. tests/test_watchlist_write.py asserts the binding textually, as it did
+ * for watchCompany before it. Between the UPDATE and this there is a state in
+ * which the filter is widened and the suppression is not written, and the hourly
+ * digest runs in exactly that state if the process dies there.
+ *
+ * IT IS STATUS-BLIND, and that is the one clause that differs from the digest's
+ * own. A closed job that reopens comes back `status = 'open'` with `miss_count = 0`
+ * from crawler/store.UPSERT_SEEN while KEEPING its canonical_id — so suppressing
+ * only open rows leaves a hole exactly one flap wide: the job sits closed and
+ * unsuppressed while somebody saves, a vendor re-lists it a week later, and it
+ * arrives as news. `reappeared` is the set crawler/diff.py most deliberately
+ * refuses to treat as news. It DOES carry `seeded = FALSE`, because a seeded row
+ * is excluded from every queue forever anyway and recording one would cost a row
+ * per user per seeded job — 6,496 from a single sweep.
+ *
+ * THE REAL MATCHER DECIDES, NOT THE SQL PREFILTER. lib/jobs.ts's clauses are
+ * allowed to be WIDER than isMatch, so using their shape here would suppress rows
+ * that never matched — and those are exactly the rows enrichment can later turn
+ * into genuine matches by filling a NULL min_experience. Over-suppressing today is
+ * swallowing a real match tomorrow. So the candidate rows are judged by isMatch,
+ * twice, and only the difference is written.
+ */
+async function suppressFilterBacklog(
+  tx: typeof sql,
+  userId: string,
+  before: MatchPreferences,
+  after: MatchPreferences,
+): Promise<number> {
+  // notify/store.SUPPRESSION_CANDIDATES_SQL, ported: the queue's own two clauses,
+  // over jobs of any status. Only the columns isMatch reads, plus the key.
+  const candidates = await tx<
+    {
+      canonical_id: string;
+      title: string;
+      city: string | null;
+      work_mode: string | null;
+      min_experience: number | null;
+      is_pm_role: boolean;
+      desc_checked: boolean;
+      desc_fetch_failed: boolean;
+      salary_min: string | null;
+      salary_max: string | null;
+    }[]
+  >`
+    SELECT j.canonical_id, j.title, j.city, j.work_mode,
+           j.min_experience, j.is_pm_role, j.desc_checked,
+           j.desc_fetch_failed, j.salary_min, j.salary_max
+      FROM jobs j
+     WHERE j.seeded = FALSE
+       AND NOT EXISTS (
+             SELECT 1
+               FROM user_job_notifications n
+              WHERE n.user_id = ${userId}
+                AND n.canonical_id = j.canonical_id
+           )
   `;
-  if (!row) return explainMissingRow();
-  return row;
+
+  const admitted = candidates
+    .filter((job) => isMatch(job, after) && !isMatch(job, before))
+    .map((job) => job.canonical_id);
+  if (admitted.length === 0) return 0;
+
+  /*
+   * `unnest` RATHER THAN THE PYTHON'S CHUNKED MULTI-ROW VALUES, and the asymmetry
+   * is forced rather than chosen. db/notifications.record_notified_sql builds
+   * `VALUES ($1, $2), ($1, $3), …` in chunks of 400 because it has to stay inside
+   * the subset Postgres and SQLite agree on — the whole pytest suite runs those
+   * statements against the in-memory shim, which has no unnest. Nothing on this
+   * side runs against SQLite, and one array parameter binds no per-row placeholder
+   * at all, so the 65535-parameter ceiling and the chunking it forces both vanish.
+   *
+   * What the two DO share is every clause that decides anything: the table, the
+   * column pair, `ON CONFLICT (user_id, canonical_id) DO NOTHING` so a re-save is
+   * a genuine no-op, and `RETURNING canonical_id` so the count is rows actually
+   * written rather than rows offered. tests/test_watchlist_write.py compares those
+   * three rather than the whole statement, and says why.
+   */
+  const written = await tx<{ canonical_id: string }[]>`
+    INSERT INTO user_job_notifications (user_id, canonical_id)
+    SELECT ${userId}, unnest(${admitted}::text[])
+    ON CONFLICT (user_id, canonical_id) DO NOTHING
+    RETURNING canonical_id
+  `;
+  return written.length;
 }
 
 /**

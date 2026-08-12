@@ -403,9 +403,32 @@ company mid-run, and a gate that re-counted the catalog would fail a migration
 that did its job perfectly. A company that appears mid-run is named in the output
 and picked up by the next run.
 
-**Creating a pair has two halves, since 1e.** A tracking row does not only say
-"send me this company's jobs" — it also decides what counts as this person's
-history. The queue is "open, in a company you watch, not back catalogue, not yet
+**A pair is an overlay, not a subscription — since the filter-first slice.** The
+queue does not read this table at all any more, so a row here grants nothing and
+withholds nothing; it is a pin, and `/watchlist` is where pins are made. The
+5-company cap still holds, the picker is unchanged, and nothing about the catalog
+moved. What changed is that an account watching nothing now matches the whole
+catalog rather than nothing at all.
+
+**That took the second half of `track_companies` with it, and removing it was the
+safe direction rather than the tidy one.** While the gate existed, creating a pair
+admitted a company's entire stored history to somebody's queue in one instant, so
+the pair and a suppression of that history were written in one transaction. With
+no gate, suppressing on a pin *takes away* jobs the person's filter has already
+earned them: you save your filter at T0, job J appears at company X at T1 and
+enters your queue, you pin X at T2 — an act that grants you nothing new — and the
+suppression records every stored job of X, J included. J leaves your queue
+silently, behind a row saying the withholding was meant. That is the worst-shaped
+failure in this codebase, so the suppression moved to the filter rather than being
+kept as insurance. `db/notifications.SUPPRESS_COMPANY_HISTORY_SQL` was deleted
+with it, on the standing argument that a statement written by nobody and read by
+nobody is worse than absent; `db/watchlist.track_companies` records what would
+have to come back if the watch list ever became a filter dimension again.
+
+**The obligation itself is undiminished and now hangs off the filter.**
+`notify/store.suppress_filter_backlog` is where it lives, ported to
+`lib/preferences.savePreferences`, and it is the paragraph below with its trigger
+changed. A tracking row used to decide what counted as this person's history. The queue is "open, in a company you watch, not back catalogue, not yet
 sent to you", so the instant the row exists every job that company already has is
 in that person's queue, and their first digest is an archive dump. `jobs.seeded`
 does not cover this: it stops a company's **first-ever crawl** reaching anyone and
@@ -533,13 +556,11 @@ Nothing is emailed from the crawl loop. Brand-new jobs are simply left
 `seeded = FALSE`, which makes them *eligible* for a queue — but eligibility is
 not the queue, and since the fan-out it takes two more clauses to become one.
 
-**What the digest actually reads** (`notify/store.CANDIDATES_SQL`), three clauses
-answering three different questions:
+**What the digest actually reads** (`notify/store.CANDIDATES_SQL`), two clauses
+answering two different questions:
 
 ```sql
  WHERE j.status = 'open'
-   AND EXISTS     (user_companies uc WHERE uc.user_id = $1
-                                       AND uc.company_id = j.company_id)
    AND j.seeded = FALSE
    AND NOT EXISTS (user_job_notifications n WHERE n.user_id = $1
                                               AND n.canonical_id = j.canonical_id)
@@ -547,16 +568,28 @@ answering three different questions:
 
 | Clause | Asks | Whose fact |
 |---|---|---|
-| `EXISTS user_companies` | is this job's company one *you* asked about? | a person's — the watch list |
 | `j.seeded = FALSE` | is this job back catalogue? | a crawl's — user-blind and permanent |
 | `NOT EXISTS user_job_notifications` | have *you* been told about it? | a person's — since 1d |
 
-Per-user in the two places that decide, user-blind in the one that describes a
-crawl. The middle clause sits in exactly the position `j.notified = FALSE`
-occupied before it, and that is the whole reason the swap was safe: the old
-boolean was never one rule. It meant "not seeded **and** not emailed", and only
-the second half is about a person — which is why a job emailed to me silenced it
-for everybody else. The two halves were separated rather than swapped.
+The first sits in exactly the position `j.notified = FALSE` occupied before it,
+and that is the whole reason the swap was safe: the old boolean was never one
+rule. It meant "not seeded **and** not emailed", and only the second half is about
+a person — which is why a job emailed to me silenced it for everybody else. The
+two halves were separated rather than swapped.
+
+**There was a third clause and the filter-first slice removed it.** The queue
+opened with `EXISTS (user_companies …)` — "is this job's company one *you* asked
+about?" — and that was the gate: a person matched jobs at companies they watched
+and nowhere else. It was the right shape while a watch list was how somebody said
+what they wanted to hear about, and it stopped being the right shape the moment
+company tracking became unlimited and free. Every user effectively sees the whole
+catalog now, so what decides an inbox is a person's **filter**, and a gate in
+front of it could only subtract from an answer the filter had already given. An
+account watching nothing used to match nothing however good its keywords were; it
+matches the catalog now, which is what a filter is for.
+
+The gate was doing a second job, and that one did not go away — see
+*`user_companies`* below.
 
 `EXISTS` rather than a join to `user_companies` for a reason the `NOT EXISTS`
 already gives: the question is existence, Postgres reads both as a semi-join
@@ -1233,23 +1266,25 @@ Bangalore job in July may have one in August.
 Next.js App Router + TypeScript in `dashboard/`. Read-mostly.
 
 - **Home (`/`)** — per-company collapsible rows showing **matches only**, over
-  **the companies this account watches** (since the watch-list slice; it was the
-  whole shared catalog before), with a "for you" count per company and, once
+  **the whole catalog** (it was narrowed to the watch list for one slice in
+  between; the filter-first slice widened it back, because the digest is computed
+  from the catalog again), with a "for you" count per company and, once
   there is one, an "N applied" count beside it. Whether a job has been emailed is deliberately *not* part of this
   filter, in either its old global form or the per-user one: Home answers "what
   fits me right now", not "what has not been emailed yet" — a job sent in this
   morning's digest is still worth applying to this afternoon. It is shown as a
   badge instead. Every job row carries an **Applied** checkbox.
 - **Watchlist (`/watchlist`)** — the **company picker**: browse and search the
-  full shared catalog, add or remove companies from **your** `user_companies`
-  rows. The write path the app never had. Adding one records that company's
-  stored jobs as already-seen for you in the same transaction, and the screen
-  says how many. A free account may watch **5**; the limit is enforced in
-  `lib/watchlist.watchCompany`, inside that transaction, and the picker only
-  greys the buttons.
+  full shared catalog and pin companies to your account. Pinning narrows nothing
+  and admits nothing since the filter-first slice — your filter is matched against
+  every board we crawl either way — so it is an overlay for keeping the companies
+  you care about in view. It recorded that company's stored jobs as already-seen
+  until that slice; see *`user_companies`* for why that became unsafe. A free
+  account may pin **5**; the limit is enforced in `lib/watchlist.watchCompany`,
+  inside its transaction, and the picker only greys the buttons.
 - **Jobs (`/jobs`)** — literally the same component with one prop different
-  (`mode="all"`), showing every open posting unfiltered, over the same watched
-  companies Home lists. This is the screen that
+  (`mode="all"`), showing every open posting unfiltered, over the same companies
+  Home lists — whichever list that is. The two must never disagree. This is the screen that
   answers "did the crawler miss it, or did the filter drop it?". In this mode
   each job additionally shows its `status` and a SUGGESTED badge if it also
   passes the filter. There is no Applied checkbox here: this screen is the raw
@@ -1404,8 +1439,20 @@ One badge per job row, computed at render from data the row already carries:
 | Badge | Screen | Rule |
 |---|---|---|
 | `NEW` | Home | is a match **and** *I* have not been told — no `user_job_notifications` row for me and this job |
-| `NOTIFIED` | Home | is a match **and** *I* have been told — such a row exists |
+| *(none)* | Home | is a match **and** already handled — such a row exists |
 | `SUGGESTED` | Jobs | passes the same shared filter, on a list that does not apply it |
+
+**There was a `NOTIFIED` badge on that second line and the filter-first slice
+removed it, which is a change of honesty rather than of design.** It read
+"already emailed to you", and that was true while a row in
+`user_job_notifications` was overwhelmingly a receipt written by `record_sent`.
+Filter-first makes the *other* kind of row the common kind: a new account's first
+save records every back-catalogue job its filter matches, so day one would have
+been a wall of badges claiming emails that were never sent. It could not have been
+caught by looking, either — the operator's own rows are genuine receipts, so their
+screen would have looked exactly as it always had. `NEW` keeps its exact meaning
+and its exact derivation; the absence of a badge now means *handled*, and the row
+does not distinguish sent from suppressed because the queue does not either.
 
 A non-matching row on Jobs gets no badge, which is the point — that screen is
 several hundred postings including the sales roles, and SUGGESTED is what makes
@@ -1621,7 +1668,8 @@ the two languages; both are about a thing being *true against the real database*
 | `npm run db:check` | does the transaction pooler actually work? Several parameterised and concurrent queries in a row, not one `SELECT 1` — the prepared-statement failure is never the first query, it is the second or third |
 | `npm run config-roundtrip` | does a company added through the dashboard store `config` as a jsonb **object**? |
 | `npm run badge-check` | is the NEW / NOTIFIED badge genuinely **per-user**? |
-| `npm run watchlist-check` | does adding a company do **both halves** — the pair *and* the history suppression — and does the cap refuse the sixth without writing anything? |
+| `npm run watchlist-check` | does pinning a company write the pair and **nothing else**, and does the cap refuse the sixth without writing anything? |
+| `npm run filter-first-check` | does a new account's first save suppress the back catalogue — queue 0, **and the same jobs still on Home**? |
 
 `badge-check` is the Phase-1f/1g check and is shaped by what it cannot prove from
 one account. §1 asserts the drop actually happened — `jobs` has no `notified` and
@@ -3077,6 +3125,77 @@ Newest last. Append here as the project evolves.
   with their slugs, the disabled umbrellas, fine-tuning present on /preferences
   and absent from setup, a seeded account still savable, and the success screen
   absent before a save), `onboarding-check` +3 and green.
+
+- **2026-08-12 — Phase 3, the filter-first slice. The watch list stops being the
+  gate.** `notify/store.CANDIDATES_SQL` loses one clause — `EXISTS
+  (user_companies …)` — and the queue becomes two questions instead of three: is
+  this back catalogue, and have you been told. Company tracking is unlimited and
+  free, so every account effectively sees the whole catalog and what decides an
+  inbox is a person's FILTER. An account watching nothing used to match nothing
+  however good its keywords were.
+
+  **No schema change, no DDL, no migration to the tables themselves.**
+  `user_job_notifications` gains rows and nothing moves.
+
+  **The gate was doing a second job and that is the whole of the work.** Paired
+  with the suppression in `db/watchlist.track_companies`, it was what stopped a
+  first digest being an archive dump. With no gate there is no tracking moment to
+  hang that on, and a brand-new account matches the WHOLE CATALOG the instant it
+  has a filter. So the obligation moved to where the match set is now decided:
+  `notify/store.suppress_filter_backlog`, ported to
+  `lib/preferences.savePreferences`, computing `NEW \ OLD` on the same
+  transaction as the `UPDATE`.
+
+  **Day one falls out of the delta rule rather than being a case in it.** A
+  brand-new row is blank on every field and every blank here is fail-closed, so
+  OLD is empty and the first save records the whole current match set. Widening
+  mid-life gets the same treatment — it is the "entering" direction
+  `relabel_cities.report_blast_radius` refuses to apply on, reached from the other
+  side. Narrowing suppresses nothing, and neither does an unrelated edit, which is
+  why it is a delta and not "everything matching now": the latter would eat
+  whatever arrived since the last digest every time anybody touched the form.
+
+  **The suppression read is STATUS-BLIND and the queue is not**, which is the one
+  clause where the two differ. A closed job that reopens comes back
+  `status = 'open'` from `UPSERT_SEEN` keeping its `canonical_id`, so an open-only
+  suppression leaves a hole exactly one flap wide. It still carries
+  `seeded = FALSE`: a seeded row is excluded from every queue forever anyway, and
+  recording one would cost a row per user per seeded job.
+
+  **The track-time suppression was DELETED rather than kept as insurance**, and
+  that is the decision worth keeping. Suppressing on a pin now removes jobs a
+  person's filter already earned them — see *`user_companies`* — which is the
+  worst-shaped failure in this codebase.
+  `db/notifications.SUPPRESS_COMPANY_HISTORY_SQL` went with it on the standing
+  argument that a statement nobody calls is worse than absent, exactly as 1e
+  deleted `TRACK_ALL_COMPANIES_SQL` and 1g dropped `jobs.notified`.
+
+  **Two things came off the onboarding form.** `PUT /api/preferences` no longer
+  refuses a save from an account watching nothing — that refusal guarded a failure
+  that can no longer happen, and a required question whose answer decides nothing
+  is worse than no question. And the **NOTIFIED badge** went, because day-one
+  suppression would have made it claim hundreds of emails nobody sent; see *Status
+  badges*.
+
+  **What the live pass found, which is the part worth reading.** Two things, and
+  neither was in the plan. The backfill first scoped itself with
+  `db/users.digest_users` (`is_active = TRUE`) — and the live database holds a
+  second account, onboarded, watching 5 of 50, `is_active = FALSE` because branch
+  3 creates signups that way. That version would have skipped it, looked clean,
+  and dumped its entire archive the day 2d flips the flag, weeks later and
+  untraceable to this slice. `ACCOUNTS_SQL` is deliberately broader and must stay
+  so: the suppression is a PRECONDITION that has to hold before an account can
+  ever be emailed, while `digest_users` asks who is emailed right now — the same
+  shape as `load_active_preferences` being broader than `load_preferences`.
+  And `match-parity`'s synthetic probes hardcoded the title "Backend Engineer"
+  while being judged against the operator's live row, so an ordinary keyword edit
+  through the dashboard on 08-11 made all six expected-MATCH probes fail in BOTH
+  languages at once. Pre-existing, fixed here: the title is derived from a keyword
+  the filter under test actually holds.
+
+  Deliberately **not** here: the crawler and `COMPANIES_SQL` (byte-for-byte), both
+  matchers, the enrichment union, `companies.tracked`, the picker, the 5-company
+  cap, `/watchlist`, the card UI, and the schema.
 
 **Pending**
 

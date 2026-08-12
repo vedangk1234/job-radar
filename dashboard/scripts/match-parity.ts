@@ -137,11 +137,12 @@ function synthetic(
   city: string,
   workMode: string | null,
   salary: [string | null, string | null] = [null, null],
+  title: string = PROBE_TITLE,
 ): Row {
   return {
     canonical_id: id,
     company: "(synthetic)",
-    title: "Backend Engineer",
+    title,
     city,
     work_mode: workMode,
     salary_min: salary[0],
@@ -152,6 +153,43 @@ function synthetic(
     desc_fetch_failed: false,
     user_notified: false,
   };
+}
+
+/**
+ * A title that passes the TITLE STAGE of whatever filter a probe is judged under.
+ *
+ * IT USED TO BE THE LITERAL "Backend Engineer" AND THAT WAS A LATENT BUG, found
+ * by the filter-first slice's live run rather than caused by it. Every probe is
+ * judged against a variant of the OPERATOR'S OWN preferences row, so the title has
+ * to match a keyword that row actually holds — and that row is editable from the
+ * dashboard. On 2026-08-11 it was edited from 43 keywords to 25, `backend` was not
+ * among the survivors, and all six expected-MATCH probes began failing in BOTH
+ * languages at once. Both agreeing is what says it is a fixture bug rather than
+ * parity drift, and it is the shape of failure this file exists to make loud: a
+ * probe that cannot fire is a green light bolted over an untested rule.
+ *
+ * So the title is DERIVED from the filter under test. The first keyword that no
+ * exclusion swallows is the whole rule — the probes exist to exercise the CITY,
+ * WORK-MODE and SALARY branches, and the title stage is scaffolding that must
+ * never be the thing that fails.
+ *
+ * Set once from the live row, before the probes are built. If it is ever empty the
+ * run refuses rather than quietly testing nothing.
+ */
+let PROBE_TITLE = "";
+
+function probeTitle(prefs: Preferences): string {
+  const usable = prefs.keywords.find(
+    (kw) => !prefs.exclusions.some((ex) => kw.includes(ex)),
+  );
+  if (!usable) {
+    throw new Error(
+      "no keyword on the live preferences row survives its own exclusions, so no " +
+        "synthetic probe can pass the title stage. The probes would all fail for a " +
+        "reason that has nothing to do with the rules they test.",
+    );
+  }
+  return usable;
 }
 
 async function main() {
@@ -236,6 +274,11 @@ async function main() {
    * experience fields, so any disagreement is attributable to the rule under test
    * rather than to a city or a keyword.
    */
+  // Derived from the live row before any probe is built — see probeTitle. Every
+  // VARIANT below is a spread of prefsRow that changes ONE field at a time, and
+  // none of them touches `keywords`, so one title is correct for all of them.
+  PROBE_TITLE = probeTitle(prefsRow);
+
   const VARIANTS: { label: string; note: string; prefs: Preferences }[] = [
     {
       label: "live row",

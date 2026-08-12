@@ -1,5 +1,5 @@
 /**
- * Prove the NEW / NOTIFIED badge is per-user, against the live database.
+ * Prove the NEW badge is per-user, against the live database.
  *
  *     npm run badge-check
  *
@@ -201,20 +201,52 @@ async function main() {
       `${rows.filter((r) => r.user_notified).length}  ·  matches ${matched.length}`,
   );
 
-  // The badge, from the shipped function, over the rows Home actually shows. Not
-  // a comparison any more — there is nothing left to compare it against — but
-  // still the number a person recognises, and the one that would move first if
-  // the per-user predicate broke.
-  const badges = { NEW: 0, NOTIFIED: 0 };
+  // The badge, from the shipped function, over the rows Home actually shows.
+  //
+  // THE ARITHMETIC CHANGED WITH THE FILTER-FIRST SLICE. This used to assert that
+  // every match got exactly one of NEW or NOTIFIED, and that is now false by
+  // construction: NOTIFIED is gone, so a match that has already been handled gets
+  // NO badge. The reason is in lib/badges.ts — a user_job_notifications row means
+  // "handled", which since the filter-first slice is far more often a filter save
+  // recording the back catalogue than an email that was sent, so "already emailed
+  // to you" was a claim the row could not support.
+  //
+  // What replaces the arithmetic is a PARTITION, which is a stronger statement
+  // than the count it replaces: every match is badged NEW or badged nothing, the
+  // NEW ones are exactly the un-notified ones, and nothing anywhere still produces
+  // the string NOTIFIED.
+  let newBadges = 0;
+  let unbadged = 0;
   for (const row of matched) {
     const label = homeBadge({ matches: true, user_notified: row.user_notified })?.label;
-    if (label) badges[label as "NEW" | "NOTIFIED"] += 1;
+    check(
+      label === "NEW" || label === undefined,
+      `a match renders NEW or nothing, never ${String(label)}`,
+    );
+    if (label === "NEW") newBadges += 1;
+    else unbadged += 1;
   }
-  console.log(`  Home renders: ${badges.NOTIFIED} NOTIFIED / ${badges.NEW} NEW`);
+  console.log(`  Home renders: ${newBadges} NEW / ${unbadged} unbadged`);
   check(
-    badges.NOTIFIED + badges.NEW === matched.length,
-    "every match on Home gets exactly one of NEW or NOTIFIED",
-    `${matched.length} matches produced ${badges.NOTIFIED + badges.NEW} badges`,
+    newBadges + unbadged === matched.length,
+    "every match on Home is accounted for — badged NEW, or deliberately bare",
+    `${matched.length} matches produced ${newBadges + unbadged} verdicts`,
+  );
+  check(
+    newBadges === matched.filter((r) => !r.user_notified).length,
+    "and NEW is exactly the set with no user_job_notifications row — the predicate " +
+      "NEW is derived from did not move when NOTIFIED was removed",
+    `${newBadges} NEW against ${matched.filter((r) => !r.user_notified).length} un-notified`,
+  );
+  // "AND NOTIFIED RENDERS NOWHERE" IS NOT ASSERTED HERE, because it cannot be:
+  // HomeBadge no longer admits the string, so a comparison against it does not
+  // typecheck. That is the stronger guarantee — the badge cannot come back without
+  // someone widening the type, which is a deliberate edit rather than a slip — and
+  // a runtime check that can never fail is one people learn to ignore. The
+  // absence is pinned in the type, in lib/badges.HomeBadge.
+  check(
+    homeBadge({ matches: false, user_notified: false }) === null,
+    "a non-match still gets no badge at all, which NEW's own definition depends on",
   );
 
   // -------------------------------------------------------------------------
@@ -291,18 +323,37 @@ async function main() {
   const flag = (rowsSeen: Seen[], id: string) => rowsSeen.find((r) => r.canonical_id === id)?.user_notified;
   const badge = (v: boolean | undefined) => homeBadge({ matches: true, user_notified: v })?.label;
 
-  check(badge(flag(asMe, mine.canonical_id)) === "NOTIFIED", "a job I was emailed reads NOTIFIED for me");
+  // THE PROPERTY IS UNCHANGED AND THE SPELLING OF IT IS NOT. This asserted the
+  // per-user half in both directions through the NOTIFIED label — "reads NOTIFIED
+  // for me, NEW for them". With NOTIFIED removed, the same four claims are made
+  // against the ABSENCE of a badge, which is what "handled" looks like now.
+  //
+  // Both halves still matter, and the second is the one with no visible symptom:
+  // a job the OTHER account was emailed must not lose my NEW badge, or the screen
+  // would be reporting somebody else's inbox as mine. That is the flattening 1d
+  // removed from the queue and 1f removed from the badge, and it is exactly as
+  // possible to reintroduce today as it was then.
+  check(
+    badge(flag(asMe, mine.canonical_id)) === undefined,
+    "a job I was emailed carries NO badge for me — it is handled",
+  );
   check(
     badge(flag(asThem, mine.canonical_id)) === "NEW",
     "and NEW for the second account, who was never told about it",
   );
   check(
-    badge(flag(asThem, theirs.canonical_id)) === "NOTIFIED",
-    "a job the second account was emailed reads NOTIFIED for them",
+    badge(flag(asThem, theirs.canonical_id)) === undefined,
+    "a job the second account was emailed carries no badge for them",
   );
   check(
     badge(flag(asMe, theirs.canonical_id)) === "NEW",
     "and NEW for me — their digest does not silence my badge",
+  );
+  // The per-user READ is what all four rest on, asserted directly so a failure
+  // above can be told apart from a badge bug.
+  check(
+    flag(asMe, mine.canonical_id) === true && flag(asThem, mine.canonical_id) === false,
+    "because notifiedToUser answers differently for the two accounts on one job",
   );
 
   // The rollback, verified rather than assumed.

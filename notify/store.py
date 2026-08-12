@@ -1,12 +1,15 @@
 """Everything the digest touches in the database, and nothing that decides anything.
 
-Six operations, and the split between them is the whole safety story:
+Eight operations, and the split between them is the whole safety story:
 
     load_preferences           read ONE person's filter
     load_active_preferences    read EVERY active person's filter — the union the
                                                 crawl's enrichment pass works from
-    fetch_candidates           read the queue  (open, watched by THEM, not back
-                                                catalogue, not yet sent to THEM)
+    fetch_candidates           read the queue  (open, not back catalogue, not yet
+                                                sent to THEM)
+    fetch_suppression_candidates  the same two clauses over ANY status — what
+                                                could still be owed to somebody
+    suppress_filter_backlog    write the history a new or widened filter admits
     fetch_enrichment_targets   read the jobs whose description is unread
     save_description_facts     write what reading a description taught us
     record_sent                write the receipt, ONLY after Resend returned an id
@@ -23,13 +26,25 @@ dashboard shows every open job that fits, emailed or not, so every open job that
 fits has to have had its description read. That difference is the whole bug fix;
 the digest's own queue is still fetch_candidates.
 
-THE QUEUE IS ONE PERSON'S, SINCE PHASE 1e
-------------------------------------------
-fetch_candidates answers "what is open, in a company THIS user watches, not back
-catalogue, and not already sent to THEM" — three clauses, three different
-questions, spelled out above CANDIDATES_SQL. Every read in this module that
-decides anything now takes a user_id, and the fan-out in notify/digest.py calls
-them once per user.
+THE QUEUE IS ONE PERSON'S, SINCE PHASE 1e — AND FILTER-FIRST SINCE PHASE 3
+---------------------------------------------------------------------------
+fetch_candidates answers "what is open, not back catalogue, and not already sent
+to THEM" — two clauses, two different questions, spelled out above
+CANDIDATES_SQL. Every read in this module that decides anything takes a user_id,
+and the fan-out in notify/digest.py calls them once per user.
+
+It asked a third question until the filter-first slice: "is this job's company
+one THIS user watches". Company tracking is unlimited and free now, so every user
+effectively sees the whole catalog and the thing that decides what reaches an
+inbox is a person's FILTER rather than their watch list. `user_companies` still
+exists and /watchlist still writes it; it is an overlay, and nothing in this
+module reads it.
+
+Removing that clause moved an obligation rather than deleting one. The gate was
+also what stopped a first digest being an archive dump, paired with the
+suppression db/watchlist.track_companies used to run when a pair was created —
+so suppress_filter_backlog is where that now lives, triggered by the filter
+changing instead of by a company being tracked.
 
 The global jobs.notified boolean is gone, as of Phase 1g. It was doing two jobs
 at once: "this is back catalogue" (a fact about a crawl) and "somebody was
@@ -63,7 +78,7 @@ from typing import Any, Iterable, Mapping
 
 from db.notifications import record_notified
 
-from .match import Preferences
+from .match import Preferences, is_match
 
 # No CHUNK constant here any more. This module held one until Phase 1g, for the
 # IN-list in record_sent's boolean flip; the two statements that remain bind
@@ -202,23 +217,86 @@ SELECT j.canonical_id, j.title, j.location, j.city, j.url,
        c.name AS company, c.ats, c.token, c.config
   FROM jobs j
   JOIN companies c ON c.id = j.company_id
- WHERE j.status = 'open'{queue_filter}
+ WHERE {status_filter}{queue_filter}
  ORDER BY c.name, j.title
 """
 
-# THE QUEUE — ONE USER'S, AND THREE CLAUSES THAT ANSWER THREE DIFFERENT
-# QUESTIONS. This is the Phase-1e fan-out, and the shape of it is the point:
+# THE STATUS CLAUSE IS A PARAMETER BECAUSE ONE READER NEEDS IT OFF, and exactly
+# one: the filter-backlog suppression below. Everything that decides an EMAIL is
+# open-only — a closed posting is not something to apply to, and enriching or
+# sending one would be spending attention on a job nobody can take.
 #
-#   EXISTS user_companies    "is this job's company one you asked about?"
-#                            WHOSE — the watch list, per person. Before 1e the
-#                            digest considered the whole catalog, which was
-#                            correct only because one person tracked all of it.
+# The suppression is the opposite case and the reason is crawler/store.UPSERT_SEEN:
+# a closed job that reappears comes back `status = 'open'` with `miss_count = 0`
+# while KEEPING its canonical_id. So a suppression scoped to open rows leaves a
+# hole exactly one flap wide — the job sits closed and unsuppressed while somebody
+# saves their filter, the vendor re-lists it a week later, and it arrives in that
+# person's digest as news because a board was edited. `reappeared` is precisely the
+# set crawler/diff.py refuses to treat as news, and this is that refusal carried
+# into the notify half.
+#
+# Spelled as two named constants rather than as an `if`, so both spellings are
+# visible in one place and neither reader can drift onto the other's.
+_OPEN_ONLY = "j.status = 'open'"
+_ANY_STATUS = "TRUE"
+
+# THE QUEUE FILTER — TWO CLAUSES SINCE THE FILTER-FIRST SLICE, and it is shared
+# verbatim between the queue and the suppression so the two can never disagree
+# about what "already handled" means.
+#
 #   j.seeded = FALSE         "is this job back catalogue?"
 #                            WHAT KIND — a property of the crawl, user-blind and
-#                            permanent. This clause is the silent seed, and it
-#                            sits exactly where `j.notified = FALSE` sat in 1d.
+#                            permanent. This clause is the silent seed.
 #   NOT EXISTS user_job_...  "have YOU been told about it?"
 #                            WHO ALREADY KNOWS — per person, since 1d.
+#
+# WHY THE SUPPRESSION READ CARRIES `j.seeded = FALSE` TOO, which is not obvious.
+# A seeded row is excluded from every queue forever by this very clause, so
+# recording one as already-notified buys nothing and costs a row per user per
+# seeded job — 6,496 of them from a single afternoon's discovery sweep, times
+# everyone who ever signs up. That is the arithmetic db/notifications.py refuses
+# in its own words ("the silent seed is deliberately not handled here"), and it is
+# refused here for the same reason: the crawl's fact stays on the crawl's column.
+_QUEUE_FILTER = """
+   AND j.seeded = FALSE
+   AND NOT EXISTS (
+         SELECT 1
+           FROM user_job_notifications n
+          WHERE n.user_id = $1
+            AND n.canonical_id = j.canonical_id
+       )"""
+
+# THE QUEUE — ONE USER'S, AND TWO CLAUSES THAT ANSWER TWO DIFFERENT QUESTIONS.
+#
+# IT WAS THREE UNTIL THE FILTER-FIRST SLICE, and the one that went is the reason
+# this comment is long. The queue opened with
+#
+#     EXISTS (user_companies uc WHERE uc.user_id = $1
+#                                 AND uc.company_id = j.company_id)
+#
+# — "is this job's company one you asked about?" — and that clause was the GATE:
+# a person matched jobs at companies they watched, and nowhere else. It was the
+# right shape while a watch list was how somebody said what they wanted to hear
+# about, and it stopped being the right shape the moment company tracking became
+# unlimited and free. Every user effectively sees the whole catalog now, so the
+# thing that decides what reaches an inbox is a person's FILTER, and a gate in
+# front of it could only ever subtract from an answer the filter had already
+# given. An account watching nothing used to match nothing however good its
+# keywords were; it matches the catalog now, which is what a filter is for.
+#
+# The watch list is NOT gone and this is not a deprecation. `user_companies`
+# still exists, /watchlist still writes it, the per-plan cap still holds — it is
+# simply an overlay rather than a gate, and nothing reads it to decide an email.
+# See db/watchlist.py, which keeps the note about what would have to come back
+# if it ever became a filter dimension again.
+#
+# WHAT REPLACED THE GATE'S OTHER JOB. The clause was doing something besides
+# narrowing: paired with the suppression in db/watchlist.track_companies, it was
+# what stopped a person's FIRST digest being an archive dump. Creating a tracking
+# row recorded that company's stored jobs as already-notified, so history could
+# not walk in behind the subscription. With no gate there is no tracking moment to
+# hang that on, so the obligation moved to where the match set is now decided —
+# see suppress_filter_backlog below. The hazard did not go away; its trigger did.
 #
 # WHY THE BOOLEAN CLAUSE IS GONE, AND WHAT REPLACED IT. `j.notified = FALSE` was
 # never one rule. It meant "not seeded AND not emailed", and the second half of
@@ -230,35 +308,17 @@ SELECT j.canonical_id, j.title, j.location, j.city, j.url,
 # mark_new writes from the same `seeding` flag it always used. The crawl path
 # still knows nothing about users, and still may not.
 #
-# EXISTS rather than a JOIN to user_companies, for the reason the NOT EXISTS
-# below already gives: the question is existence, Postgres reads both as a
-# semi-join anyway, and a JOIN invites the reader to wonder whether the row can
-# come back twice. It cannot — UNIQUE (user_id, company_id) — but EXISTS says so
-# without being asked, and keeps the SELECT list free of a table it never reads.
-#
-# $1 appears three times. asyncpg repeats a bound parameter natively and the test
-# shim's _translate maps placeholders in order of appearance precisely so that
-# works, so the statement the tests run is this one character for character.
+# $1 appears twice, where it used to appear three times. asyncpg repeats a bound
+# parameter natively and the test shim's _translate maps placeholders in order of
+# appearance precisely so that works, so the statement the tests run is this one
+# character for character.
 #
 # WHAT THIS DELIBERATELY DOES NOT ASK: companies.tracked. That is the crawl's
-# exclusion axis — a property of the catalog — and a person's watch list is a
-# property of a person. Conflating them would mean a dashboard toggle silently
-# emptying somebody else's digest. See db/watchlist.py.
+# exclusion axis — a property of the catalog, one shared value for the whole
+# install — and it was never a per-person question. It was not a candidate for
+# this clause's job before the filter-first slice and it is not one now.
 CANDIDATES_SQL = _CANDIDATES_TEMPLATE.format(
-    queue_filter="""
-   AND EXISTS (
-         SELECT 1
-           FROM user_companies uc
-          WHERE uc.user_id = $1
-            AND uc.company_id = j.company_id
-       )
-   AND j.seeded = FALSE
-   AND NOT EXISTS (
-         SELECT 1
-           FROM user_job_notifications n
-          WHERE n.user_id = $1
-            AND n.canonical_id = j.canonical_id
-       )"""
+    status_filter=_OPEN_ONLY, queue_filter=_QUEUE_FILTER
 )
 
 # The same query minus the queue filter. Used only by scripts/preview_digest.py
@@ -266,19 +326,35 @@ CANDIDATES_SQL = _CANDIDATES_TEMPLATE.format(
 # picked out of everything currently open", against a table whose rows are almost
 # all already notified.
 #
-# Deliberately NOT narrowed to the watch list by 1e, even though every other read
-# in this module now is. This statement is the matcher's own preview and its total
-# is what `npm run match-parity` is compared against — that check walks every open
-# row in the live database, so scoping this to one person's tracked companies
-# would make the two numbers stop meaning the same thing, silently, and the drift
-# would look like a matcher bug.
+# It was ALREADY filter-first before the filter-first slice, which is the single
+# most useful fact about this statement: it never carried the watch-list gate, so
+# its total and `npm run match-parity`'s have always been comparable, and they are
+# the fixed points the slice was measured against. A number that did not move is
+# only evidence if it could have.
 #
 # Note that this one binds NO parameter, which is why fetch_candidates branches
 # on how it calls conn.fetch rather than passing user_id either way: asyncpg
 # rejects an argument the statement has no placeholder for. Widening the read to
 # "every open job" genuinely has no user in it — that is what makes it a preview
 # of the matcher rather than a preview of someone's digest.
-CANDIDATES_IGNORING_NOTIFIED_SQL = _CANDIDATES_TEMPLATE.format(queue_filter="")
+CANDIDATES_IGNORING_NOTIFIED_SQL = _CANDIDATES_TEMPLATE.format(
+    status_filter=_OPEN_ONLY, queue_filter=""
+)
+
+# THE SUPPRESSION READ — the queue's own two clauses, over jobs of ANY status.
+#
+# One statement away from CANDIDATES_SQL and the difference is the whole point.
+# It shares _QUEUE_FILTER verbatim, so "already back catalogue" and "already told"
+# mean exactly what they mean to the queue; it drops the open-only clause, so a
+# closed job that matches is recorded as history now rather than arriving as news
+# the week a vendor re-lists it. See _ANY_STATUS above for that argument in full.
+#
+# Read by suppress_filter_backlog and by scripts/suppress_filter_backlog.py, and
+# by nothing that sends. It is a read of what WOULD be owed to somebody, which is
+# why it is shaped like the queue rather than like the preview.
+SUPPRESSION_CANDIDATES_SQL = _CANDIDATES_TEMPLATE.format(
+    status_filter=_ANY_STATUS, queue_filter=_QUEUE_FILTER
+)
 
 # Every open job whose description we have not successfully read — the crawl's
 # enrichment queue, before the title filter narrows it in Python.
@@ -447,14 +523,19 @@ async def fetch_candidates(
 ) -> list[Mapping[str, Any]]:
     """Rows eligible to be considered — before any filtering.
 
-    Eligible means open, in a company THIS USER tracks, not stored by a silent
-    seed, and not yet notified TO THIS USER. Whether a job is *interesting* is
-    decided afterwards, by notify/match.py, over the rows this returns.
+    Eligible means open, not stored by a silent seed, and not yet notified TO
+    THIS USER. Whether a job is *interesting* is decided afterwards, by
+    notify/match.py, over the rows this returns — and since the filter-first
+    slice that is the ONLY thing which narrows a person's digest to a person.
 
-    Note which of those four is not about the user: `seeded` is a property of the
+    Note which of those three is not about the user: `seeded` is a property of the
     crawl that stored the row, so it excludes the same rows for everybody. That
     is what "the silent seed is silent for all of us" means, and it is the clause
     that replaced the old global notified = FALSE.
+
+    It used to mean "in a company THIS USER tracks" as well. It does not, and an
+    account watching nothing now reads the whole catalog here rather than an empty
+    list — see CANDIDATES_SQL for why that is the point rather than a regression.
 
     `user_id` is required rather than defaulted, and that is deliberate: a
     default would be a guess about whose queue this is, and the failure mode of
@@ -472,6 +553,96 @@ async def fetch_candidates(
     else:
         rows = await conn.fetch(CANDIDATES_SQL, user_id)
     return [dict(row) for row in rows]
+
+
+async def fetch_suppression_candidates(conn, user_id: Any) -> list[Mapping[str, Any]]:
+    """Every job that could still be owed to this user — open or closed.
+
+    The queue's own two clauses over jobs of any status. Read only by the
+    suppression below and by scripts/suppress_filter_backlog.py; nothing that
+    sends an email calls it. See SUPPRESSION_CANDIDATES_SQL.
+    """
+    rows = await conn.fetch(SUPPRESSION_CANDIDATES_SQL, user_id)
+    return [dict(row) for row in rows]
+
+
+async def suppress_filter_backlog(
+    conn, user_id: Any, before: Preferences | None, after: Preferences
+) -> list[str]:
+    """Record what a NEW OR WIDENED filter has just admitted as already-notified.
+
+    THE OBLIGATION THAT USED TO BELONG TO TRACKING A COMPANY, MOVED TO WHERE THE
+    MATCH SET IS NOW DECIDED. Until the filter-first slice the queue opened with
+    `EXISTS (user_companies …)`, so the moment a person started watching a company
+    every stored job of that company was in their queue — and
+    db/watchlist.track_companies wrote the pair and suppressed that company's
+    history in one transaction, which is what stopped a first digest being an
+    archive dump. There is no gate now and therefore no tracking moment, and a
+    brand-new account matches the WHOLE CATALOG the instant it has a filter. Same
+    hazard, bigger blast radius, different trigger.
+
+    So the trigger is the filter itself:
+
+        OLD  = what the row as it stands matches
+        NEW  = what the row being saved matches
+        suppress (NEW \\ OLD)
+
+    DAY ONE FALLS OUT OF THAT RULE RATHER THAN BEING A CASE IN IT, which is the
+    reason it is written as a delta. A brand-new account's row is blank on every
+    field, and every blank in this project is fail-closed — no selected_cities and
+    no all_india matches nothing, an empty work_modes matches nothing, an
+    unconfigured experience range matches nothing. So OLD is empty, NEW \\ OLD is
+    NEW, and the first save records the entire current match set. Pass
+    `before=None` to say so explicitly (a genuinely absent row, as opposed to a
+    row that matches nothing, which is the same answer arrived at honestly).
+
+    WIDENING MID-LIFE IS THE SAME HAZARD AND GETS THE SAME ANSWER. Ticking a
+    twenty-fourth city, or turning on all-India, admits hundreds of stored rows
+    that have no user_job_notifications row — because rows are written when
+    something is SENT, and nothing was ever sent for a job that did not match. So
+    nothing suppresses them and they go out in the next digest as news, because a
+    person edited a form. That is exactly the "entering" direction
+    scripts/relabel_cities.report_blast_radius refuses to apply on, one table over
+    and reached from the other side: there a LABELLER moved a job into a filter,
+    here the FILTER moved onto a job.
+
+    NARROWING SUPPRESSES NOTHING, and neither does an unrelated edit. The delta is
+    empty, so a job already legitimately in somebody's queue stays there — which is
+    why this is a delta and not "suppress everything currently matching on every
+    save". The latter would silently eat whatever arrived since the last digest
+    every single time anybody touched the form.
+
+    THE REAL MATCHER DECIDES, NOT A PREFILTER. is_match is run over both filters
+    rather than pushing an approximation into SQL, and the difference is not
+    academic: the SQL prefilter in dashboard/src/lib/jobs.ts is allowed to be WIDER
+    than the matcher, so using its shape here would suppress rows that never
+    matched — and those are precisely the rows enrichment can later turn into
+    genuine matches, by filling a NULL min_experience the filter then admits. Over-
+    suppressing today is swallowing a real match tomorrow.
+
+    Returns the canonical_ids genuinely recorded. NOT wrapped in a transaction
+    here: the caller holds one spanning this and the preferences UPDATE itself,
+    for the reason db/watchlist.track_companies held one — between the two there
+    is a state in which the filter is widened and the suppression is not written,
+    and the hourly digest runs in exactly that state if the process dies there.
+    """
+    rows = await fetch_suppression_candidates(conn, user_id)
+
+    admitted = {
+        row["canonical_id"] for row in rows if is_match(row, after)
+    }
+    if before is not None:
+        admitted -= {row["canonical_id"] for row in rows if is_match(row, before)}
+    if not admitted:
+        return []
+
+    # Ordered so a run is reproducible and two invocations over the same state
+    # produce the same report. Nothing depends on the order — record_notified is a
+    # set operation — but a migration whose output moves between invocations for
+    # no reason is harder to compare against the dry run somebody approved.
+    ids = sorted(admitted)
+    await record_notified(conn, user_id, ids)
+    return ids
 
 
 async def fetch_enrichment_targets(

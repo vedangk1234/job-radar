@@ -1,36 +1,38 @@
-"""The dashboard's watch-list write is the Python one, ported — not a second design.
+"""The dashboard's per-user writes: one table each, and the Python they port.
 
 WHAT THIS GUARDS
 ----------------
-`user_companies` had one writer for two phases: db/watchlist.track_companies,
-reached from scripts/track_companies.py. That function is a function rather than
-an INSERT for one reason, stated at length in its own docstring — creating a
-tracking row has TWO halves. The pair says "send me this company's jobs"; the
-suppression says "and not the ones it already has", because the digest queue is
-"open, in a company you watch, not back catalogue, not yet sent to you" and the
-instant the pair exists every stored job of that company is in that person's
-queue. jobs.seeded does not cover it: that stops a company's FIRST-EVER crawl
-reaching anyone and says nothing about the weeks of ordinary crawling after it.
+Two tables in this app are written per person, and until the filter-first slice
+BOTH were written from one module. `lib/watchlist.watchCompany` created the
+tracking pair AND recorded that company's stored jobs as already-notified, in one
+transaction, because the digest queue opened with `EXISTS (user_companies …)` —
+so the instant a pair existed, every job that company already held was in that
+person's queue and their first digest was an archive dump.
 
-The picker adds a SECOND writer, in TypeScript, in a runtime that cannot call the
-first one — Vercel has no Python and there is no API between the two (CLAUDE.md,
-"Two runtimes, one database"). So the statements exist twice, which is a promise
-to drift, and this file is the same arrangement tests/test_city_vocabulary.py has
-with the city labels and `npm run match-parity` has with the matcher: the
-duplication is a fact of the architecture, and a test is what stops it becoming a
-lie.
+The queue does not read `user_companies` any more. A pair admits nothing, so
+suppressing on the strength of one takes away jobs a person's filter has already
+earned them (db/watchlist.track_companies has the sequence). The obligation moved
+to the filter, which is where the match set is now decided, and with it the write:
+
+    user_companies          <- lib/watchlist.ts          and nothing else
+    user_job_notifications  <- lib/preferences.ts        and nothing else
+
+Two tables, one writer each, which is a tighter seal than the one writer for two
+that came before it. FORBIDDEN_WRITES is therefore two parametrised sets rather
+than one list with an exemption bolted on: an exemption is a hole somebody widens,
+a second set is a rule somebody has to state.
 
 WHY A PYTHON TEST ASSERTS ABOUT TYPESCRIPT — the argument
 tests/test_tracked_write_sealed.py makes, unchanged: pytest is the only thing
-that runs on every commit. `npm run watchlist-check` proves the behaviour against
-the live database and needs Supabase to be reachable; an invariant that holds only
-when the database is up is an invariant nobody checks on the commit that breaks
-it.
+that runs on every commit. `npm run filter-first-check` proves the behaviour
+against the live database and needs Supabase to be reachable; an invariant that
+holds only when the database is up is an invariant nobody checks on the commit
+that breaks it.
 
 WHAT IT DELIBERATELY DOES NOT ASSERT: that the TypeScript is byte-identical to
 the Python. It is not — placeholders differ ($1 versus a tagged template), the TS
 carries a per-plan cap the Python has no reason to know about, and it acts on one
-company where the Python loops. What is compared is the two STATEMENTS, which is
+company where the Python loops. What is compared is the STATEMENTS, which is
 where a divergence would silently change what an inbox receives.
 """
 
@@ -41,16 +43,16 @@ from pathlib import Path
 
 import pytest
 
-from db.notifications import SUPPRESS_COMPANY_HISTORY_SQL
 from db.watchlist import TRACK_ONE_COMPANY_SQL
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DASHBOARD = PROJECT_ROOT / "dashboard"
 
-# The one file allowed to write this table from the web app, and the only one.
-# Same shape as tests/test_tracked_write_sealed.ADD_PATH_FILE: an exemption that
-# is a single named file, re-earned below by a test that reads it apart.
+# One module per table, and the pairing is the rule this file exists to hold.
+# Same shape as tests/test_tracked_write_sealed.ADD_PATH_FILE: each is a single
+# named file, re-earned below by tests that read it apart.
 WATCHLIST_MODULE = "src/lib/watchlist.ts"
+PREFERENCES_MODULE = "src/lib/preferences.ts"
 
 
 def read(relative: str) -> str:
@@ -61,9 +63,9 @@ def strip_comments(source: str) -> str:
     """Remove /* … */ and // … so prose about a statement is not a statement.
 
     Load-bearing here for the same reason it is in test_tracked_write_sealed.py:
-    lib/watchlist.ts quotes the Python statements it ports in its comments, and a
-    rule that forced the documentation to avoid naming its subject would make the
-    code worse. `://` is protected so a URL is not read as a comment.
+    both modules quote the statements they port in their comments, and a rule
+    that forced the documentation to avoid naming its subject would make the code
+    worse. `://` is protected so a URL is not read as a comment.
     """
     source = re.sub(r"/\*.*?\*/", " ", source, flags=re.S)
     return re.sub(r"(?<!:)//[^\n]*", " ", source)
@@ -105,7 +107,12 @@ def watchlist_ts() -> str:
     return strip_comments(read(WATCHLIST_MODULE))
 
 
-# --- the two statements, against the Python originals ----------------------
+@pytest.fixture(scope="module")
+def preferences_ts() -> str:
+    return strip_comments(read(PREFERENCES_MODULE))
+
+
+# --- the pair insert, against the Python original --------------------------
 
 
 def test_the_pair_insert_is_the_python_statement(watchlist_ts: str):
@@ -114,8 +121,8 @@ def test_the_pair_insert_is_the_python_statement(watchlist_ts: str):
     ON CONFLICT (user_id, company_id) DO NOTHING is what makes watching
     idempotent, and it is the table's UNIQUE doing the work rather than a check in
     either language. RETURNING company_id is what tells "I have just started
-    watching this" from "I already was" — the distinction the suppression hangs
-    off, and the reason a DO UPDATE here would be a bug rather than a nicety.
+    watching this" from "I already was" — which decided whether history was
+    suppressed until the filter-first slice, and is now what the caller reports.
     """
     ported = statement_containing(watchlist_ts, "INSERT INTO user_companies")
     assert normalise(ported) == normalise(TRACK_ONE_COMPANY_SQL), (
@@ -126,133 +133,230 @@ def test_the_pair_insert_is_the_python_statement(watchlist_ts: str):
     )
 
 
-def test_the_suppression_is_the_python_statement(watchlist_ts: str):
-    """db/notifications.SUPPRESS_COMPANY_HISTORY_SQL, ported.
+def test_watching_a_company_no_longer_writes_notification_rows(watchlist_ts: str):
+    """THE DELETION, ASSERTED RATHER THAN ASSUMED — and it is the sharp one.
 
-    The half that stops a first digest being an archive dump. INSERT ... SELECT
-    rather than a loop, so the set is decided by the database at the instant the
-    statement runs; ON CONFLICT DO NOTHING so an untrack/re-track cycle is a
-    no-op; RETURNING canonical_id so the caller can report how many rows it
-    actually suppressed, which is the number the picker prints.
+    lib/watchlist.ts wrote `user_job_notifications` for two slices, and it was
+    right to: the queue's first clause was the watch list, so a pair admitted a
+    company's whole stored history at once. With the gate gone a pair admits
+    nothing, and suppressing on the strength of one is not harmless insurance —
+    it silently removes jobs the person's FILTER already put in their queue:
+
+        filter saved at T0, so everything matching then is suppressed. Job J
+        appears at company X at T1, matches, enters the queue. At T2 the person
+        pins X — which grants them nothing new — and the suppression records every
+        stored job of X, J included. J leaves the queue, behind a row saying it
+        was meant.
+
+    That is the failure tests/test_leakage.py's fifth property exists to exclude,
+    reached from inside rather than from another account. So the statement has to
+    be ABSENT here, not merely unreachable.
     """
-    ported = statement_containing(watchlist_ts, "INSERT INTO user_job_notifications")
-    assert normalise(ported) == normalise(SUPPRESS_COMPANY_HISTORY_SQL), (
-        "the dashboard's history suppression has drifted from db/notifications."
-        "SUPPRESS_COMPANY_HISTORY_SQL.\n"
-        f"  python: {normalise(SUPPRESS_COMPANY_HISTORY_SQL)}\n"
-        f"  ts    : {normalise(ported)}"
+    assert "user_job_notifications" not in watchlist_ts, (
+        "lib/watchlist.ts names user_job_notifications again. Watching a company "
+        "must not touch notification state: the queue no longer reads the watch "
+        "list, so suppressing a company's history on a pin removes jobs the "
+        "person's filter already earned them. See db/watchlist.track_companies."
     )
 
 
-def test_the_suppression_covers_closed_jobs_too(watchlist_ts: str):
-    """EVERY job of that company, not only the open ones.
-
-    A closed job that reopens gets status='open' and miss_count=0 back from
-    crawler/store.UPSERT_SEEN while keeping its canonical_id, so scoping this to
-    open rows leaves a hole exactly one flap wide — and `reappeared` is precisely
-    the set the crawler refuses to treat as news. Asserted on both sides, because
-    "the port matches" would still pass if somebody narrowed both.
-    """
-    ported = statement_containing(watchlist_ts, "INSERT INTO user_job_notifications")
-    assert "status" not in ported, (
-        "the ported suppression filters on jobs.status. It must not: a closed job "
-        "that reopens keeps its identity, so an open-only suppression would let a "
-        "flap deliver history as news."
-    )
-    assert "status" not in SUPPRESS_COMPANY_HISTORY_SQL
+# --- the suppression, on the filter instead --------------------------------
 
 
-# --- the obligation: one transaction, and only on a genuine insert ---------
-
-
-def watch_company_body(source: str) -> str:
-    """The body of lib/watchlist.watchCompany, which is where both halves live."""
+def preferences_save_body(source: str) -> str:
+    """The body of lib/preferences.savePreferences, where the transaction lives."""
     match = re.search(
-        r"export async function watchCompany\b.*?\n\}\n", source, flags=re.S
+        r"export async function savePreferences\b.*?\n\}\n", source, flags=re.S
     )
-    assert match, "watchCompany has been renamed or restructured — check these assertions"
+    assert match, "savePreferences has been renamed or restructured — check these assertions"
     return match.group(0)
 
 
-def test_both_halves_run_in_one_transaction(watchlist_ts: str):
-    """No instant in which the pair exists and the suppression does not.
+def suppression_body(source: str) -> str:
+    """The body of lib/preferences.suppressFilterBacklog."""
+    match = re.search(
+        r"async function suppressFilterBacklog\b.*?\n\}\n", source, flags=re.S
+    )
+    assert match, "suppressFilterBacklog has been renamed or restructured"
+    return match.group(0)
+
+
+def test_the_suppression_insert_shares_every_deciding_clause_with_the_python(
+    preferences_ts: str,
+):
+    """The port, compared on the clauses that decide rather than character for
+    character — and the asymmetry is FORCED rather than chosen.
+
+    db/notifications.record_notified_sql builds `VALUES ($1, $2), ($1, $3), …` in
+    chunks of 400 because it must stay inside the subset Postgres and SQLite agree
+    on: the whole pytest suite runs those statements against the in-memory shim,
+    which has no `unnest`. Nothing on the TypeScript side runs against SQLite, and
+    one array parameter binds no per-row placeholder, so both the 65535-parameter
+    ceiling and the chunking it forces disappear.
+
+    What the two must still share is every clause that changes an outcome: the
+    table, the column pair, the ON CONFLICT target and action (so a re-save is a
+    genuine no-op rather than an error or a re-stamp), and RETURNING canonical_id
+    (so the count reported to the person is rows WRITTEN, not rows offered).
+    """
+    ported = statement_containing(preferences_ts, "INSERT INTO user_job_notifications")
+    flat = normalise(ported)
+
+    assert "INSERT INTO user_job_notifications (user_id, canonical_id)" in flat
+    assert "ON CONFLICT (user_id, canonical_id) DO NOTHING" in flat, (
+        "the suppression is no longer ON CONFLICT DO NOTHING. Re-saving a filter "
+        "would then error or re-stamp rather than being the no-op it has to be."
+    )
+    assert "RETURNING canonical_id" in flat, (
+        "the suppression no longer returns what it wrote, so the count the save "
+        "reports to a person would be rows OFFERED rather than rows written."
+    )
+    assert "DO UPDATE" not in flat
+
+
+def test_the_suppression_read_is_status_blind(preferences_ts: str):
+    """EVERY job the filter admits, not only the open ones.
+
+    A closed job that reopens comes back `status = 'open'` with `miss_count = 0`
+    from crawler/store.UPSERT_SEEN while KEEPING its canonical_id. So a suppression
+    scoped to open rows leaves a hole exactly one flap wide: the job sits closed and
+    unsuppressed while somebody saves their filter, a vendor re-lists it a week
+    later, and it arrives in that person's digest as news because a board was
+    edited. `reappeared` is precisely the set crawler/diff.py refuses to treat as
+    news.
+
+    This is the property db/notifications.SUPPRESS_COMPANY_HISTORY_SQL held before
+    it, asserted on the thing that replaced it — the replacement had to re-earn it
+    and could easily not have.
+    """
+    body = suppression_body(preferences_ts)
+    read_statement = next(
+        literal for literal in template_literals(body) if "FROM jobs j" in literal
+    )
+    assert "status" not in read_statement, (
+        "the suppression read filters on jobs.status. It must not: a closed job "
+        "that reopens keeps its identity, so an open-only suppression lets a flap "
+        "deliver history as news. See notify/store.SUPPRESSION_CANDIDATES_SQL."
+    )
+    # And it must still carry the other two, which are what make it the QUEUE's
+    # question rather than a different one.
+    assert "j.seeded = FALSE" in read_statement, (
+        "the suppression read dropped `seeded = FALSE`. A seeded row is excluded "
+        "from every queue forever anyway, so recording one costs a row per user "
+        "per seeded job — 6,496 from a single sweep."
+    )
+    assert "user_job_notifications" in read_statement
+
+
+def test_the_save_and_the_suppression_run_in_one_transaction(preferences_ts: str):
+    """No instant in which the filter is widened and the suppression is not written.
 
     Not tidiness: the hourly digest runs in exactly that instant if the process
-    dies between the two statements, and what it would send is the company's whole
-    stored history. db/watchlist.track_companies opens a transaction around the
-    same pair of statements for the same reason.
+    dies between the two, and what it would send is every stored job the new answer
+    just admitted. lib/watchlist.watchCompany held a transaction around the same
+    shape of obligation for the same reason, until the obligation moved here.
     """
-    body = watch_company_body(watchlist_ts)
+    body = preferences_save_body(preferences_ts)
 
     assert "sql.begin(" in body, (
-        "watchCompany no longer opens a transaction. The pair and the history "
-        "suppression must commit together or not at all."
+        "savePreferences no longer opens a transaction. The UPDATE and the "
+        "backlog suppression must commit together or not at all."
     )
-    assert "INSERT INTO user_companies" in body
-    assert "INSERT INTO user_job_notifications" in body
-
-    # Both statements must be inside the begin() callback rather than beside it.
     begin_at = body.index("sql.begin(")
-    assert body.index("INSERT INTO user_companies") > begin_at
-    assert body.index("INSERT INTO user_job_notifications") > begin_at
-
-    # And they must run on the transaction handle, not on the pool. A statement
-    # bound to `sql` inside a `sql.begin` callback runs on a DIFFERENT connection
-    # and is therefore outside the transaction entirely — the one mistake in this
-    # shape that looks completely correct.
-    for statement in ("INSERT INTO user_companies", "INSERT INTO user_job_notifications"):
-        prefix = body[: body.index(statement)]
-        opener = prefix.rindex("`")
-        head = prefix[max(0, opener - 120) : opener]
-        assert re.search(r"\btx\s*[<`]", head), (
-            f"the statement holding {statement!r} does not run on the transaction "
-            f"handle `tx`. Bound to the pool it would run on another connection, "
-            f"outside the transaction, and the atomicity would be decorative."
-        )
+    assert body.index("UPDATE preferences") > begin_at
+    assert body.index("suppressFilterBacklog") > begin_at, (
+        "the suppression is called outside the transaction the UPDATE runs in."
+    )
 
 
-def test_the_suppression_runs_only_on_a_genuine_insert(watchlist_ts: str):
-    """The sharp edge, ported.
+def test_every_statement_of_the_save_runs_on_the_transaction_handle(preferences_ts: str):
+    """`tx`, never `sql` — the one mistake in this shape that looks correct.
 
-    Suppression records every job the company has RIGHT NOW as already-notified.
-    Run against a pair that already exists it would swallow everything that
-    arrived since — somebody's actual queue, silently. So it has to sit AFTER the
-    branch that returns when the INSERT returned no row, which is what makes
-    re-adding genuinely idempotent rather than idempotent-looking.
+    A statement bound to the pool inside a `sql.begin` callback runs on a DIFFERENT
+    connection and is therefore outside the transaction entirely, so the atomicity
+    above would be decorative. Asserted textually because nothing else can see it:
+    the code compiles, runs, and produces the right answer on every run that does
+    not crash in the window.
     """
-    body = watch_company_body(watchlist_ts)
+    for source in (preferences_save_body(preferences_ts), suppression_body(preferences_ts)):
+        for statement in ("UPDATE preferences", "INSERT INTO user_job_notifications", "FROM jobs j"):
+            if statement not in source:
+                continue
+            prefix = source[: source.index(statement)]
+            opener = prefix.rindex("`")
 
-    guard = re.search(r"if \(inserted\.length === 0\)", body)
-    assert guard, (
-        "the RETURNING check is gone from watchCompany. Without it the suppression "
-        "runs on every add, and the second click swallows every job that arrived "
-        "since the first."
+            # THE HANDLE IS FOUND BY WALKING BACK TO THE `await` RATHER THAN BY
+            # SEARCHING A FIXED WINDOW, and that is not a refinement — the first
+            # draft of this test used `prefix[opener - 160 : opener]` and FAILED on
+            # a statement that was perfectly correct. The suppression read carries
+            # a ~400-character inline row type between `tx<` and its backtick, so a
+            # window wide enough for that statement is wide enough to catch an
+            # unrelated `tx` several lines above a statement bound to the pool —
+            # which is the failure this test exists to detect. Anchoring on the
+            # awaited expression is exact at any length.
+            awaited = re.findall(r"await\s+([A-Za-z_$][\w$]*)", prefix)
+            assert awaited, f"no awaited call precedes {statement!r}"
+            assert awaited[-1] == "tx", (
+                f"the statement holding {statement!r} runs on `{awaited[-1]}` rather "
+                f"than on the transaction handle `tx`. Bound to the pool it would run "
+                f"on another connection, outside the transaction, and the atomicity "
+                f"would be decorative."
+            )
+
+
+def test_the_suppression_is_a_delta_rather_than_everything_matching(preferences_ts: str):
+    """NEW \\ OLD, and the subtraction is the whole design.
+
+    "Suppress everything currently matching on every save" would be simpler and is
+    wrong: it eats whatever arrived since the last digest EVERY TIME anybody
+    touches the form, including a save that narrows the filter or edits a field the
+    matcher never reads. Only what the new answer newly admits is history.
+
+    Day one is not a special case in that rule — a brand-new row is blank on every
+    field and every blank in this app is fail-closed, so OLD is empty and the first
+    save records the whole current match set. Asserted on the shape of the
+    expression, because the alternative reads almost identically.
+    """
+    body = suppression_body(preferences_ts)
+    assert re.search(r"isMatch\([^)]*,\s*after\)\s*&&\s*!isMatch\([^)]*,\s*before\)", body), (
+        "the suppression no longer computes NEW \\ OLD. Suppressing everything the "
+        "new filter matches would silently swallow whatever arrived since the last "
+        "digest, on every save, including one that narrows the filter."
     )
-    assert body.index("INSERT INTO user_job_notifications") > guard.start(), (
-        "the history suppression runs BEFORE the already-watching check. It must "
-        "run only on a genuine insert — see db/watchlist.track_companies."
+
+
+def test_the_suppression_judges_with_the_real_matcher(preferences_ts: str):
+    """isMatch, not the SQL prefilter's shape.
+
+    lib/jobs.ts's clauses are allowed to be WIDER than isMatch — that is stated
+    three times in that file and is what keeps the prefilter safe. Using their
+    shape here would suppress rows that never matched, and those are exactly the
+    rows enrichment can later turn into genuine matches by filling a NULL
+    min_experience the filter then admits. Over-suppressing today is swallowing a
+    real match tomorrow.
+    """
+    body = suppression_body(preferences_ts)
+    assert "isMatch(" in body, (
+        "the backlog suppression no longer runs isMatch. A prefilter-shaped "
+        "approximation suppresses rows that never matched."
     )
-    # The guard has to leave, not merely log.
-    tail = body[guard.start() : body.index("INSERT INTO user_job_notifications")]
-    assert "return" in tail, (
-        "the already-watching branch does not return, so it falls through into the "
-        "suppression it exists to skip."
-    )
 
 
-# --- the seal: one writer, and it is that file -----------------------------
+# --- the seal: two tables, one writer each ---------------------------------
 
-# Every shape a write to the watch list can take. Reads (`FROM user_companies`,
-# the EXISTS in lib/companies and the count in lib/account) are deliberately not
-# here: the rule is one WRITER, not one reader.
-FORBIDDEN_WRITES = (
-    r"INSERT\s+INTO\s+user_companies\b",
-    r"DELETE\s+FROM\s+user_companies\b",
-    r"UPDATE\s+user_companies\b",
-    r"INSERT\s+INTO\s+user_job_notifications\b",
-    r"DELETE\s+FROM\s+user_job_notifications\b",
-    r"UPDATE\s+user_job_notifications\b",
-)
+# Every shape a write can take, per table. Reads are deliberately not here — the
+# rule is one WRITER, not one reader, so lib/companies' EXISTS and lib/account's
+# counts are unaffected.
+WRITE_SHAPES = ("INSERT\\s+INTO\\s+{table}\\b", "DELETE\\s+FROM\\s+{table}\\b", "UPDATE\\s+{table}\\b")
+
+# The pairing this file exists to hold. It was ONE writer for TWO tables until the
+# filter-first slice; splitting it into two parametrised sets rather than adding an
+# exemption is deliberate — an exemption is a hole the next person widens, and a
+# second set is a rule they have to state.
+SEALED_TABLES = {
+    "user_companies": WATCHLIST_MODULE,
+    "user_job_notifications": PREFERENCES_MODULE,
+}
 
 
 def dashboard_sources() -> list[Path]:
@@ -261,10 +365,10 @@ def dashboard_sources() -> list[Path]:
     src/ ONLY, unlike tests/test_tracked_write_sealed.py, and the difference is
     the rule rather than an oversight. That file's rule is "this column is not
     the web app's to write, by anyone, ever", so it sweeps the check scripts too.
-    This one's rule is "a REQUEST may create a tracking row through exactly one
-    function", and a check script is not a request: it is run from a terminal by
-    whoever already holds the DSN, against rows it created itself. The two that
-    do write these tables are named and re-earned by the test below, which is
+    This one's rule is "a REQUEST may write these tables through exactly one
+    function each", and a check script is not a request: it is run from a terminal
+    by whoever already holds the DSN, against rows it created itself. The three
+    that do write these tables are named and re-earned by the test below, which is
     what stops "not swept" quietly becoming "not looked at".
     """
     files = sorted(DASHBOARD.glob("src/**/*.ts"))
@@ -276,45 +380,56 @@ def relative(path: Path) -> str:
     return path.relative_to(DASHBOARD).as_posix()
 
 
+@pytest.mark.parametrize("table,writer", sorted(SEALED_TABLES.items()))
 @pytest.mark.parametrize("path", dashboard_sources(), ids=relative)
-def test_only_one_module_writes_the_watch_list(path: Path):
-    """One writer, so there is one place the second obligation can be forgotten.
+def test_each_per_user_table_has_exactly_one_writer(path: Path, table: str, writer: str):
+    """One writer per table, so there is one place each obligation can be forgotten.
 
     This is db/watchlist.py's own argument, carried across the language boundary:
     the bulk INSERT that tracked the whole catalog in Phase 1c was DELETED rather
-    than kept-but-unused, because a convenient statement that skips the
-    suppression is a loaded gun aimed at whichever future caller reaches for it.
-    A second TypeScript file writing either table would be that gun, rebuilt.
+    than kept-but-unused, because a convenient statement that skips an obligation
+    is a loaded gun aimed at whichever future caller reaches for it. A second
+    TypeScript file writing either table would be that gun, rebuilt.
+
+    Note that the two writers are now DIFFERENT files, which is what makes this
+    parametrised rather than a single sweep: lib/watchlist.ts writing
+    user_job_notifications is exactly the regression the filter-first slice
+    removed, and this catches it as a violation of the OTHER table's seal.
     """
-    if relative(path) == WATCHLIST_MODULE:
-        pytest.skip(f"{WATCHLIST_MODULE} is the one writer — the tests above pin what it writes")
+    if relative(path) == writer:
+        pytest.skip(f"{writer} is the one writer of {table} — the tests above pin what it writes")
 
     code = strip_comments(path.read_text(encoding="utf-8"))
-    for pattern in FORBIDDEN_WRITES:
-        match = re.search(pattern, code)
+    for shape in WRITE_SHAPES:
+        match = re.search(shape.format(table=table), code)
         assert match is None, (
-            f"{relative(path)} writes the per-user watch list or notification history "
-            f"({match.group(0)!r}). Both tables are written from lib/watchlist.ts and "
-            f"nowhere else, because creating a tracking row has a second obligation — "
-            f"recording that company's stored jobs as already-seen — and a statement "
-            f"that skips it delivers somebody an archive dump."
+            f"{relative(path)} writes {table} ({match.group(0)!r}). That table is "
+            f"written from {writer} and nowhere else, because the write carries an "
+            f"obligation — a tracking row is capped per plan, and a notification row "
+            f"is what stops somebody being emailed a job. A statement that skips "
+            f"either delivers an archive dump or an unenforceable limit."
         )
 
 
 def test_the_check_scripts_that_write_these_tables_write_only_their_own_rows():
-    """The two exemptions, enumerated and re-earned rather than granted.
+    """The exemptions, enumerated and re-earned rather than granted.
 
-    Neither is reachable by a request — they are headless scripts run from a
-    terminal — but both fabricate per-user rows, and a fabricated row against the
-    WRONG user is a person's watch list or notification history edited by a check.
-    So each is held to the property that makes it safe:
+    None is reachable by a request — they are headless scripts run from a
+    terminal — but all of them fabricate per-user rows, and a fabricated row
+    against the WRONG user is a person's watch list or notification history edited
+    by a check. So each is held to the property that makes it safe:
 
-      badge-check   writes inside a transaction whose only exit is a throw, so it
-                    can only ever end in ROLLBACK. Nothing it inserts survives.
-      delete-check  writes against an account it created moments earlier, by an id
-                    it generated, and deletes it afterwards. A rollback would prove
-                    the wrong thing there: the claim under test is that
-                    lib/account.deleteAccount really removes rows.
+      badge-check        writes inside a transaction whose only exit is a throw, so
+                         it can only ever end in ROLLBACK. Nothing it inserts
+                         survives.
+      delete-check       writes against an account it created moments earlier, by
+                         an id it generated, and deletes it afterwards. A rollback
+                         would prove the wrong thing there: the claim under test is
+                         that lib/account.deleteAccount really removes rows.
+      filter-first-check the same shape as delete-check and for the same reason —
+                         the claim under test is that a real save against a real
+                         account really writes suppression rows, which a rolled-back
+                         transaction could not demonstrate.
     """
     badge = strip_comments(read("scripts/badge-check.ts"))
     insert_at = badge.index("INSERT INTO user_job_notifications")
@@ -329,9 +444,7 @@ def test_the_check_scripts_that_write_these_tables_write_only_their_own_rows():
 
     delete = strip_comments(read("scripts/delete-check.ts"))
     for table in ("user_companies", "user_job_notifications"):
-        statement = re.search(
-            rf"INSERT INTO {table}[^`]*", delete, flags=re.S
-        )
+        statement = re.search(rf"INSERT INTO {table}[^`]*", delete, flags=re.S)
         assert statement, f"delete-check no longer seeds {table}"
         assert "who.accountId" in statement.group(0), (
             f"delete-check's {table} INSERT no longer binds the throwaway account id "
@@ -343,6 +456,12 @@ def test_the_check_scripts_that_write_these_tables_write_only_their_own_rows():
         "rows would accumulate."
     )
 
+    first = strip_comments(read("scripts/filter-first-check.ts"))
+    assert "DELETE FROM public.users" in first, (
+        "filter-first-check no longer removes the throwaway account it creates, so "
+        "the rows its save suppresses would accumulate against a real row."
+    )
+
 
 # --- the cap ---------------------------------------------------------------
 
@@ -351,10 +470,15 @@ def test_the_free_cap_is_the_number_on_the_pricing_card():
     """The landing page promises a limit; this is the same number, enforceable.
 
     "Watch up to 5 companies" has been on the Free tier since the pricing section
-    shipped and was enforced NOWHERE — there was no writer for the table at all,
-    so the sentence was marketing copy rather than a rule. The two now have to
-    agree, and this is what says so: a cap raised in code and not on the card
-    (or the reverse) is a promise the product quietly stops keeping.
+    shipped. The two have to agree, and this is what says so: a cap raised in code
+    and not on the card (or the reverse) is a promise the product quietly stops
+    keeping.
+
+    UNTOUCHED BY THE FILTER-FIRST SLICE, and worth saying why rather than leaving
+    it to look like an oversight: the cap limits how many companies somebody may
+    PIN, and pinning is still a real feature with a real cost on the pricing page.
+    What changed is that a pin no longer gates a digest — so the cap no longer caps
+    what anybody can be emailed about, which it never should have.
     """
     labels = read("src/lib/labels.ts")
     constant = re.search(r"FREE_WATCHLIST_CAP\s*=\s*(\d+)", labels)
@@ -370,6 +494,13 @@ def test_the_free_cap_is_the_number_on_the_pricing_card():
         f"the pricing card promises {promised.group(1)} companies and "
         f"FREE_WATCHLIST_CAP is {constant.group(1)}."
     )
+
+
+def watch_company_body(source: str) -> str:
+    """The body of lib/watchlist.watchCompany."""
+    match = re.search(r"export async function watchCompany\b.*?\n\}\n", source, flags=re.S)
+    assert match, "watchCompany has been renamed or restructured — check these assertions"
+    return match.group(0)
 
 
 def test_the_cap_is_enforced_where_the_row_is_written(watchlist_ts: str):
@@ -396,44 +527,62 @@ def test_the_cap_is_enforced_where_the_row_is_written(watchlist_ts: str):
 
 
 @pytest.mark.parametrize("page", ["src/app/page.tsx", "src/app/jobs/page.tsx"])
-def test_home_and_jobs_list_the_watch_list_rather_than_the_catalog(page: str):
-    """The two screens that print a per-user count follow the person.
+def test_home_and_jobs_list_the_catalog_rather_than_the_watch_list(page: str):
+    """THE INVERSE OF WHAT THIS ASSERTED BEFORE, and the inversion is the slice.
 
-    Before the picker there was one list and it could not be wrong: nothing could
-    write user_companies, so "the catalog" and "your companies" were the same fifty
-    rows. They can differ now, and a "for you" count computed over companies you do
-    not watch counts jobs that can never reach your inbox — the disagreement
-    between Home and the digest that this slice exists to close.
+    The picker slice narrowed both screens to `user_companies`, on the argument
+    that a screen printing a per-user "for you" count has to follow the person —
+    a count over a company you did not watch counted jobs that could never reach
+    your inbox. Sound, and its premise is gone: the digest queue no longer reads
+    the watch list, so a match at any company can reach any inbox.
+
+    The count itself never moved. lib/jobs.matchCountsByCompany has always spanned
+    the catalog, so the narrowing only ever affected which company ROWS were
+    printed beside numbers that already covered everything. This is the page
+    agreeing with its own figures again.
+
+    Asserted rather than left to the eye because the failure is quiet in the
+    dangerous direction: back on listWatchedCompanyCards, a new account would see
+    an empty Home while its digest filled up.
     """
     source = strip_comments(read(page))
-    assert "listWatchedCompanyCards" in source, (
-        f"{page} no longer lists the watch list. If it went back to listCompanyCards "
-        f"it is showing the shared catalog with per-user match counts on it again."
+    assert "listCompanyCards" in source, (
+        f"{page} no longer lists the catalog."
     )
-    assert "listCompanyCards(" not in source
+    assert "listWatchedCompanyCards" not in source, (
+        f"{page} is back on the watch-list query. Under filter-first that shows a "
+        f"person fewer companies than their digest is computed from — an empty Home "
+        f"beside a full inbox."
+    )
 
 
-def test_finishing_onboarding_requires_a_watch_list():
-    """The fifth required answer, and it is the one the queue asks FIRST.
+def test_finishing_onboarding_does_not_require_a_watch_list():
+    """THE SIXTH REQUIRED ANSWER IS GONE, asserted as an absence.
 
-    notify/store.CANDIDATES_SQL begins with `EXISTS (user_companies …)`, so an
-    account watching nothing matches nothing however good its keywords are —
-    exactly the empty-digest failure the empty-cities and empty-keywords refusals
-    guard against. PUT /api/preferences is the only writer of
-    onboarding_completed, so this is where "onboarded implies it can match
-    something" is made true.
+    PUT /api/preferences refused a save from an account watching nothing, and it
+    belonged to the family holding the city answer, the keyword list, the
+    experience range and the work arrangement — every one of which guards a row
+    that matches NO JOB AT ALL. It earned its place the same way: the queue asked
+    `EXISTS (user_companies …)` first, so an account watching nothing matched
+    nothing however good its keywords were.
+
+    That failure cannot happen now, so the refusal guarded nothing while still
+    requiring an answer that decides nothing — and on a setup screen a required
+    question whose answer changes no outcome is worse than no question, because a
+    person reasonably concludes it must matter.
+
+    The picker, the cap and /watchlist are all untouched, which is the point: the
+    watch list stopped being a GATE, not a feature.
     """
     route = strip_comments(read("src/app/api/preferences/route.ts"))
-    assert "watchesAnything" in route, (
-        "PUT /api/preferences no longer checks the watch list, so an account can "
-        "complete onboarding watching nothing and get an empty digest forever — "
-        "which is the state this slice exists to make impossible."
+    assert "watchesAnything" not in route, (
+        "PUT /api/preferences checks the watch list again. Under filter-first an "
+        "account watching nothing matches the whole catalog, so the refusal blocks "
+        "a save for a reason that is no longer true."
     )
-    refusal = re.search(
-        r"if \(!\(await watchesAnything\([^)]*\)\)\) \{(.*?)\n  \}", route, flags=re.S
-    )
-    assert refusal, "the watch-list branch has been restructured — check this assertion"
-    assert "badRequest" in refusal.group(1), (
-        "the empty-watch-list branch must REFUSE the save, not log it. An ignored "
-        "check reads to the caller as a successful onboarding."
+
+    watchlist_source = strip_comments(read(WATCHLIST_MODULE))
+    assert "export async function watchesAnything" not in watchlist_source, (
+        "watchesAnything is exported again with no caller. A function written for "
+        "nobody is the jobs.notified lesson applied to a name."
     )

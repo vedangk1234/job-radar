@@ -14,10 +14,36 @@
  * It is also why there is no migration here and no backfill: adding a badge
  * changed no data, only what the screen says about data it already had.
  *
- *   NEW        a match I have not been told about  (match && !user_notified)
- *   NOTIFIED   a match a digest has told me about  (match && user_notified)
+ *   NEW        a match not yet emailed to me      (match && !user_notified)
+ *   (none)     a match already handled             (match && user_notified)
  *   SUGGESTED  on the RAW list: this one fits      (match, on a screen that does
  *                                                   not filter by matching)
+
+ *
+ * THERE WAS A `NOTIFIED` BADGE ON THAT SECOND LINE AND THE FILTER-FIRST SLICE
+ * REMOVED IT, WHICH IS A CHANGE OF HONESTY RATHER THAN OF DESIGN.
+ *
+ * It read "already emailed to you", and for two phases that was true: a row in
+ * user_job_notifications was written by record_sent, after Resend returned an id.
+ * The table has always held a second kind of row — written because a job must
+ * NEVER be emailed to that person — but they were rare: the 1d backfill, and a
+ * company's history when somebody first watched it.
+ *
+ * Filter-first makes the second kind the COMMON kind. A brand-new account's first
+ * save records every back-catalogue job its filter matches as already-seen (see
+ * lib/preferences.suppressFilterBacklog), so on day one that account's Home would
+ * have been a wall of badges claiming emails it had never received. The badge
+ * would have been lying on almost every row of the screen a person sees first.
+ *
+ * It could not be caught by looking, either, which is why it came out in the same
+ * slice rather than later: the operator's own rows are genuine receipts, so their
+ * screen would have looked exactly as it always had.
+ *
+ * SO THE ABSENCE OF A BADGE NOW MEANS "handled" — sent, or suppressed, and the row
+ * itself does not distinguish them because the queue does not either. NEW keeps
+ * its exact meaning, which is the one worth having: this is in your digest queue
+ * and has not gone out yet. Deriving it is unchanged — `match && !user_notified`,
+ * the same predicate from the same table.
  *
  * "TOLD ME", NOT "TOLD SOMEBODY" — THE PHASE 1f CHANGE
  * ----------------------------------------------------
@@ -44,27 +70,27 @@
  * ---------------------------------------
  * They are answers to different questions. On Home every row is a match, so
  * "does it match" is not news and the useful distinction is whether the digest
- * has already told me about it — NEW is the row I have not seen in my inbox.
- * On Jobs nothing is filtered, so the useful distinction is the opposite one:
- * which of these several hundred postings the filter would have picked. Showing
- * NEW/NOTIFIED there would put a badge on every row and mean nothing; showing
+ * has already handled it — NEW is the row still queued for my inbox. On Jobs
+ * nothing is filtered, so the useful distinction is the opposite one: which of
+ * these several hundred postings the filter would have picked. Showing NEW there
+ * would put a badge on almost every matching row and mean nothing; showing
  * SUGGESTED on Home would put the same badge on every row and mean nothing.
  *
  * A NOTE ON WHAT YOU WILL ACTUALLY SEE TODAY
  * ------------------------------------------
- * Most matches read NOTIFIED, because most of the table is back catalogue: a
+ * Most matches carry NO badge, because most of the table is already handled: a
  * company's first-ever crawl stores its whole board silently (see "the silent
- * seed" in CLAUDE.md), and the 1d backfill recorded every job the old boolean
- * covered as already-notified for the one existing account.
+ * seed" in CLAUDE.md), the 1d backfill recorded every job the old boolean
+ * covered, and a filter save records the back catalogue it admits.
  *
  * NEW is not speculative and has not been since the hourly cron started. A
  * genuinely new posting arrives with no row in user_job_notifications for
  * anybody, so it reads NEW on Home until that hour's digest sends and records
  * one. A job that somebody else's digest sent stays NEW here, which is the whole
- * point of the change.
+ * point of the per-user predicate.
  */
 
-export type HomeBadge = "NEW" | "NOTIFIED";
+export type HomeBadge = "NEW";
 export type JobsBadge = "SUGGESTED";
 export type Badge = HomeBadge | JobsBadge;
 
@@ -90,17 +116,16 @@ type Judged = { user_notified?: boolean | null; matches?: boolean | null };
  */
 export function homeBadge(job: Judged): BadgeInfo | null {
   if (job.matches === false) return null;
-  return job.user_notified
-    ? {
-        label: "NOTIFIED",
-        title: "This job fits your filter and has already gone out to you in a digest email.",
-      }
-    : {
-        label: "NEW",
-        title:
-          "This job fits your filter and has not been emailed to you yet — it is sitting in " +
-          "your digest queue.",
-      };
+  // Already handled — emailed, or recorded as history by a filter save. No badge,
+  // because the row cannot tell those two apart and neither can the queue. See the
+  // block comment above for why claiming "already emailed" here became a lie.
+  if (job.user_notified) return null;
+  return {
+    label: "NEW",
+    title:
+      "This job fits your filter and has not been emailed to you yet — it is sitting in " +
+      "your digest queue.",
+  };
 }
 
 /**

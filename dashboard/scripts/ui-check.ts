@@ -6,7 +6,7 @@
  *
  * WHY THIS EXISTS
  * ---------------
- * The Applied checkbox and the NEW / NOTIFIED / SUGGESTED badges were once
+ * The Applied checkbox and the NEW / SUGGESTED badges were once
  * described in a spec, agreed to, and never built — and nothing failed, because
  * nothing in the repo could tell the difference between "rendered" and
  * "designed". A type checker proves the props line up. A database query proves
@@ -87,7 +87,6 @@ type Lib = {
   matchingJobsForCompany: typeof import("../src/lib/jobs").matchingJobsForCompany;
   openJobsWithMatchFlag: typeof import("../src/lib/jobs").openJobsWithMatchFlag;
   listCompanyCards: typeof import("../src/lib/companies").listCompanyCards;
-  listWatchedCompanyCards: typeof import("../src/lib/companies").listWatchedCompanyCards;
   listCompanies: typeof import("../src/lib/companies").listCompanies;
   watchlistState: typeof import("../src/lib/watchlist").watchlistState;
   FREE_WATCHLIST_CAP: typeof import("../src/lib/labels").FREE_WATCHLIST_CAP;
@@ -148,7 +147,6 @@ async function loadLib(): Promise<Lib> {
     matchingJobsForCompany: jobs.matchingJobsForCompany,
     openJobsWithMatchFlag: jobs.openJobsWithMatchFlag,
     listCompanyCards: companies.listCompanyCards,
-    listWatchedCompanyCards: companies.listWatchedCompanyCards,
     listCompanies: companies.listCompanies,
     watchlistState: watchlist.watchlistState,
     FREE_WATCHLIST_CAP: labels.FREE_WATCHLIST_CAP,
@@ -321,7 +319,7 @@ async function main() {
   // scripts/ since 2b, so the request path cannot reach it even by accident; a
   // page or route resolves its user from the session — see lib/guard.ts.
   lib = await loadLib();
-  const { currentUserId, loadPreferences, listWatchedCompanyCards, matchingJobsForCompany, openJobsWithMatchFlag } = lib;
+  const { currentUserId, loadPreferences, listCompanyCards, matchingJobsForCompany, openJobsWithMatchFlag } = lib;
 
   /*
    * --- THE APP NAV, ON /onboarding AND EVERYWHERE ELSE ---------------------
@@ -406,13 +404,13 @@ async function main() {
   console.log(`\nlive rows for the operator's account: ${userId}`);
 
   const prefs = await loadPreferences(userId);
-  // listWatchedCompanyCards, which is what Home and Jobs call since the picker
-  // slice. For this account it returns the same fifty rows the catalog query does
-  // — it watches everything, via scripts/backfill_user_companies.py in Phase 1c —
-  // and that equality is asserted below rather than assumed, because it is the
-  // whole reason the two screens could be narrowed without moving anything the
-  // operator sees.
-  const companies = await listWatchedCompanyCards(userId);
+  // listCompanyCards, which is what Home and Jobs call again since the filter-first
+  // slice. They called listWatchedCompanyCards for one slice in between, and for
+  // THIS account the two returned the same rows either way — it watches everything,
+  // via scripts/backfill_user_companies.py in Phase 1c — which is exactly why the
+  // operator's screens are the wrong place to notice a model change and why
+  // filter-first-check.ts uses a throwaway account instead.
+  const companies = await listCompanyCards(userId);
 
   let home: JobView[] = [];
   let all: JobView[] = [];
@@ -448,16 +446,41 @@ async function main() {
   // derived FOR comes from the session on a real request; here it is the
   // operator's id, threaded explicitly, which is the same code path with the
   // same parameter.
-  console.log("\nHome — NEW / NOTIFIED");
-  const notified = render({ ...home[0], user_notified: true }, "matches");
-  check(notified.includes('class="badge notified"'), "a match already emailed to me reads NOTIFIED");
-  check(notified.includes(">NOTIFIED<"), "the word NOTIFIED is in the markup");
-  check(!notified.includes(">NEW<"), "and NEW is not");
+  //
+  // A `NOTIFIED` badge sat opposite NEW until the filter-first slice and these
+  // assertions were its mirror image. It is gone because its copy — "already gone
+  // out to you in a digest email" — stopped being true: a user_job_notifications
+  // row now far more often means a filter save recorded the back catalogue than
+  // that an email was sent, so on a new account's first Home it would have claimed
+  // hundreds of emails nobody received. See lib/badges.ts.
+  //
+  // ASSERTED AS AN ABSENCE IN THE MARKUP, which is the half the type cannot cover:
+  // lib/badges.HomeBadge no longer admits the string, but a hand-written <span> in
+  // JobLine would compile perfectly well.
+  console.log("\nHome — NEW, and the absence that replaced NOTIFIED");
+  const handled = render({ ...home[0], user_notified: true }, "matches");
+  check(
+    !handled.includes(">NOTIFIED<") && !handled.includes('class="badge notified"'),
+    "a match already handled carries NO badge — it does not claim an email",
+    "the NOTIFIED badge is back in the markup",
+  );
+  check(!handled.includes(">NEW<"), "and it is not mislabelled NEW either");
+  check(
+    !/class="badge[^"]*"/.test(handled),
+    "no badge element is rendered for it at all",
+  );
 
   const fresh = render({ ...home[0], user_notified: false }, "matches");
-  check(fresh.includes('class="badge new"'), "a match not yet emailed to me reads NEW");
+  check(fresh.includes('class="badge new"'), "a match still queued for me reads NEW");
   check(fresh.includes(">NEW<"), "the word NEW is in the markup");
   check(!fresh.includes(">NOTIFIED<"), "and NOTIFIED is not");
+
+  // The Applied checkbox and the apply link survive on BOTH, which is what says
+  // the row is intact rather than merely badge-free.
+  for (const [markup, label] of [[handled, "handled"], [fresh, "new"]] as const) {
+    check(markup.includes('type="checkbox"'), `the Applied checkbox is still on a ${label} row`);
+    check(markup.includes('rel="noopener noreferrer"'), `and the apply link is too (${label})`);
+  }
 
   // The same row with NOTHING overridden — the badge the app actually puts on
   // screen, from the flag the live query produced. The two checks above prove
@@ -473,10 +496,10 @@ async function main() {
     `got ${typeof liveRow.user_notified}`,
   );
   const live = render(liveRow, "matches");
-  const expected = liveRow.user_notified ? "NOTIFIED" : "NEW";
   check(
-    live.includes(`>${expected}<`),
-    `the live row reads ${expected}, which is what user_job_notifications says for me — "${liveRow.title}"`,
+    liveRow.user_notified ? !live.includes(">NEW<") : live.includes(">NEW<"),
+    `the live row reads ${liveRow.user_notified ? "no badge" : "NEW"}, which is what ` +
+      `user_job_notifications says for me — "${liveRow.title}"`,
   );
 
   // --- JOBS: SUGGESTED, and its absence -----------------------------------
@@ -494,7 +517,22 @@ async function main() {
   if (nonMatching) {
     const html = render(nonMatching, "all");
     check(!html.includes("badge"), `a non-matching row has NO badge — "${nonMatching.title}"`);
-    check(html.includes("notified"), "but keeps the notified text and the status tag");
+    // The raw row printed `notified` / `not notified` beside the status tag until
+    // the filter-first slice, and it went with the NOTIFIED badge for the same
+    // reason: a user_job_notifications row now far more often means a filter save
+    // recorded the back catalogue than that an email was sent, so the word claimed
+    // something the row could not support — on the DEBUGGING view, where a wrong
+    // fact is most likely to be believed. The status tag stays; that one is a
+    // column.
+    check(
+      !html.includes(">notified<") && !html.includes(">not notified<"),
+      "and no longer claims a notification state it cannot support",
+      "the notified text is back on the raw row",
+    );
+    check(
+      html.includes("tag on") || html.includes("tag off"),
+      "but keeps the status tag, which is a real column",
+    );
     check(
       typeof nonMatching.user_notified === "boolean",
       "and the raw list carries user_notified too, so that text is per-user as well",
@@ -1049,41 +1087,43 @@ async function main() {
   );
 
   /*
-   * THE FIFTH SAVE GATE — an account watching no company, since the picker slice.
+   * THE FIFTH SAVE GATE — AN ACCOUNT WATCHING NO COMPANY — IS GONE, and its
+   * absence is what is asserted here instead.
    *
-   * PUT /api/preferences refuses that save, because the digest queue asks
-   * `EXISTS (user_companies …)` before it asks anything about a title: an account
-   * watching nothing matches nothing however good its keywords are. This is the
-   * screen saying so before the button is pressed, exactly as the blank range and
-   * the empty city selection do above.
+   * PUT /api/preferences used to refuse that save, because the digest queue asked
+   * `EXISTS (user_companies …)` before it asked anything about a title: an account
+   * watching nothing matched nothing however good its keywords were. The
+   * filter-first slice removed the clause, so watching nothing matches the whole
+   * catalog and there is no missing answer to grey the button for.
+   *
+   * Asserted as an ABSENCE rather than simply deleted, because a gate that comes
+   * back by accident is exactly the kind of regression nothing else here would
+   * catch: the button would silently refuse a save that the route now allows, and
+   * the person would be sent to a picker to fix a problem they do not have.
    */
-  console.log("\nPreferences — the watch-list save gate");
+  console.log("\nPreferences — the watch-list gate is gone");
   //
-  // The keyword list is trimmed to one for these two renders, and that is not
-  // cosmetic: the operator's stored row holds 43 keywords against a KEYWORD_CAP
-  // of 25, so `overCap` fires FIRST in the label chain and the button would read
-  // "Remove 18 keywords to save" whatever the watch list said. Checking the
-  // watch-list gate needs a row on which it is the only unmet condition.
+  // The keyword list is trimmed to one, and that is not cosmetic: the operator's
+  // stored row holds 43 keywords against a KEYWORD_CAP of 25, so `overCap` fires
+  // first in the label chain and the button would read "Remove 18 keywords to
+  // save" whatever else were true.
   const savable = { ...prefs, keywords: ["backend engineer"] };
   const noCompanies = withRouter(
-    createElement(lib.PreferencesEditor, { initial: savable, resume: null, watchedCount: 0 }),
+    createElement(lib.PreferencesEditor, { initial: savable, resume: null }),
   );
   check(
-    noCompanies.includes("Pick a company to watch to save"),
-    "with nothing watched, Save is disabled and says which answer is missing",
-    "the button did not name the empty watch list",
+    !noCompanies.includes("Pick a company to watch to save"),
+    "an account watching nothing is not blocked from saving",
+    "the button still names an empty watch list — the fifth gate is back",
   );
   check(
-    /would match nothing at all/.test(noCompanies) && noCompanies.includes('href="/watchlist"'),
-    "and the message links to the screen that fixes it — the picker is not on THIS page",
-    "a person on /preferences is told to pick companies with no way to get there",
-  );
-  const withCompanies = withRouter(
-    createElement(lib.PreferencesEditor, { initial: savable, resume: null, watchedCount: 3 }),
+    !/would match nothing at all/.test(noCompanies),
+    "and is not told its filter would match nothing",
+    "the empty-watch-list message is still rendered",
   );
   check(
-    !withCompanies.includes("Pick a company to watch to save"),
-    "and an account that watches something is not blocked by it",
+    noCompanies.includes("Save preferences") || noCompanies.includes("No changes"),
+    "the button reads normally with every other answer in place",
   );
 
   /*
@@ -1167,22 +1207,22 @@ async function main() {
     blank.includes('href="#cities"') && blank.includes('href="#experience"'),
     "and each one links to the section that fixes it, rather than just naming it",
   );
+  // The empty watch list was a sixth entry on this list until the filter-first
+  // slice. Asserted as an absence, for the same reason the button's own gate is
+  // above: an entry that comes back sends somebody to a picker to fix a problem
+  // they do not have.
   check(
-    noCompanies.includes("Watch at least one company"),
-    "an empty watch list is listed there too",
+    !blank.includes("Watch at least one company") &&
+      !noCompanies.includes("Watch at least one company"),
+    "and an empty watch list is NOT listed — it stopped being a missing answer",
+    "the watch-list blocker is back on the save bar",
   );
   check(
-    /class="save-blockers"[^]{0,400}href="\/watchlist"/.test(noCompanies),
-    "pointing at /watchlist by default, because on THIS page the picker is elsewhere",
-    "the watch-list blocker does not point anywhere useful",
+    configured.includes('class="save-state-ok"') && !configured.includes("save-blockers"),
+    "a form with every answer in says so instead of listing nothing",
   );
   check(
-    withCompanies.includes('class="save-state-ok"') &&
-      !withCompanies.includes("save-blockers"),
-    "and a form with every answer in says so instead of listing nothing",
-  );
-  check(
-    withCompanies.includes("Last saved"),
+    configured.includes("Last saved"),
     "with the last-saved time still on the bar, where the old panel used to carry it",
   );
 
@@ -1235,15 +1275,35 @@ async function main() {
     "with the save bar after every one of them, including the picker",
     "the save bar renders above a section, so it will stop being sticky there",
   );
+  /*
+   * TWO ASSERTIONS STOOD HERE AND THE FILTER-FIRST SLICE REMOVED WHAT THEY
+   * TESTED. They were that an account watching nothing could not finish setup
+   * ("Pick a company to watch to save"), and that the save bar's link for it
+   * pointed at the picker ON THIS PAGE (`#companies`) rather than at /watchlist,
+   * which the onboarding gate would have bounced straight back.
+   *
+   * Both were right while the digest queue opened with `EXISTS (user_companies …)`
+   * — an account pinning nothing matched nothing however good its keywords were,
+   * so it was a genuine missing answer and PUT /api/preferences refused the save.
+   * It matches the whole catalog now, so there is nothing to refuse and no answer
+   * missing. Asserted as an ABSENCE rather than deleted, because a gate that comes
+   * back sends somebody to a picker to solve a problem they do not have — and on
+   * the ONE screen where the picker is a section of this very form, that is a
+   * dead end with no error to explain it.
+   */
   check(
-    setupBlank.includes("Pick a company to watch to save"),
-    "an account watching nothing cannot finish setup, and the button says so",
+    !setupBlank.includes("Pick a company to watch to save"),
+    "an account watching nothing CAN finish setup — pinning is not a gate",
+    "the button still refuses over an empty watch list",
   );
   check(
-    /class="save-blockers"[^]*href="#companies"/.test(setupBlank),
-    "and the bar's link points at the picker ON THIS PAGE rather than at /watchlist, " +
-      "which the gate would bounce straight back",
-    "mid-setup the missing-companies link leads somewhere the gate refuses",
+    !/class="save-blockers"[^]*href="#companies"/.test(setupBlank),
+    "and the save bar does not list it as a missing answer",
+    "the watch-list blocker is back on the setup bar",
+  );
+  check(
+    setupBlank.includes('id="companies"'),
+    "while the picker itself is still a section of the form — removed as a GATE, not as a feature",
   );
   check(
     setupBlank.includes('type="search"') && setupBlank.includes("not watching any company"),

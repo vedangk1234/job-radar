@@ -26,31 +26,41 @@ import { watchlistCapForPlan } from "./labels";
  * lines of SQL. So the statement is written twice and guarded by a test, exactly
  * as the matcher and the resolver already are.
  *
- * ═══ CREATING A PAIR HAS TWO HALVES, AND THE SECOND ONE IS THE POINT ═══
+ * ═══ A PAIR USED TO HAVE TWO HALVES, AND THE FILTER-FIRST SLICE REMOVED ONE ═══
  *
- * A tracking row does not only say "send me this company's jobs". It also decides
- * what counts as this person's history. The digest queue
- * (notify/store.CANDIDATES_SQL) is:
+ * The digest queue (notify/store.CANDIDATES_SQL) used to be:
  *
- *     open, in a company you watch, not back catalogue, not yet sent to you
+ *     open, IN A COMPANY YOU WATCH, not back catalogue, not yet sent to you
  *
- * so the instant the pair exists, every job that company already holds is in that
+ * so the instant a pair existed, every job that company already held was in that
  * person's queue — hundreds of perfectly ordinary rows, open, never emailed to
- * anybody — and their first digest is an archive dump. `jobs.seeded` does not
- * cover this: it stops a company's FIRST-EVER crawl reaching anyone and says
- * nothing about the weeks of ordinary crawling after it, which is the door history
- * walks through.
+ * anybody — and their first digest was an archive dump. watchCompany() therefore
+ * wrote the pair AND recorded that company's stored jobs as already-notified, in
+ * one transaction, only on a genuine insert.
  *
- * So watchCompany() writes the pair AND records that company's stored jobs as
- * already-notified for that user, IN ONE TRANSACTION. Not tidiness: between the
- * two there is a state in which the pair exists and the suppression does not, and
- * the hourly digest runs in exactly that state if the process dies there.
+ * The queue does not read this table any more. Company tracking is unlimited and
+ * free, every account effectively sees the whole catalog, and what decides an
+ * inbox is a person's FILTER — so a pair grants nothing, and suppressing history
+ * on the strength of one takes away jobs the person is already owed:
  *
- * ONLY ON A GENUINE INSERT — the sharp edge. Suppression records every job the
- * company has RIGHT NOW as already-notified. Running it over a pair that already
- * exists would swallow everything that arrived since, which is somebody's actual
- * queue, silently. So it is driven by what `RETURNING` gave back against
- * `ON CONFLICT DO NOTHING`, which the table's UNIQUE makes exact.
+ *     you save your filter at T0, so everything matching then is suppressed. At
+ *     T1 job J appears at company X, matches, and enters your queue. At T2, before
+ *     the next digest, you pin X here — an act that grants you nothing you did not
+ *     already have — and the suppression records every stored job of X, J
+ *     included. J leaves your queue silently, behind a row saying it was meant.
+ *
+ * So the obligation moved rather than being kept as insurance: it hangs off the
+ * FILTER changing now, in lib/preferences.savePreferences, which is the port of
+ * notify/store.suppress_filter_backlog. This module writes `user_companies` and
+ * nothing else — tests/test_watchlist_write.py asserts that it is the only writer
+ * of that table, and that lib/preferences.ts is the only writer of the other.
+ *
+ * WHAT WOULD HAVE TO COME BACK, if the watch list ever becomes a filter dimension
+ * again (an opt-in "only email me companies I watch" is the obvious shape): the
+ * suppression, here, in one transaction, driven by `RETURNING` against
+ * `ON CONFLICT DO NOTHING` so it runs only on a genuine insert. Running it over a
+ * pair that already exists swallows everything that arrived since. See
+ * db/watchlist.track_companies, which carries the same note on the Python side.
  */
 
 /** How many companies this account watches, and the cap it is watching them under. */
@@ -63,14 +73,8 @@ export type WatchlistState = {
 
 /** What one add actually did, so the screen can say it rather than guess. */
 export type WatchResult = {
-  /** FALSE means the pair was already there — a no-op, and no history suppressed. */
+  /** FALSE means the pair was already there — a no-op. */
   inserted: boolean;
-  /**
-   * How many of that company's stored jobs were recorded as already-seen for this
-   * user by this call. THE NUMBER THAT SAYS THE FIRST DIGEST IS NOT AN ARCHIVE
-   * DUMP, so it is returned rather than logged: the picker prints it.
-   */
-  suppressed: number;
   /** The watch list size after the call. */
   watching: number;
 };
@@ -136,7 +140,7 @@ export async function watchlistState(userId: string): Promise<WatchlistState> {
 }
 
 /**
- * Start watching one company, and do not deliver its history.
+ * Start watching one company.
  *
  * The port of db/watchlist.track_companies for a single id, with one thing the
  * Python has no reason to carry: the per-plan cap, enforced here rather than in
@@ -156,17 +160,17 @@ export async function watchlistState(userId: string): Promise<WatchlistState> {
  *    23503 that reaches the screen as "server error"; with it the person is told
  *    which id was not found.
  * 3. the pair, `ON CONFLICT DO NOTHING RETURNING company_id`. No row back means
- *    already watching: return, having written nothing and — critically — having
- *    suppressed nothing.
+ *    already watching: return, having written nothing.
  * 4. the cap, checked AFTER the insert and on the resulting count. Checking
  *    before would refuse a re-add of a company the person already watches with a
  *    message about a limit, when the honest answer is "you already do". Over the
  *    cap the transaction is rolled back by the throw, so the refusal writes
  *    nothing at all.
- * 5. the history suppression, over EVERY job of that company — not only the open
- *    ones. A closed job that reopens keeps its identity and comes back
- *    `status = 'open'` from crawler/store.UPSERT_SEEN, so scoping this to open
- *    rows leaves a hole one flap wide.
+ *
+ * There was a fifth step until the filter-first slice — the history suppression —
+ * and the block comment at the top of this file is why it is not step 5 any more.
+ * The transaction survives it: the cap check still has to roll its own insert
+ * back, which is a guarantee about two statements rather than about three.
  */
 export async function watchCompany(userId: string, companyId: number): Promise<WatchResult> {
   return sql.begin(async (tx) => {
@@ -197,10 +201,8 @@ export async function watchCompany(userId: string, companyId: number): Promise<W
     `;
 
     if (inserted.length === 0) {
-      // Already watching it. Its history was suppressed when the pair was first
-      // created, and re-running the suppression now would swallow every job that
-      // has arrived since.
-      return { inserted: false, suppressed: 0, watching };
+      // Already watching it — nothing written, nothing to say.
+      return { inserted: false, watching };
     }
 
     const [account] = await tx<{ plan: string }[]>`
@@ -208,43 +210,25 @@ export async function watchCompany(userId: string, companyId: number): Promise<W
     `;
     const cap = watchlistCapForPlan(account?.plan);
     if (cap !== null && watching > cap) {
-      // The throw rolls the transaction back, so the pair inserted above is gone
-      // and no suppression ran. `watching - 1` is what they actually have, since
-      // the row being counted is the one about to disappear.
+      // The throw rolls the transaction back, so the pair inserted above is gone.
+      // `watching - 1` is what they actually have, since the row being counted is
+      // the one about to disappear.
       throw new WatchlistFullError(cap, watching - 1);
     }
 
-    // db/notifications.SUPPRESS_COMPANY_HISTORY_SQL, same modulo placeholders.
-    // INSERT ... SELECT rather than a loop for the reason the Python states: the
-    // set is decided by the database at the instant the statement runs, so there
-    // is no window between "which jobs does this company have" and "record them"
-    // for the two answers to disagree.
-    const suppressed = await tx<{ canonical_id: string }[]>`
-      INSERT INTO user_job_notifications (user_id, canonical_id)
-      SELECT ${userId}, j.canonical_id
-        FROM jobs j
-       WHERE j.company_id = ${companyId}
-      ON CONFLICT (user_id, canonical_id) DO NOTHING
-      RETURNING canonical_id
-    `;
-
-    return { inserted: true, suppressed: suppressed.length, watching };
+    return { inserted: true, watching };
   });
 }
 
 /**
  * Stop watching one company. Returns false if it was not being watched.
  *
- * THE SUPPRESSION ROWS ARE DELIBERATELY LEFT BEHIND, and that is the whole of
- * what this function decides. Deleting them would mean that untracking and
- * re-tracking re-delivers everything the company held in between — an inbox full
- * of postings a person once said they did not want to hear about, arriving
- * because they toggled a checkbox twice. Leaving them costs some rows that no
- * query joins to while the pair is absent, and db/watchlist.track_companies
- * already documents the re-track case as the one that proves the design: the
- * suppression runs again over a catalogue that has moved on, and every job it
- * names is either already recorded (a no-op) or history this person never asked
- * to hear about.
+ * It writes nothing but this row, which is a smaller claim than it used to be:
+ * while watching was a subscription, this function had to argue at length for
+ * LEAVING the suppression rows behind, because deleting them would have made an
+ * untrack/re-track cycle re-deliver everything the company held in between. There
+ * is no suppression tied to a pair any more, so there is nothing to leave behind
+ * and no cycle to worry about.
  *
  * Scoped by user_id AND company_id, so it can only ever remove the caller's own
  * row — the same shape as every other per-user statement in this app.
@@ -259,24 +243,24 @@ export async function unwatchCompany(userId: string, companyId: number): Promise
   return rows.length > 0;
 }
 
-/**
- * Does this account watch anything at all?
+/*
+ * watchesAnything() STOOD HERE AND WENT WITH THE ONBOARDING GATE.
  *
- * Read by PUT /api/preferences, which refuses to complete onboarding for an
- * account watching nothing — the fourth member of the family that already holds
- * the city answer, the keyword list and the work arrangement. An empty watch list
- * matches no job by construction: the queue's first clause is
- * `EXISTS (user_companies …)`, so a person released from onboarding without one
- * gets an empty digest and an empty Home, for a reason nothing on the screen
- * explains. See the route for why that refusal is the same argument as an empty
- * city selection rather than a new kind of rule.
+ * PUT /api/preferences was its only caller: it refused to complete onboarding for
+ * an account watching nothing, as the fifth member of the family holding the city
+ * answer, the keyword list, the experience range and the work arrangement. Every
+ * other member of that family guards a row that matches NO JOB AT ALL, and this
+ * one earned its place the same way — the queue's first clause was
+ * `EXISTS (user_companies …)`, so an account watching nothing matched nothing
+ * however good its keywords were.
  *
- * `EXISTS` rather than a count, because the question is existence — the same
- * reason notify/store.CANDIDATES_SQL asks it that way one table over.
+ * That is simply not true any more. An account watching nothing matches the whole
+ * catalog, so the refusal guarded nothing and required an answer that decided
+ * nothing — and on the screen, a required question whose answer changes no
+ * outcome is worse than no question. The picker stays, the cap stays, /watchlist
+ * stays; only the requirement went. See the route for the removal and
+ * tests/test_watchlist_write.py for the test that went with it.
+ *
+ * Deleted rather than left exported-and-unread, on this codebase's standing
+ * argument about statements nobody calls.
  */
-export async function watchesAnything(userId: string): Promise<boolean> {
-  const [row] = await sql<{ any_watched: boolean }[]>`
-    SELECT EXISTS (SELECT 1 FROM user_companies WHERE user_id = ${userId}) AS any_watched
-  `;
-  return row?.any_watched ?? false;
-}

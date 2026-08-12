@@ -26,13 +26,13 @@ import { descriptionHint } from "@/lib/match";
  *
  * THE BADGE
  * ---------
- * One per row, and which one depends on which question the screen is asking.
- * Home shows NEW or NOTIFIED — everything there matches, so the useful fact is
- * whether a digest has already mentioned it TO ME. Jobs shows SUGGESTED on the
- * rows that match and nothing on the rest — nothing there is filtered, so the
- * useful fact is the opposite one. Both are derived at render from data the row
- * already carries; see lib/badges.ts for why neither is a column, and why the
- * first pair is per-user since Phase 1f rather than a boolean on the job.
+ * At most one per row, and which one depends on which question the screen is
+ * asking. Home shows NEW on the matches still queued for my inbox and nothing on
+ * the ones already handled. Jobs shows SUGGESTED on the rows that match and
+ * nothing on the rest — nothing there is filtered, so the useful fact is the
+ * opposite one. Both are derived at render from data the row already carries; see
+ * lib/badges.ts for why neither is a column, why the per-user half arrived in
+ * Phase 1f, and why the NOTIFIED badge that used to sit beside NEW was removed.
  *
  * THE APPLIED CHECKBOX, AND WHY IT IS ONLY ON HOME
  * ------------------------------------------------
@@ -109,12 +109,17 @@ export function JobLine({
         {mode === "all" ? (
           <>
             <span className={job.status === "open" ? "tag on" : "tag off"}>{job.status}</span>
-            <span
-              className="muted small"
-              title="Whether a digest has told YOU about this job — a row in user_job_notifications, not a column on the job."
-            >
-              {job.user_notified ? "notified" : "not notified"}
-            </span>
+            {/*
+              A `notified` / `not notified` word sat here and said the same thing
+              the NOTIFIED badge said, so it went for the same reason: a
+              user_job_notifications row means "handled", which since the
+              filter-first slice is far more often a filter save recording the back
+              catalogue than an email that was sent. Printing "notified" beside a
+              job nobody was ever emailed about is the lie, and this screen is the
+              debugging view — the one place a wrong fact is most likely to be
+              believed. What a person needs here is `status` and SUGGESTED, both of
+              which are still on the row.
+            */}
           </>
         ) : null}
       </div>

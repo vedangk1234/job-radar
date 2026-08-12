@@ -63,13 +63,14 @@ export async function GET() {
 }
 
 /**
- * Start watching one company — and, in the same transaction, record its stored
- * jobs as already-seen so the first digest is not an archive dump.
+ * Start watching one company.
  *
- * The obligation is discharged in lib/watchlist.watchCompany rather than here,
- * deliberately: a route that did half of it and called a plain INSERT for the
- * other would be the loaded gun db/watchlist.py deleted its bulk statement to
- * avoid. This handler validates an integer and reports what happened.
+ * It also recorded that company's stored jobs as already-seen, in the same
+ * transaction, until the filter-first slice — because watching a company was what
+ * admitted its history to a digest. It is not any more, and suppressing on the
+ * strength of a pin would take away jobs the person's filter had already earned
+ * them; see lib/watchlist.watchCompany. This handler validates an integer and
+ * reports what happened, as it always did.
  *
  * 409 RATHER THAN 400 FOR THE CAP, and rather than 402. The request is
  * well-formed — `{"company_id": 12}` is exactly right — and what refuses it is
@@ -99,17 +100,18 @@ export async function POST(request: Request) {
       cap: state.cap,
       company_ids: state.companyIds,
       /*
-       * The suppression count is reported to the SCREEN and not only to a log,
-       * which is the one piece of UI opinion in this route. "Now watching Adobe"
-       * says nothing about the 214 stored postings that just became history; a
-       * person who was not told would reasonably expect them in the morning, and
-       * a digest that then contains three jobs looks broken rather than correct.
+       * A `suppressed` count travelled here until the filter-first slice, and the
+       * argument for reporting it to the SCREEN rather than to a log has simply
+       * moved rather than died: "Now watching Adobe" said nothing about the 214
+       * stored postings that had just become history, and a person who was not
+       * told would reasonably expect them in the morning. Watching a company no
+       * longer withholds anything — see lib/watchlist.watchCompany — so there is
+       * nothing to report here. The same sentence is now carried by PUT
+       * /api/preferences, where the withholding actually happens.
        */
-      suppressed: result.suppressed,
       message: result.inserted
-        ? `Now watching it. Its ${result.suppressed} stored job(s) were marked as ` +
-          `already seen, so your first digest carries only postings that arrive ` +
-          `from now on.`
+        ? "Now watching it. Your filter already covers every board we crawl — pinning is " +
+          "for keeping this one in view."
         : "You were already watching it — nothing changed.",
     });
   } catch (err) {
@@ -129,8 +131,10 @@ export async function POST(request: Request) {
 /**
  * Stop watching one company.
  *
- * The suppression rows stay — see lib/watchlist.unwatchCompany for why removing
- * them would make an untrack/re-track cycle re-deliver everything in between.
+ * It removes a pin and nothing else. There was a paragraph here about the
+ * suppression rows deliberately outliving the pair — removing them would have made
+ * an unwatch/re-watch cycle re-deliver everything held in between — and it went
+ * with the suppression itself in the filter-first slice.
  */
 export async function DELETE(request: Request) {
   const gate = await requireSession();
@@ -154,7 +158,8 @@ export async function DELETE(request: Request) {
       cap: state.cap,
       company_ids: state.companyIds,
       message: removed
-        ? "Stopped watching it. Its jobs will not appear in your digest or on Home."
+        ? "Unpinned. Its jobs still match your filter like any other board's — this only " +
+          "takes it off your pinned list."
         : "You were not watching it — nothing changed.",
     });
   } catch (err) {

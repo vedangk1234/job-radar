@@ -671,12 +671,17 @@ li.job.applied:hover {
 }
 
 /*
- * The status badges: NEW / NOTIFIED on Home, SUGGESTED on Jobs. One per row.
+ * The status badges: NEW on Home, SUGGESTED on Jobs. At most one per row.
  *
- * Smaller and louder than a `.tag` — uppercase, tracked out, and only NEW and
- * SUGGESTED carry the accent colour. NOTIFIED is deliberately the quiet one: it
- * is what almost every row says today, and a page of coloured badges is a page
- * with no signal on it. The colour marks the rows that want attention.
+ * Smaller and louder than a `.tag` — uppercase, tracked out, accent-coloured.
+ *
+ * THERE WAS A THIRD, `.badge.notified`, AND IT WAS THE QUIET ONE — no accent, on
+ * the argument that it is what almost every row says and a page of coloured
+ * badges is a page with no signal on it. The badge itself went in the filter-first
+ * slice because its copy stopped being true (see lib/badges.ts), and the quiet
+ * variant went with it. The base rule below is deliberately left carrying the
+ * unaccented look: it is what a future third badge would want, and it is what
+ * keeps `.badge` legible if one is added without a modifier.
  */
 .badge {
   display: inline-block;

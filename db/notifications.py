@@ -34,12 +34,17 @@ TWO KINDS OF ROW, AND NEITHER IS A LIE
 --------------------------------------
 Most rows here are receipts: notify/store.record_sent wrote them after Resend
 returned an id. The rest were written because the job must NEVER be emailed to
-that person — the Phase-1d backfill of everything the old global boolean
-covered, and (since 1e) SUPPRESS_COMPANY_HISTORY_SQL, which records a company's
-existing jobs the moment somebody starts tracking it. Both kinds say the same thing to the queue,
-which is the only thing that reads them: this person will not be told about this
-job. What they do not share is a `notifications` receipt, and that is honest —
-one was sent, the other never will be.
+that person — the Phase-1d backfill of everything the old global boolean covered,
+and (since the filter-first slice) notify/store.suppress_filter_backlog, which
+records what a new or widened FILTER has just admitted. Both kinds say the same
+thing to the queue, which is the only thing that reads them: this person will not
+be told about this job. What they do not share is a `notifications` receipt, and
+that is honest — one was sent, the other never will be.
+
+The second kind used to be written on a different trigger — SUPPRESS_COMPANY_
+HISTORY_SQL, when somebody started tracking a company — and that statement is
+gone with the watch-list gate. See the block where it stood for why the trigger
+moved and why it was deleted rather than parked.
 
 The silent seed is deliberately NOT handled by writing rows here. It is a
 property of a crawl rather than of a person, so it lives in jobs.seeded and the
@@ -89,46 +94,43 @@ RETURNING canonical_id
 """
 
 
-# THE OTHER HALF OF THE HISTORY HAZARD — a person, not a crawl.
+# THE OTHER HALF OF THE HISTORY HAZARD LIVED HERE UNTIL THE FILTER-FIRST SLICE,
+# AS SUPPRESS_COMPANY_HISTORY_SQL, AND IT IS GONE RATHER THAN LEFT UNUSED.
 #
-# jobs.seeded keeps a company's FIRST-EVER crawl out of everyone's digest. It
-# does nothing about the other way history reaches a new inbox: a user starts
-# tracking a company that has been in the catalog for weeks, whose recent
-# postings are perfectly ordinary rows — not seeded, never emailed to anyone,
-# sitting open. Nothing about those rows is special, and that is the problem:
-# there can be hundreds, and they would all be that person's first digest.
+# What it did: the moment a (user, company) pair was created, every job stored for
+# that company was recorded here as already-notified. "You start hearing about a
+# company when you add it, not from its archive." It existed because the digest
+# queue opened with `EXISTS (user_companies …)`, so creating a pair admitted that
+# company's whole stored history to somebody's queue in one instant — hundreds of
+# perfectly ordinary rows, not seeded, never emailed to anybody.
 #
-# So the moment a (user, company) pair is created, every job stored for that
-# company becomes that user's history and is recorded here. "You start hearing
-# about a company when you add it, not from its archive."
+# WHY IT WENT. The queue does not read user_companies at all now, so a pair admits
+# nothing, and suppressing on the strength of one WITHHOLDS jobs a person is
+# already owed. db/watchlist.track_companies spells out the sequence; the short
+# form is that pinning a company you already match would silently eat whatever
+# arrived at it since your last save, leaving a row claiming the withholding was
+# meant. The hazard itself is undiminished — a filter still admits history the
+# instant it exists or widens — but its TRIGGER moved from tracking a company to
+# changing a filter, which is where the match set is now decided. The replacement
+# is notify/store.suppress_filter_backlog, and it reuses RECORD_NOTIFIED_TEMPLATE
+# above rather than needing a statement of its own.
 #
-# THE ROWS THIS WRITES MEAN WHAT EVERY ROW HERE MEANS: this person will never be
-# emailed about this job. They carry no receipt because no email was sent, which
-# is the same shape the Phase-1d backfill's rows had, and notified_at takes its
-# DEFAULT for the same reason — it records when the state was written, nothing
-# branches on it, and inventing a send date would be the mistake source_posted_at
-# exists to name.
+# DELETED RATHER THAN KEPT AGAINST THE DAY THE WATCH LIST BECOMES A FILTER
+# DIMENSION AGAIN, on this codebase's own standing argument: a statement written
+# by nobody and read by nobody is worse than absent, because the next person to
+# find it reasonably assumes something depends on it. That is why Phase 1e deleted
+# db/watchlist.TRACK_ALL_COMPANIES_SQL and why 1g dropped jobs.notified rather
+# than leaving either as a net. The git history has the fifteen lines, and
+# db/watchlist.track_companies names what would have to come back with them.
 #
-# EVERY job of that company, not just the open ones. A closed job that reopens
-# gets status='open' and miss_count=0 back from crawler/store.UPSERT_SEEN while
-# keeping its identity — so scoping this to open rows would leave a hole that
-# takes exactly one flap to walk through, and `reappeared` is precisely the set
-# the crawler refuses to treat as news.
-#
-# INSERT ... SELECT rather than a Python loop, the same argument BACKFILL_SQL
-# above makes: the set is decided by the database at the instant the statement
-# runs, so there is no window between "which jobs does this company have" and
-# "record them" for the two answers to disagree. The
-# caller runs it in the same transaction as the tracking row itself, which closes
-# the same window one level up.
-SUPPRESS_COMPANY_HISTORY_SQL = """
-INSERT INTO user_job_notifications (user_id, canonical_id)
-SELECT $1, j.canonical_id
-  FROM jobs j
- WHERE j.company_id = $2
-ON CONFLICT (user_id, canonical_id) DO NOTHING
-RETURNING canonical_id
-"""
+# ONE PROPERTY OF IT IS WORTH CARRYING FORWARD IN PROSE, because the replacement
+# had to re-earn it and could easily not have. It covered EVERY job of the
+# company, not only the open ones: a closed job that reopens gets status='open'
+# and miss_count=0 back from crawler/store.UPSERT_SEEN while keeping its identity,
+# so an open-only suppression leaves a hole exactly one flap wide and `reappeared`
+# is the set the crawler most deliberately refuses to treat as news.
+# notify/store.SUPPRESSION_CANDIDATES_SQL is status-blind for that reason and for
+# no other.
 
 
 def record_notified_sql(count: int) -> str:
@@ -169,27 +171,6 @@ async def record_notified(conn, user_id: Any, canonical_ids: Iterable[str]) -> i
         rows = await conn.fetch(record_notified_sql(len(chunk)), user_id, *chunk)
         inserted += len(rows)
     return inserted
-
-
-async def suppress_company_history(conn, user_id: Any, company_id: int) -> list[str]:
-    """Record this company's stored jobs as already-notified for this user.
-
-    Returns the canonical_ids genuinely inserted. Called when a (user, company)
-    pair is created — see db/watchlist.track_companies, which runs it in the same
-    transaction as the tracking row, so there is no instant in which the pair
-    exists and its history does not.
-
-    Not wrapped in a transaction here for that reason: the caller holds one, and
-    a nested one would claim a guarantee this function cannot make on its own.
-
-    An empty list means every job of that company was already recorded for this
-    user — the ordinary result of untracking and re-tracking, which is exactly
-    the case that must not re-flood an inbox.
-    """
-    rows = await conn.fetch(SUPPRESS_COMPANY_HISTORY_SQL, user_id, company_id)
-    return [row["canonical_id"] for row in rows]
-
-
 
 
 async def count_notified_for_user(conn, user_id: Any) -> int:

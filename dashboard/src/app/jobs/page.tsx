@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-import { listWatchedCompanyCards } from "@/lib/companies";
+import { listCompanyCards } from "@/lib/companies";
 import { requirePage } from "@/lib/guard";
 import { CompanyList } from "@/components/CompanyList";
 
@@ -32,36 +32,36 @@ export const dynamic = "force-dynamic";
  * screen is the raw reference, and the tick belongs on the list of jobs worth
  * applying to.
  *
- * IT FOLLOWS HOME ONTO THE WATCH LIST, since the picker slice. The question this
- * screen exists to answer — "did the crawler miss it, or did the filter drop it?"
- * — is asked ABOUT a company whose matches you were expecting, and those are the
- * companies you watch. Keeping the catalog here while Home narrowed would make
- * the reference list and the list it is a reference FOR two different sets, which
- * is exactly the confusion the two-list problem creates. /watchlist browses
- * everything.
+ * IT FOLLOWS HOME, WHICHEVER LIST HOME IS ON, and that is the durable rule here
+ * rather than a fact about either slice. This screen is the reference FOR Home —
+ * "did the crawler miss it, or did the filter drop it?" is asked about a company
+ * whose matches you were expecting — so the reference list and the list it
+ * explains must be the same set. The picker slice narrowed both to the watch list;
+ * the filter-first slice widened both back to the catalog, because the digest is
+ * computed from the catalog again. What must never happen is the two disagreeing.
  */
 export default async function JobsPage() {
   const { userId } = await requirePage();
 
-  const companies = await listWatchedCompanyCards(userId);
+  const companies = await listCompanyCards(userId);
   const openJobs = companies.reduce((n, c) => n + c.open_jobs, 0);
 
   return (
     <>
       <h1>Jobs</h1>
       <p className="lede">
-        Every open job the crawler holds for the companies you watch —{" "}
-        <strong>{openJobs}</strong> across {companies.length} compan
-        {companies.length === 1 ? "y" : "ies"} — with no filtering at all. All seniorities, all
-        cities, sales and HR included. Read-only: the crawler owns this table.
+        Every open job the crawler holds — <strong>{openJobs}</strong> across{" "}
+        {companies.length} compan{companies.length === 1 ? "y" : "ies"} — with no filtering at
+        all. All seniorities, all cities, sales and HR included. Read-only: the crawler owns
+        this table.
       </p>
       <CompanyList
         initial={companies}
         mode="all"
         empty={
           <>
-            You are not watching any company yet, so this reference list is empty.{" "}
-            <Link href="/watchlist">Pick some on the Watchlist tab</Link>.
+            The catalog is empty, so there is nothing to list.{" "}
+            <Link href="/add">Add a company board</Link> to start crawling one.
           </>
         }
       />

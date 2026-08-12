@@ -35,9 +35,8 @@ from datetime import date
 import pytest
 
 from db.notifications import count_notified_for_user
-from db.watchlist import track_companies
 from notify.digest import run_digest, run_fan_out
-from notify.store import fetch_candidates
+from notify.store import fetch_candidates, load_preferences, suppress_filter_backlog
 from tests.conftest import (
     TEST_EMAIL,
     TEST_USER_ID,
@@ -82,18 +81,30 @@ async def test_each_user_gets_only_their_own_matches(two_users):
     assert [j["canonical_id"] for j in by_user[USER_B_EMAIL].matched] == ["b-pune-ml"]
 
 
-async def test_a_company_you_do_not_watch_never_reaches_you(two_users):
-    """The watch-list clause, on a job that would otherwise match perfectly.
+async def test_a_company_you_do_not_watch_still_reaches_you(two_users):
+    """THE INVERSE OF WHAT THIS ASSERTED BEFORE, AND THE SLICE IN ONE TEST.
 
-    B's filter would take this job on every other axis — it is an ML role in
-    Pune — and the only thing keeping it out of their digest is that they do not
-    watch the company. That is the clause 1e added, tested where it is the sole
-    difference.
+    It used to be test_a_company_you_do_not_watch_never_reaches_you, and it was
+    the watch-list clause tested where it was the sole difference: an ML role in
+    Pune that B's filter wanted on every axis, kept out of their digest by nothing
+    but the company it happened to be posted at.
+
+    That is exactly what filter-first stops doing. Company tracking is unlimited
+    and free, so the queue no longer asks whose board a job came from, and a job a
+    person's filter wants reaches them wherever it was posted. B watches only
+    Otherco and this job is at Testco; B gets it anyway.
+
+    Asserted on fetch_candidates rather than through a digest, because the queue is
+    where the clause was: the filter is applied afterwards, so a queue that still
+    narrowed by company would be invisible to a test that only read an inbox.
     """
     await two_users.add_job("a-only", title="Machine Learning Engineer",
                             company_id=1, location="Pune, India")
 
-    assert [j["canonical_id"] for j in await fetch_candidates(two_users, USER_B_ID)] == []
+    queued = [j["canonical_id"] for j in await fetch_candidates(two_users, USER_B_ID)]
+    assert queued == ["a-only"], (
+        "the queue is narrowing by company again — B does not watch Testco"
+    )
     assert [j["canonical_id"] for j in await fetch_candidates(two_users, TEST_USER_ID)] == ["a-only"]
 
 
@@ -188,18 +199,37 @@ async def test_a_seeded_back_catalogue_reaches_nobody(two_users):
     assert await two_users.notification_pairs() == set()
 
 
-async def test_tracking_a_company_mid_life_does_not_dump_its_history(two_users):
-    """The end-to-end version of the tracking hazard, through run_fan_out.
+async def test_widening_a_filter_mid_life_does_not_dump_the_catalogue(two_users):
+    """The end-to-end version of the history hazard, through run_fan_out.
 
-    Twenty ordinary open jobs — not seeded, never emailed, exactly what a company
-    crawled normally for a month looks like. B starts watching it and gets one
-    digest containing the single job that arrived afterwards, not twenty-one.
+    THE SAME TEST WITH ITS TRIGGER CHANGED, which is the whole of what the
+    filter-first slice did to this hazard. It used to be
+    test_tracking_a_company_mid_life_does_not_dump_its_history: twenty ordinary
+    open jobs, B starts WATCHING the company, and gets one digest containing the
+    single job that arrived afterwards rather than twenty-one.
+
+    Watching a company grants nothing now, so it cannot dump anything. Widening a
+    FILTER can, and by more: a new answer admits every stored row it covers across
+    the whole catalog, and none of those has a user_job_notifications row — those
+    are written when something is SENT, and nothing was ever sent for a job that
+    did not match. So nothing suppresses them and they would all go out as news
+    because a person edited a form. That is the "entering" direction
+    scripts/relabel_cities.report_blast_radius refuses to apply on, reached from
+    the other side: there a labeller moved a job into a filter, here the filter
+    moved onto the job.
+
+    B's fixture filter is ML in Pune, so none of the twenty match it. Widening to
+    A's filter admits all twenty at once, which is the archive dump; the delta
+    suppression is what turns it into one email about the job that arrived after.
     """
-    await same_filter_as_a(two_users)
     for n in range(20):
         await two_users.add_job(f"old-{n}", title="Backend Engineer", company_id=1)
 
-    await track_companies(two_users, USER_B_ID, [1])
+    before = await load_preferences(two_users, USER_B_ID)
+    await same_filter_as_a(two_users)
+    after = await load_preferences(two_users, USER_B_ID)
+    assert len(await suppress_filter_backlog(two_users, USER_B_ID, before, after)) == 20
+
     await two_users.add_job("brand-new", title="Backend Engineer", company_id=1)
 
     sender = RecordingSender()
@@ -235,7 +265,14 @@ async def test_one_users_failed_send_does_not_stop_the_others(two_users):
     failures = [email for _, email, _ in fan_out.failures]
     assert failures == [USER_B_EMAIL]
     assert await count_notified_for_user(two_users, USER_B_ID) == 0
-    assert [j["canonical_id"] for j in await fetch_candidates(two_users, USER_B_ID)] == ["b-pune-ml"]
+    # MEMBERSHIP RATHER THAN EQUALITY, since the filter-first slice, and the extra
+    # row is the property rather than a leak. B's queue is catalog-wide now, so it
+    # also holds the job A was just emailed — A's receipt is A's alone and silences
+    # nothing for B. What this test is about is that B's OWN match survived a failed
+    # send, so it asserts that directly and asserts the other row on purpose.
+    queued = {j["canonical_id"] for j in await fetch_candidates(two_users, USER_B_ID)}
+    assert "b-pune-ml" in queued, "a failed send consumed the queue it failed on"
+    assert "a-blr-backend" in queued, "A's successful send silenced a job for B"
 
 
 async def test_the_sandbox_sender_still_refuses_everyone_but_my_email(two_users, monkeypatch):
@@ -265,7 +302,9 @@ async def test_the_sandbox_sender_still_refuses_everyone_but_my_email(two_users,
     assert list(failures) == [USER_B_EMAIL]
     assert "sandbox sender" in failures[USER_B_EMAIL]
     assert await two_users.notification_pairs() == {(TEST_USER_ID, "a-blr-backend")}
-    assert [j["canonical_id"] for j in await fetch_candidates(two_users, USER_B_ID)] == ["b-pune-ml"]
+    # Membership, for the reason the test above gives: B's queue is catalog-wide
+    # since the filter-first slice and legitimately holds A's job too.
+    assert "b-pune-ml" in {j["canonical_id"] for j in await fetch_candidates(two_users, USER_B_ID)}
 
 
 async def test_a_users_digest_goes_to_their_own_address(two_users):
@@ -340,13 +379,22 @@ async def test_an_inactive_user_is_not_sent_to(two_users):
     assert [j["canonical_id"] for j in await fetch_candidates(two_users, USER_B_ID)] == ["b-pune-ml"]
 
 
-async def test_a_user_with_an_empty_watch_list_gets_nothing_and_is_not_an_error(digest_conn):
-    """No watch list is a quiet outcome, not a failure.
+async def test_a_user_with_an_empty_watch_list_still_matches_the_catalogue(digest_conn):
+    """AN EMPTY WATCH LIST IS NOT A FILTER, AND THIS IS THE SLICE STATED PLAINLY.
 
-    The state a Phase-2 signup starts in, before anybody picks a company. It must
-    read as "nothing matched" rather than as a broken account — and in particular
-    must not fall back to the whole catalog, which is what "the digest considers
-    every company" used to mean.
+    It used to assert the opposite — `candidates == 0` — with a docstring saying an
+    account that had picked no company "must not fall back to the whole catalog".
+    That was right while the queue's first clause was the watch list: falling back
+    would have meant a digest computed from a list nobody chose, which is the
+    seeded-defaults failure Slices 1b and 1c removed from the preferences row.
+
+    Under filter-first there is no fallback and no list to fall back FROM. Every
+    account is matched against every board we crawl, and what narrows it to a
+    person is their filter — so an account that has pinned no company is not a
+    broken account or a quiet one, it is an ordinary account.
+
+    B holds the seeded default filter, which wants a Bengaluru backend role, and
+    this is one. B watches nothing. B gets it.
     """
     await digest_conn.add_user(USER_B_ID, USER_B_EMAIL)
     await digest_conn.add_preferences_for(USER_B_ID)
@@ -355,7 +403,10 @@ async def test_a_user_with_an_empty_watch_list_gets_nothing_and_is_not_an_error(
     sender = RecordingSender()
     fan_out = await run_fan_out(digest_conn, today=TODAY, sender=sender)
 
-    assert [call["to"] for call in sender.calls] == [TEST_EMAIL]
     assert fan_out.failures == []
     by_user = {email: run for _, email, run in fan_out.runs}
-    assert by_user[USER_B_EMAIL].candidates == 0
+    assert by_user[USER_B_EMAIL].candidates == 1, (
+        "an account watching nothing read an empty queue — the gate is back"
+    )
+    assert [j["canonical_id"] for j in by_user[USER_B_EMAIL].matched] == ["visible-to-a"]
+    assert sorted(call["to"] for call in sender.calls) == sorted([TEST_EMAIL, USER_B_EMAIL])

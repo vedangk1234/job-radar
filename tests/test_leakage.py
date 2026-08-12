@@ -36,10 +36,12 @@ THE FIVE PROPERTIES, AND WHERE EACH ONE WAS ALREADY HALF-COVERED
     4  a shared job is one receipt per person
        — the pair rows were asserted in 1e; the `notifications` sent-log was not,
          and a flattened send would leave one receipt where there should be two.
-    5  tracking-time suppression is per-user
-       — every existing test looks at the person who tracked. None asserts that
-         the person who ALREADY watched that company is unaffected, which is the
-         actual per-user claim.
+    5  filter-time suppression is per-user
+       — every existing test looks at the person whose filter changed. None
+         asserts that the person who was ALREADY matching those jobs is
+         unaffected, which is the actual per-user claim. (It was tracking-time
+         suppression until the filter-first slice; the trigger moved, the
+         property did not.)
 
 The dashboard half of property 3 — a job notified to A reads NOTIFIED for A and
 NEW for B — cannot live here, because it is TypeScript reading a live database.
@@ -56,9 +58,13 @@ from datetime import date
 
 import pytest
 
-from db.watchlist import track_companies
 from notify.digest import run_fan_out
-from notify.store import fetch_candidates, record_sent
+from notify.store import (
+    fetch_candidates,
+    load_preferences,
+    record_sent,
+    suppress_filter_backlog,
+)
 from tests.conftest import (
     TEST_EMAIL,
     TEST_USER_ID,
@@ -99,39 +105,55 @@ def owned_by(pairs: set[tuple[str, str]], user_id: str) -> set[str]:
 async def test_no_job_crosses_between_two_digests(two_users):
     """The whole matrix in one fan-out: two axes, four cells, two digests.
 
-    test_fanout.py tests the watch list and the filter separately, each as the
-    sole difference between the two users. That is the right way to prove each
-    clause does its job, and it leaves one thing unasked: what happens to a job
-    that satisfies ONE axis for one person and the OTHER axis for the other. Those
-    are the two cells where a leak would actually live, because they are the rows
-    a query joining the wrong pair of tables would hand to somebody.
+    THE AXES CHANGED WITH THE FILTER-FIRST SLICE AND THE SHAPE DID NOT, which is
+    the thing to understand before editing this. The matrix used to be WATCH LIST
+    x FILTER, and its two interesting cells were the ones satisfying one axis for
+    one person and the other axis for the other — a job at A's company that only
+    B's filter wanted, and the reverse. Both went to nobody, because each was
+    wanted by one person and visible to the other.
 
-    So all four combinations exist here at once:
+    Neither of those cells exists now. There is no watch-list axis: a job at A's
+    company that B's filter wants is simply B's job, which is what
+    tests/test_fanout.test_a_company_you_do_not_watch_still_reaches_you asserts
+    directly. Deleting the matrix outright would have been wrong, though — the
+    PROPERTY it defends is that nothing of A's ever appears in B's answer, and
+    that property is undiminished. It just needs the axis that still separates
+    people.
 
-        a-co-a-filter   A's company, A's filter    -> A only
-        b-co-b-filter   B's company, B's filter    -> B only
-        a-co-b-filter   A's company, B's filter    -> NOBODY
-        b-co-a-filter   B's company, A's filter    -> NOBODY
+    So the second axis is now NOTIFICATION STATE, which is the other per-user
+    fact the queue reads:
 
-    The two "nobody" cells are the point. Each one is wanted by exactly one
-    person's filter and stored at a company exactly one person watches — and they
-    are not the same person, so neither is entitled to it.
+        a-filter-untold   A's filter, nobody told    -> A only
+        b-filter-untold   B's filter, nobody told    -> B only
+        a-filter-told-a   A's filter, already told A -> NOBODY
+        b-filter-told-b   B's filter, already told B -> NOBODY
+
+    The two "nobody" cells are still the point, and they are sharper than the ones
+    they replace: each is wanted by exactly one person's filter and has already
+    been recorded against exactly that person, so the only way either reaches an
+    inbox is a query that reads somebody else's notification rows.
+
+    THE COMPANIES ARE DELIBERATELY CROSSED — A's filter's jobs sit at B's company
+    and vice versa — so that a queue which quietly re-acquired a company gate
+    would empty both digests rather than passing.
     """
-    await two_users.add_job("a-co-a-filter", title="Backend Engineer",
-                            company_id=1, location="Bengaluru, India")
-    await two_users.add_job("b-co-b-filter", title="Machine Learning Engineer",
-                            company_id=2, location="Pune, India")
-    await two_users.add_job("a-co-b-filter", title="Machine Learning Engineer",
-                            company_id=1, location="Pune, India")
-    await two_users.add_job("b-co-a-filter", title="Backend Engineer",
+    await two_users.add_job("a-filter-untold", title="Backend Engineer",
                             company_id=2, location="Bengaluru, India")
+    await two_users.add_job("b-filter-untold", title="Machine Learning Engineer",
+                            company_id=1, location="Pune, India")
+    await two_users.add_job("a-filter-told-a", title="Backend Engineer",
+                            company_id=2, location="Bengaluru, India")
+    await two_users.add_job("b-filter-told-b", title="Machine Learning Engineer",
+                            company_id=1, location="Pune, India")
+    await two_users.notify_user(TEST_USER_ID, "a-filter-told-a")
+    await two_users.notify_user(USER_B_ID, "b-filter-told-b")
 
     sender = RecordingSender()
     fan_out = await run_fan_out(two_users, today=TODAY, sender=sender)
 
     by_user = {email: run for _, email, run in fan_out.runs}
-    assert {j["canonical_id"] for j in by_user[TEST_EMAIL].matched} == {"a-co-a-filter"}
-    assert {j["canonical_id"] for j in by_user[USER_B_EMAIL].matched} == {"b-co-b-filter"}
+    assert {j["canonical_id"] for j in by_user[TEST_EMAIL].matched} == {"a-filter-untold"}
+    assert {j["canonical_id"] for j in by_user[USER_B_EMAIL].matched} == {"b-filter-untold"}
 
     # And in the emails themselves, which is where a leak would be visible to a
     # person. Asserted in both directions rather than once: "A's job is in A's
@@ -139,19 +161,22 @@ async def test_no_job_crosses_between_two_digests(two_users):
     # second one is about isolation.
     a_body = sender.to(TEST_EMAIL)[0]["text"]
     b_body = sender.to(USER_B_EMAIL)[0]["text"]
-    assert "a-co-a-filter" in a_body
-    assert "b-co-b-filter" in b_body
-    for leaked in ("b-co-b-filter", "a-co-b-filter", "b-co-a-filter"):
+    assert "a-filter-untold" in a_body
+    assert "b-filter-untold" in b_body
+    for leaked in ("b-filter-untold", "a-filter-told-a", "b-filter-told-b"):
         assert leaked not in a_body
-    for leaked in ("a-co-a-filter", "a-co-b-filter", "b-co-a-filter"):
+    for leaked in ("a-filter-untold", "a-filter-told-a", "b-filter-told-b"):
         assert leaked not in b_body
 
-    # Nothing was recorded for the two cells nobody was entitled to, either —
-    # a job that reached no inbox but acquired a notification row would be
-    # silently withheld from whoever becomes entitled to it later.
+    # The two already-told rows kept their single owner, and the two fresh sends
+    # added exactly one row each. A job that reached no inbox but acquired a
+    # notification row would be silently withheld from whoever becomes entitled to
+    # it later, which is the failure with no visible symptom.
     assert await two_users.notification_pairs() == {
-        (TEST_USER_ID, "a-co-a-filter"),
-        (USER_B_ID, "b-co-b-filter"),
+        (TEST_USER_ID, "a-filter-untold"),
+        (TEST_USER_ID, "a-filter-told-a"),
+        (USER_B_ID, "b-filter-untold"),
+        (USER_B_ID, "b-filter-told-b"),
     }
 
 
@@ -285,19 +310,28 @@ async def test_a_shared_job_produces_one_receipt_per_person(two_users):
 # --- 5. tracking-time suppression is per-user ------------------------------
 
 
-async def test_one_users_tracking_suppresses_history_for_them_only(two_users):
-    """B starts watching a company A already watches. A's queue must not move.
+async def test_one_users_filter_save_suppresses_history_for_them_only(two_users):
+    """B widens their filter onto jobs A already matches. A's queue must not move.
 
-    db.watchlist.track_companies records every job the company currently has as
-    already-notified for the person who just started watching it — the archive
-    dump the silent seed does not cover. Every existing test looks at that person.
-    None of them asks the other question, which is the per-user one: A has been
-    watching this company all along, those jobs are A's legitimate queue, and the
-    suppression must not take a single one of them away.
+    THE SAME PROPERTY AS BEFORE WITH ITS TRIGGER MOVED. It was
+    test_one_users_tracking_suppresses_history_for_them_only, and it asked the
+    per-user half of the archive-dump guard: db.watchlist.track_companies recorded
+    a company's stored jobs as already-notified for whoever had just started
+    watching it, and every other test looked at that person. Nobody asserted the
+    other side — that A, who had been watching all along and whose legitimate queue
+    those jobs were, lost nothing.
+
+    Filter-first moved the suppression from tracking a company to widening a
+    filter, and the per-user question is identical: B's save must record twenty
+    rows against B and not one against A, and A's queue must be exactly what it
+    was.
 
     The failure this excludes is the worst-shaped one in the codebase — a job
     removed from somebody's queue by somebody else's action, leaving a row that
-    says the withholding was deliberate. Nothing would ever surface it.
+    says the withholding was deliberate. Nothing would ever surface it. It is also
+    the failure that made the track-time suppression unsafe to keep once the gate
+    was gone: pinning a company you already match would have swallowed whatever had
+    arrived at it since your last save. See db/watchlist.track_companies.
     """
     for n in range(20):
         await two_users.add_job(f"old-{n}", title="Backend Engineer", company_id=1)
@@ -306,14 +340,18 @@ async def test_one_users_tracking_suppresses_history_for_them_only(two_users):
     assert await queued_for(two_users, TEST_USER_ID) == history
     assert await two_users.notification_pairs() == set()
 
-    assert await track_companies(two_users, USER_B_ID, [1]) == [1]
+    # B's fixture filter wants ML in Pune, so none of these are theirs yet.
+    before = await load_preferences(two_users, USER_B_ID)
+    await same_filter_as_a(two_users)
+    after = await load_preferences(two_users, USER_B_ID)
+    assert set(await suppress_filter_backlog(two_users, USER_B_ID, before, after)) == history
 
     pairs = await two_users.notification_pairs()
     assert owned_by(pairs, USER_B_ID) == history, "B's own history was not suppressed"
     assert owned_by(pairs, TEST_USER_ID) == set(), (
-        "B tracking a company recorded rows against A"
+        "B saving a filter recorded rows against A"
     )
     assert await queued_for(two_users, USER_B_ID) == set()
     assert await queued_for(two_users, TEST_USER_ID) == history, (
-        "B tracking a company emptied A's queue"
+        "B saving a filter emptied A's queue"
     )

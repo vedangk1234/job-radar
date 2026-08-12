@@ -18,12 +18,12 @@ import { WatchlistPicker, type PickerCompany } from "./WatchlistPicker";
  * established that asymmetry on this screen; this adds a second thing on the
  * "commits immediately" side.
  *
- * So the state that has to be shared is one number: how many companies are
- * watched right now. Save is refused while that is zero — by the route, which is
- * where the rule lives, and by the button, which is where a person can see it
- * before pressing. A component that owns both children is the smallest way to
- * carry a number between two client components, and it keeps PreferencesEditor
- * ignorant of the picker: it takes a count, not a watch list.
+ * IT USED TO SHARE ONE NUMBER BETWEEN THE TWO — how many companies were watched —
+ * because Save was refused while that was zero, by the route and by the button
+ * alike. The filter-first slice removed the refusal: an account watching nothing
+ * matches the whole catalog now, so watching none is not a missing answer. The
+ * count is still held here for the section's own "3 of 5" tag, which is the picker
+ * describing itself rather than a gate.
  *
  * THE ORDER CHANGED WITH THE FORM SLICE, AND THE OLD REASON IS WORTH RECORDING
  * BECAUSE IT WAS NOT WRONG. The picker used to be FIRST, on the argument that the
@@ -38,8 +38,9 @@ import { WatchlistPicker, type PickerCompany } from "./WatchlistPicker";
  * asked what kind of job they wanted. Resume-first opens with the one thing they
  * already have, and the picker lands after the filter is described — which is
  * also the order the page's own copy has always read in. The picker still commits
- * immediately, still reports its suppression count, and Save is still refused
- * while nothing is watched; only its position on the page moved.
+ * immediately; only its position on the page moved. (It reported a suppression
+ * count too, until watching a company stopped being what withheld its history —
+ * see lib/watchlist.watchCompany.)
  *
  * IT IS PASSED AS A SECTION OF THE EDITOR'S FORM rather than rendered beside it,
  * so the sticky save bar stays the last element in the stack. See the
@@ -65,8 +66,6 @@ export function OnboardingSetup({
       initial={preferences}
       resume={resume}
       redirectOnSave="/"
-      watchedCount={watched.length}
-      watchlistHref="#companies"
       /*
        * EXCLUSIONS AND MAX LEVEL ARE NOT ON THIS SCREEN, and they are not dropped
        * from the save either — see the prop's own comment in PreferencesEditor.
@@ -80,8 +79,8 @@ export function OnboardingSetup({
       doneCopy={{
         title: "You're all set",
         body:
-          "Your filter is saved. We'll start watching your companies and email you the moment " +
-          "a matching role appears.",
+          "Your filter is saved. We match it against every board we crawl and email you the " +
+          "moment a new role fits — jobs already on the board are on your dashboard now.",
         action: "Go to dashboard",
       }}
       extraSections={
@@ -89,7 +88,7 @@ export function OnboardingSetup({
           id="companies"
           title="Companies to watch"
           tag={cap === null ? undefined : `${watched.length} of ${cap}`}
-          lede="We only email you jobs from companies you watch. The first question the digest asks about a job is whose board it came from, so pick at least one here or nothing above can match, however good the filter is."
+          lede="Optional. Your filter above is matched against every board we crawl, so you will hear about matching jobs whether or not you pin anything here. Pinning is for keeping an eye on the companies you care about most."
         >
           <WatchlistPicker
             catalog={catalog}

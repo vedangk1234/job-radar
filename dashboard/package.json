@@ -14,6 +14,7 @@
     "badge-check": "tsx scripts/badge-check.ts",
     "onboarding-check": "tsx scripts/onboarding-check.ts",
     "watchlist-check": "tsx scripts/watchlist-check.ts",
+    "filter-first-check": "tsx scripts/filter-first-check.ts",
     "delete-check": "tsx scripts/delete-check.ts",
     "resume-check": "tsx scripts/resume-check.ts",
     "skills-check": "tsx scripts/skills-check.ts",

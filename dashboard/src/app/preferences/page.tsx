@@ -66,19 +66,14 @@ export default async function PreferencesPage({
         companies it narrows is the other half, and that lives on the Watchlist tab.
       </p>
       {/*
-        watchedCount comes off the footprint that is already being loaded for the
-        delete section below — `accountFootprint().companies` IS the count of
-        user_companies rows — so the fifth save gate costs this page no query at
-        all. It is passed here as well as on /onboarding because the rule is
-        enforced by the route for every caller, and a Save that is refused by the
-        server while the button looks willing is the failure the other four gates
-        already avoid.
+        `watchedCount={footprint.companies}` was passed here until the filter-first
+        slice, to feed a fifth save gate that restated PUT /api/preferences' refusal
+        of an account watching nothing. Both are gone: an account watching nothing
+        matches the whole catalog now, so there was no answer missing to grey the
+        button for. The footprint is still loaded — the delete section below needs
+        it — and simply is not read by the editor any more.
       */}
-      <PreferencesEditor
-        initial={preferences}
-        resume={resume}
-        watchedCount={footprint.companies}
-      />
+      <PreferencesEditor initial={preferences} resume={resume} />
 
       <hr className="rule" />
 

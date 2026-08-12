@@ -24,18 +24,17 @@ backfill tracks every catalog row for the single user), but they answer differen
 questions and conflating them is how a dashboard toggle would silently stop a
 board being crawled for everyone else.
 
-CREATING A PAIR HAS TWO HALVES, SINCE PHASE 1e
------------------------------------------------
-A tracking row does not only say "send me this company's jobs" — it also decides
-what counts as this person's history. The fan-out queue is "open, in a company
-you watch, not back catalogue, not yet sent to you", so the moment the row exists
-every job that company already has is in that person's queue. jobs.seeded keeps a
-company's first-ever crawl out of everyone's digest and says nothing about the
-weeks of ordinary crawling after it.
-
-So track_companies() writes the pair and records the company's stored jobs as
-already-notified for that user, in one transaction, and it is the only path that
-writes this table. See db/notifications.SUPPRESS_COMPANY_HISTORY_SQL.
+A PAIR IS AN OVERLAY, NOT A SUBSCRIPTION — SINCE THE FILTER-FIRST SLICE
+-----------------------------------------------------------------------
+It was a subscription for two phases: the fan-out queue opened with
+`EXISTS (user_companies …)`, so a row here was what admitted a company's jobs to
+somebody's digest, and creating one therefore had a SECOND obligation — recording
+that company's stored jobs as already-notified, or the first digest was an archive
+dump. Company tracking is unlimited and free now, so the queue reads a person's
+FILTER instead and this table decides nothing about an inbox. The second half of
+track_companies() came out with the gate; see there for why leaving it in was the
+more dangerous option, and for what would have to come back if the watch list ever
+became a filter dimension again.
 
 The SQL lives here rather than in the backfill script so the statement the tests
 exercise is the statement production runs — the discipline
@@ -45,8 +44,6 @@ tests/test_applied_column.py established for the crawler's writes.
 from __future__ import annotations
 
 from typing import Any, Iterable
-
-from .notifications import suppress_company_history
 
 # The catalog as a set of ids. Read before the inserts by the backfill, so that
 # what the migration is responsible for is a snapshot rather than a moving
@@ -59,13 +56,13 @@ CATALOG_IDS_SQL = "SELECT id FROM companies ORDER BY id"
 # It used to be an `INSERT ... SELECT id FROM companies WHERE TRUE`, one
 # statement for the whole catalog, so that the set was decided by the database at
 # the instant it ran. That statement is gone rather than kept-but-unused, and
-# deliberately: since 1e, creating a pair has a SECOND obligation — recording the
-# company's stored history as already-notified for that user — and a bulk INSERT
-# that quietly skipped it would be a loaded gun left in the module, aimed at
-# whichever future caller reached for the convenient one. There is now no way to
-# create a tracking row without the suppression, because there is only one
-# statement and one function around it. (The lesson that statement carried is
-# worth keeping even though it is gone: SQLite cannot parse
+# deliberately: from 1e until the filter-first slice, creating a pair had a SECOND
+# obligation — recording the company's stored history as already-notified — and a
+# bulk INSERT that quietly skipped it would have been a loaded gun left in the
+# module, aimed at whichever future caller reached for the convenient one. The
+# obligation has since moved to the filter (see track_companies), so this is now
+# simply the one statement that creates a pair. (The lesson that statement carried
+# is worth keeping even though it is gone: SQLite cannot parse
 # `INSERT ... SELECT ... ON CONFLICT` when the SELECT has no WHERE — it reads the
 # `ON` as beginning a join — and documents `WHERE true` as the disambiguator.
 # db/notifications.py has two such statements and both have a real predicate
@@ -76,8 +73,8 @@ CATALOG_IDS_SQL = "SELECT id FROM companies ORDER BY id"
 # Python — the same idiom crawler/discover.TRACK_SQL uses to make "add a company"
 # safe to re-run. RETURNING company_id therefore yields a row only on a genuine
 # insert, which lets track_companies() tell "I have just started watching this"
-# from "I already was" — a distinction that is load bearing rather than
-# cosmetic here, because it is what decides whether history gets suppressed.
+# from "I already was" — a distinction that decided whether history was suppressed
+# until the filter-first slice, and is now what the caller reports.
 TRACK_ONE_COMPANY_SQL = """
 INSERT INTO user_companies (user_id, company_id)
 VALUES ($1, $2)
@@ -114,39 +111,54 @@ async def count_tracked(conn, user_id: Any) -> int:
 
 
 async def track_companies(conn, user_id: Any, company_ids: Iterable[int]) -> list[int]:
-    """Start watching these companies, and do not deliver their history.
+    """Start watching these companies.
 
     Returns the ids genuinely newly tracked; one already tracked contributes
     nothing, exactly as track_all_companies reports.
 
-    THE HISTORY SUPPRESSION IS THE WHOLE REASON THIS IS A FUNCTION AND NOT AN
-    INSERT. A company in the catalog has stored jobs — hundreds of them, open,
-    ordinary, never emailed to anybody. Since Phase 1e the digest queue is "open,
-    in a company you watch, not back catalogue, not yet sent to you", so the
-    instant this row exists every one of those jobs is in this person's queue and
-    their first digest is an archive dump. That is the cry-wolf failure this
-    codebase spends its guards on, arriving through the one door the silent seed
-    does not cover: jobs.seeded stops a company's FIRST-EVER crawl reaching
-    anyone, and says nothing about the weeks of ordinary crawling after it.
+    THIS FUNCTION USED TO HAVE A SECOND HALF AND THE FILTER-FIRST SLICE REMOVED
+    IT. Until then it wrote the pair AND recorded that company's stored jobs as
+    already-notified, in one transaction, because the digest queue opened with
+    `EXISTS (user_companies …)` — so the instant a pair existed, every job the
+    company already held was in that person's queue and their first digest was an
+    archive dump.
 
-    So the pair and its suppression are written in ONE TRANSACTION. Not as
-    tidiness: between the two there is a state where the user tracks the company
-    and the history is not yet recorded, and the hourly digest runs in that state
-    if the process dies there.
+    That was correct for as long as tracking a company was how somebody SUBSCRIBED
+    to it. It is not any more: the queue no longer reads this table at all, so a
+    pair grants nothing and withholding history on the strength of it is not
+    belt-and-braces, it is a write aimed at the wrong event. Concretely, and this
+    is why it had to come out rather than being left as harmless insurance:
 
-    ONLY ON A GENUINE INSERT, AND THIS IS THE SHARP EDGE. Suppression records
-    every job the company has RIGHT NOW as already-notified. Running it against a
-    pair that already exists would swallow the jobs that arrived since — the
-    person's actual queue — and silently. So the suppression is driven by what
-    RETURNING gave back, which the table's UNIQUE makes exact: a company already
-    tracked yields no row, so nothing is suppressed for it, so re-running this is
-    genuinely idempotent rather than idempotent-looking.
+        you save your filter at T0, so everything matching then is suppressed.
+        At T1 job J appears at company X, matches, and enters your queue. At T2,
+        before the next digest, you pin X on /watchlist — an act that under
+        filter-first grants you nothing you did not already have — and the
+        suppression records every stored job of X, J included. J leaves your queue
+        silently, and leaves behind a row saying the withholding was deliberate.
 
-    Untrack and re-track is the case that proves the design rather than a corner
-    of it: the pair is created again, so the suppression runs again, over a
-    catalogue that has moved on — and every job it names is either already
-    recorded (no-op) or is history this person genuinely never asked to hear
-    about. Neither can produce an email.
+    A job removed from somebody's queue by an unrelated action, with a receipt
+    claiming it was meant, is the worst-shaped failure in this codebase — it is
+    the one tests/test_leakage.py's fifth property exists to exclude. So the
+    obligation moved rather than being duplicated: it now hangs off the FILTER
+    changing, in notify/store.suppress_filter_backlog, which is where the match
+    set is now decided.
+
+    IF THE WATCH LIST EVER BECOMES A FILTER DIMENSION AGAIN — an opt-in "only
+    email me companies I watch" toggle is the obvious shape — the suppression has
+    to come back WITH it, in this function, in one transaction, driven by
+    RETURNING so it runs only on a genuine insert. Both halves of that sentence
+    are load bearing and the git history has the implementation: suppressing over
+    a pair that already exists swallows everything that arrived since, which is
+    somebody's actual queue.
+
+    db/notifications.SUPPRESS_COMPANY_HISTORY_SQL went WITH it rather than being
+    left in place for that day, and deliberately — this module deleted its own
+    bulk TRACK_ALL_COMPANIES_SQL on the identical argument in Phase 1e. A
+    statement written by nobody and read by nobody is worse than absent: the next
+    person to find it reasonably assumes something depends on it, and here the
+    first edit made on that assumption re-aims a suppression at an event that no
+    longer grants anything. Retrieving fifteen lines from the log is cheaper than
+    that.
     """
     ids = list(company_ids)
     if not ids:
@@ -157,9 +169,8 @@ async def track_companies(conn, user_id: Any, company_ids: Iterable[int]) -> lis
         for company_id in ids:
             rows = await conn.fetch(TRACK_ONE_COMPANY_SQL, user_id, company_id)
             if not rows:
-                continue  # already tracked: its history was suppressed back then
+                continue  # already tracked
             tracked.append(rows[0]["company_id"])
-            await suppress_company_history(conn, user_id, company_id)
 
     return tracked
 
@@ -170,12 +181,10 @@ async def track_all_companies(conn, user_id: Any) -> list[int]:
     An empty list means every company was already tracked, which is the ordinary
     result of a second run — not an error and not a no-op to report as a failure.
 
-    Goes through track_companies, so the history suppression cannot be skipped by
-    reaching for the migration path instead of the ordinary one. That matters
-    most for the one caller that exists: scripts/backfill_user_companies.py,
-    which is how a SECOND user would be handed the catalog — and handing someone
-    fifty companies' stored history without suppression is precisely the archive
-    dump described above, aimed at the newest account.
+    Goes through track_companies rather than restating its INSERT, which is what
+    keeps "there is one statement that creates a tracking row" true. That mattered
+    more when creating one carried a second obligation; it is still how the bulk
+    path and the ordinary path are kept from drifting.
 
     A company inserted into the catalog between the read below and the inserts is
     simply not tracked by this run. That window is not new and is not an
