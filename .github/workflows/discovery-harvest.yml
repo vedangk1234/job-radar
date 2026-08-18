@@ -1,0 +1,121 @@
+name: discovery-harvest
+
+# Harvest board tokens from the Common Crawl URL index into
+# discovered_companies. MANUAL ONLY — see the `on:` block below.
+#
+#   scripts/harvest_commoncrawl.py   query the CDX index, extract (ats, token),
+#                                    dedupe, write the new ones to the audit log
+#
+# This produces a LIST and nothing else. It fetches no board, runs no two-bar
+# test, and promotes nothing into `companies` — a row it writes has NULL
+# job_count and NULL city_hits because nothing has looked at that board yet.
+# Verification happens later, by scripts/run_discovery.py or by hand.
+
+on:
+  # workflow_dispatch ONLY. There is deliberately no `schedule:` here, and this
+  # is deliberately NOT a step in crawl.yml.
+  #
+  # crawl.yml runs hourly against ~50 tracked boards, which is a known, bounded
+  # amount of work. This walks an index of tens of thousands of URLs and can
+  # write thousands of rows. Hourly it would be a standing insult to a free
+  # public service and would bury the audit log in re-confirmations of what it
+  # already knew. Run it by hand when a new monthly crawl drops — roughly
+  # monthly, which is also how often the source data actually changes.
+  workflow_dispatch:
+    inputs:
+      crawl_id:
+        description: 'Crawl to query, e.g. CC-MAIN-2026-30 (blank = newest)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Report the per-ATS counts without writing anything'
+        type: boolean
+        required: false
+        default: false
+
+# Its own group, NOT job-radar-crawl. This must never queue behind — or hold
+# up — the hourly crawl: the two write different tables and have nothing to
+# serialise against each other. Two harvests at once would be pointless rather
+# than dangerous (the second would dedupe against the first's rows), so the
+# group only stops a double-click.
+concurrency:
+  group: job-radar-discovery-harvest
+  cancel-in-progress: false
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+
+    # A full harvest is ~13 CDX requests paced 5s apart plus ~9 MB of index
+    # to parse — a few minutes. 30 is headroom for the index answering slowly
+    # (it does 502 under load, and http.py retries with backoff) without a
+    # hung run holding the concurrency group indefinitely.
+    timeout-minutes: 30
+
+    env:
+      # The only secret this needs. No AWS credentials, no API key: the Common
+      # Crawl index is a free public HTTP endpoint and is read anonymously.
+      #
+      # CRAWLER_DB_URL must be the SESSION pooler (port 5432), same as crawl.yml
+      # — the direct db.<ref>.supabase.co endpoint is IPv6-only and these
+      # runners are IPv4-only.
+      CRAWLER_DB_URL: ${{ secrets.CRAWLER_DB_URL }}
+      # Read by fetchers/http.py for the User-Agent contact address, so whoever
+      # runs the Common Crawl index can reach a human about our traffic.
+      MY_EMAIL: ${{ secrets.MY_EMAIL }}
+      PYTHONUNBUFFERED: '1' # interleave print() with step output in real time
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Pinned rather than floating, matching crawl.yml: a new interpreter
+          # landing in the runner image must not change behaviour on a job
+          # that writes to the database.
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install runtime dependencies
+        # requirements.txt ONLY — nothing on the harvest path imports pytest.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify required secrets are present
+        # Presence only. The values are never printed or compared.
+        run: |
+          missing=
+          for name in CRAWLER_DB_URL MY_EMAIL; do
+            if [ -z "${!name}" ]; then
+              missing="$missing $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing"
+            echo "Set them at Settings -> Secrets and variables -> Actions." >&2
+            exit 1
+          fi
+          echo "Both required secrets are present."
+
+      - name: Harvest the Common Crawl index
+        # The report this prints is the point of the first run: per ATS, how
+        # many URLs matched, how many distinct tokens came out, how many were
+        # already known, and how many were stored. That table replaces every
+        # estimate anybody has made about the yield.
+        #
+        # Lever appears in it with 0 and a note saying why (its robots.txt
+        # disallows CCBot). That is the expected result, not a failure.
+        run: |
+          args=""
+          if [ -n "${{ inputs.crawl_id }}" ]; then
+            args="$args --crawl-id ${{ inputs.crawl_id }}"
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args="$args --dry-run"
+          fi
+          echo "running: python scripts/harvest_commoncrawl.py$args"
+          python scripts/harvest_commoncrawl.py $args
