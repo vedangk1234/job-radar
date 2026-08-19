@@ -51,7 +51,21 @@ import { AppRouterContext } from "next/dist/shared/lib/app-router-context.shared
 import { PathnameContext } from "next/dist/shared/lib/hooks-client-context.shared-runtime";
 
 import { CompanyList } from "../src/components/CompanyList";
+// Static for CompanyList's reason, checked the same way: CompanyJobs reaches
+// JobLine and lib/cards, and lib/cards imports only lib/labels (which imports
+// nothing) plus an `import type` of lib/companies that is erased. Nothing on that
+// graph builds a database pool.
+import { CompanyJobs } from "../src/components/CompanyJobs";
 import { JobLine, type Mode } from "../src/components/JobLine";
+import {
+  defaultSortMode,
+  freshnessLabel,
+  GRID_CAP,
+  monogram,
+  sortCards,
+  topCityChips,
+} from "../src/lib/cards";
+import { displayKeyword } from "../src/lib/labels";
 // Static for the reason CompanyList is: its lib/companies import is `import
 // type` and erased, and the only other things it reaches are React and the DOM.
 // Nothing on that graph builds a database pool.
@@ -108,6 +122,13 @@ type Lib = {
    */
   PreferencesEditor: typeof import("../src/components/PreferencesEditor").PreferencesEditor;
   /**
+   * Deferred because lib/preferences imports lib/db. It is here for one
+   * assertion and it is the important half of the ALL-CAPS keyword rule: that
+   * the transform is display-only, proved in the direction that could actually
+   * break the digest — what goes INTO the row is still lowercase.
+   */
+  cleanList: typeof import("../src/lib/preferences").cleanList;
+  /**
    * Deferred for exactly DeleteAccount's reason: Nav imports the sign-out server
    * action from app/actions, which imports lib/account, which imports lib/db. A
    * static import would build the pool before loadEnv() and throw before the first
@@ -151,6 +172,7 @@ async function loadLib(): Promise<Lib> {
     watchlistState: watchlist.watchlistState,
     FREE_WATCHLIST_CAP: labels.FREE_WATCHLIST_CAP,
     loadPreferences: preferences.loadPreferences,
+    cleanList: preferences.cleanList,
     DeleteAccount: deleteAccount.DeleteAccount,
     PreferencesEditor: editor.PreferencesEditor,
     Nav: nav.Nav,
@@ -583,6 +605,324 @@ async function main() {
     companyMarkup.includes("<select"),
     "and the category select — the one control that legitimately stays — is still there",
   );
+
+  /*
+   * --- HOME: THE CARD GRID -------------------------------------------------
+   *
+   * Phase 3 Slice 2. Rendered from the SHIPPED component over the LIVE cards
+   * Home actually passes it, because every failure this section is written for
+   * is invisible to a type checker and to a query: a chip row that stops
+   * rendering, a big number reading the wrong field, a freshness tag on a company
+   * with nothing relevant, a NOTIFIED badge finding its way back in.
+   *
+   * What it deliberately does NOT assert is that five cards fit across a row.
+   * That is CSS and a viewport, which is where this script has always stopped —
+   * and it is why the browser pass is a required step before this slice is
+   * committed rather than a nice-to-have.
+   */
+  console.log("\nHome — the card grid");
+  const gridCards = [...companies].sort((a, b) => b.match_jobs - a.match_jobs || a.name.localeCompare(b.name));
+  const richest = gridCards[0];
+  const grid = renderToStaticMarkup(
+    createElement(CompanyList, {
+      initial: gridCards.slice(0, GRID_CAP) as CompanyCard[],
+      mode: "matches" as Mode,
+      variant: "grid" as const,
+      now: new Date().toISOString(),
+    }),
+  );
+
+  check(grid.includes('class="company-grid"'), "the grid renders as a grid, not as the row list");
+  check(
+    !grid.includes('class="companies"'),
+    "and not as both — the list variant is /jobs's and must not come along",
+  );
+  const cardCount = (grid.match(/class="company-card/g) ?? []).length;
+  check(
+    cardCount === Math.min(gridCards.length, GRID_CAP),
+    `every one of the ${Math.min(gridCards.length, GRID_CAP)} companies is a card`,
+    `rendered ${cardCount}`,
+  );
+  check(
+    gridCards.filter((c) => c.match_jobs === 0).length > 0
+      ? grid.includes(">0<")
+      : true,
+    "a company with nothing relevant is still on the grid, stating its 0 — the catalog " +
+      "is the filler and there is no empty state",
+    "a zero-relevance company was dropped from the grid",
+  );
+  check(grid.includes('class="company-logo'), "each card carries a logo mark");
+  check(
+    !grid.includes("<img") && !grid.includes("https://"),
+    "which fetches NOTHING — the monogram is a placeholder and real logos are Slice 3",
+    "the card grid is making a network request for a logo",
+  );
+  check(
+    grid.includes(`>${monogram(richest.name)}<`),
+    `the mark is the company's monogram — "${richest.name}" reads ${monogram(richest.name)}`,
+  );
+  check(grid.includes(richest.name), "the company name is on the card in full");
+  check(
+    grid.includes('class="card-count hit"'),
+    "the relevant-roles count is the one number with a colour on it",
+    "no card carried the accent count — is any company matching?",
+  );
+  check(
+    new RegExp(`<strong class="num">${richest.match_jobs}</strong>`).test(grid),
+    `and it is the count itself — ${richest.match_jobs} for "${richest.name}"`,
+  );
+  check(/relevant role/.test(grid), "labelled in words rather than as a bare figure");
+
+  /*
+   * THE CHIP ROW. Every number in it is inside this account's city answer, which
+   * is a property of where the counts come from rather than a rule the card
+   * applies — see lib/jobs.matchCountsByCompany. What is checkable here is that
+   * the arithmetic reached the markup and agrees with the big number beside it.
+   */
+  const { chips, more } = topCityChips(richest.city_counts);
+  check(chips.length > 0, `the richest company has a city breakdown (${chips.length} cities)`);
+  check(
+    grid.includes(`${richest.match_jobs} role`),
+    "the chip row opens with the total, the same number as the big count",
+  );
+  for (const chip of chips) {
+    check(
+      grid.includes(`${chip.count} ${chip.label}`),
+      `a chip reads "${chip.count} ${chip.label}" — the stored label, shouted`,
+    );
+    check(
+      grid.includes(`in ${chip.name} (${chip.label.toLowerCase()})`),
+      `and its tooltip names ${chip.name} and the slug behind it`,
+    );
+  }
+  check(
+    !/\b(BOM|PNQ|DEL|MAA|HYA)\b/.test(grid),
+    "no airport codes anywhere — the project owns ONE city vocabulary and a chip " +
+      "must not invent a second",
+    "an airport code reached the chip row",
+  );
+  check(
+    more > 0 ? grid.includes("+more") : !grid.includes("+more"),
+    more > 0
+      ? `"+more" covers the ${more} cities past the top three`
+      : "no +more, because no company here has more than three cities",
+  );
+  check(
+    /\d+ total job/.test(grid),
+    "total jobs is on the card as faint secondary context",
+  );
+
+  /*
+   * THE FRESHNESS TAG comes from the freshest relevant role, so a company with
+   * none must not have one. Both directions, because the failure that matters is
+   * the tag rendering "new today" beside a zero.
+   */
+  const freshest = gridCards.find((c) => c.latest_match_at !== null);
+  const barren = gridCards.find((c) => c.match_jobs === 0);
+  check(Boolean(freshest), "at least one company has a freshest-relevant-role timestamp");
+  if (freshest) {
+    check(
+      grid.includes(`first seen at ${freshest.latest_match_at}`),
+      `the tag's tooltip names the exact instant — "${freshest.name}"`,
+    );
+  }
+  if (barren) {
+    const alone = renderToStaticMarkup(
+      createElement(CompanyList, {
+        initial: [barren] as CompanyCard[],
+        mode: "matches" as Mode,
+        variant: "grid" as const,
+        now: new Date().toISOString(),
+      }),
+    );
+    check(
+      !alone.includes('class="card-fresh"') && !alone.includes('class="card-chips"'),
+      `a company with 0 relevant roles gets no freshness tag and no chip row — "${barren.name}"`,
+      "a card with nothing relevant is claiming freshness",
+    );
+    check(
+      alone.includes('class="card-count"') && alone.includes(">0<"),
+      "it states its zero instead, quietly and without the accent",
+    );
+  }
+
+  // The sort control, and the absence of a NOTIFIED badge anywhere on this screen.
+  check(grid.includes('aria-label="Sort companies"'), "the sort dropdown is on the page");
+  for (const label of ["Latest relevant role", "Highest relevant count", "Alphabetical A–Z"]) {
+    check(grid.includes(label), `it offers "${label}"`);
+  }
+  check(
+    !grid.includes(">NOTIFIED<") && !grid.includes('class="badge notified"'),
+    "and no NOTIFIED badge exists anywhere on the grid",
+    "the NOTIFIED badge is back",
+  );
+
+  /*
+   * THE TWO CONTROLS MOVED INTO THE PANEL, AND THE SECURITY ASSERTIONS MOVED WITH
+   * THEM RATHER THAN BEING DROPPED. A card's whole face is the disclosure button,
+   * so a <select> could not live on it — nesting one inside a <button> is invalid
+   * HTML and the card would open every time the tag was changed. Both are still
+   * rendered, still exactly once, and still present in the markup of a CLOSED card
+   * because the panel is `hidden` rather than absent.
+   */
+  check(
+    grid.includes(">tracked<") || grid.includes(">off<"),
+    "the tracked/off pill is still SHOWN on the grid — the fact is worth reading",
+    "the card grid dropped the crawl-flag pill entirely",
+  );
+  check(!grid.includes('aria-label="Track '), "there is no `Track <company>` control on a card");
+  check(!grid.includes('class="switch"'), "and no switch label that could carry one");
+  check(
+    !grid.includes('type="checkbox"'),
+    "a closed card renders no checkbox at all (the Applied box lives on a job, not a company)",
+  );
+  /*
+   * NAMED, NOT COUNTED. `includes("<select")` passes on this markup whatever
+   * happens to the category control, because the sort dropdown is a <select> too
+   * — a mutation that deleted the panel's controls entirely was caught by the
+   * pill assertion above and NOT by this one until it named the thing it means.
+   */
+  check(
+    grid.includes(`Category for ${richest.name}`),
+    "the category select survived the move into the panel, named for a screen reader",
+  );
+  check(
+    (grid.match(/<select/g) ?? []).length === Math.min(gridCards.length, GRID_CAP) + 1,
+    "one category select per card, plus the one sort dropdown — no control was duplicated " +
+      "by rendering the shared block in two places",
+    `${(grid.match(/<select/g) ?? []).length} selects for ${Math.min(gridCards.length, GRID_CAP)} cards`,
+  );
+  check(
+    grid.includes('class="card-body"') && grid.includes("hidden="),
+    "which is inside a panel that is hidden rather than absent",
+  );
+
+  /*
+   * --- HOME: AN OPEN CARD, GROUPED BY CITY ---------------------------------
+   *
+   * The expanded card is fetched in the browser, so its markup exists in no
+   * server render and would be the one part of this slice nothing could check
+   * without a browser. CompanyJobs is presentational precisely so it can be
+   * rendered here over LIVE rows from the same lib function the route calls.
+   */
+  console.log("\nHome — an open card, grouped by city");
+  const openCard = renderToStaticMarkup(
+    createElement(CompanyJobs, { jobs: home, mode: "matches" as Mode, onApplied: () => {} }),
+  );
+  const cityLabels = [...new Set(home.map((j) => j.city ?? ""))];
+  check(cityLabels.length > 0, `the live match set spans ${cityLabels.length} cit(y/ies)`);
+  for (const label of cityLabels) {
+    check(
+      openCard.includes(`>${label ? label.toUpperCase() : "—"}<`),
+      `every city in the match set gets a heading — ${label || "(unlabelled)"}`,
+    );
+  }
+  check(
+    (openCard.match(/class="city-group"/g) ?? []).length === cityLabels.length,
+    "one group per city, ALL of them — not the three the chip row had room for",
+  );
+  // `<li class="job` with the delimiter, not a bare `class="job` — the row also
+  // carries job-line, job-meta and job-title, so the loose form counts four per
+  // job and passes for the wrong reason on any list of the wrong length.
+  const rowsRendered = (openCard.match(/<li class="job[ "]/g) ?? []).length;
+  check(
+    rowsRendered === home.length,
+    `every one of the ${home.length} matching jobs is in a group — none lost to the grouping`,
+    `${rowsRendered} rendered`,
+  );
+  check(openCard.includes('type="checkbox"'), "the Applied checkbox is on the rows in an open card");
+  check(
+    openCard.includes('rel="noopener noreferrer"'),
+    "and the title is still the apply link, opening in a new tab",
+  );
+  check(
+    !openCard.includes(">NOTIFIED<"),
+    "no NOTIFIED badge inside an open card either",
+  );
+
+  /*
+   * SALARY, when the posting states any. It renders on nothing today — salary_min
+   * and salary_max are NULL on every row of the live board — so this is asserted
+   * over a synthetic row, and the ABSENCE is asserted over the live one. Both
+   * halves matter: a pay tag that never renders is indistinguishable from one
+   * that cannot.
+   */
+  const priced = render({ ...home[0], salary_min: "15", salary_max: "25" }, "matches");
+  check(priced.includes("₹15L – ₹25L"), "a posting that states pay shows it, normalised to LPA");
+  const halfPriced = render({ ...home[0], salary_min: "18", salary_max: null }, "matches");
+  check(halfPriced.includes("₹18L+"), "a half-stated range is unbounded on the missing side");
+  check(
+    !render({ ...home[0], salary_min: null, salary_max: null }, "matches").includes("₹"),
+    "and an unpriced posting shows no pay tag at all — which is every live row today",
+  );
+
+  /*
+   * --- THE CARD GRID'S ARITHMETIC ------------------------------------------
+   *
+   * The order, the default it opens on, the freshness ladder and the chip
+   * arithmetic are decisions with off-by-ones in them, and each is a pure
+   * function precisely so it can be checked here rather than squinted at in a
+   * browser.
+   */
+  console.log("\nHome — the sort, the default, and the freshness ladder");
+  const mkCard = (over: Partial<CompanyCard>): CompanyCard =>
+    ({ ...gridCards[0], ...over }) as CompanyCard;
+  const a = mkCard({ id: 1, name: "Alpha", match_jobs: 2, latest_match_at: "2026-08-01T00:00:00.000Z", queued: 0 });
+  const b = mkCard({ id: 2, name: "Beta", match_jobs: 9, latest_match_at: "2026-08-10T00:00:00.000Z", queued: 0 });
+  const c = mkCard({ id: 3, name: "Cadmium", match_jobs: 0, latest_match_at: null, queued: 0 });
+
+  check(
+    sortCards([a, b, c], "count").map((x) => x.name).join() === "Beta,Alpha,Cadmium",
+    "highest-count sorts by the big number, then by name",
+  );
+  check(
+    sortCards([a, b, c], "name").map((x) => x.name).join() === "Alpha,Beta,Cadmium",
+    "alphabetical sorts by name alone",
+  );
+  check(
+    sortCards([a, b, c], "latest").map((x) => x.name).join() === "Beta,Alpha,Cadmium",
+    "latest sorts by the freshest relevant role — one new job floats a whole company",
+  );
+  check(
+    sortCards([c, a, b], "latest")[2].name === "Cadmium",
+    "and a company with nothing relevant sorts LAST there, not first",
+    "null latest_match_at sorted to the top",
+  );
+  check(
+    defaultSortMode([a, b, c]) === "count",
+    "with nothing queued, the grid opens on highest-count — the browsing order",
+  );
+  check(
+    defaultSortMode([a, { ...b, queued: 1 }, c]) === "latest",
+    "and on latest the moment one match has not been sent to me yet — the NEW badge, " +
+      "asked per company",
+  );
+
+  const ago = (minutes: number) =>
+    freshnessLabel(
+      new Date(Date.UTC(2026, 7, 12, 12, 0, 0) - minutes * 60000).toISOString(),
+      new Date(Date.UTC(2026, 7, 12, 12, 0, 0)),
+    );
+  check(ago(10) === "new today", "under an hour old reads 'new today' — one hourly crawl ago");
+  check(ago(120) === "2h ago", "two hours reads '2h ago'");
+  check(ago(60 * 30) === "yesterday", "a day and a bit reads 'yesterday'");
+  check(ago(60 * 24 * 3) === "3d ago", "three days reads '3d ago'");
+  check(ago(60 * 24 * 30) === "13 Jul", "past a week it becomes a date");
+  check(freshnessLabel(null) === null, "and a company with no relevant role has no tag at all");
+  check(
+    topCityChips({ blr: 5, hyd: 4, pnq: 4, mumbai: 1 }).chips.map((x) => x.label).join() ===
+      "BLR,HYD,PNQ",
+    "the chip row takes the top three by count, ties broken alphabetically",
+  );
+  check(
+    topCityChips({ blr: 5, hyd: 4, pnq: 4, mumbai: 1 }).more === 1,
+    "and counts the rest as +more",
+  );
+  check(
+    topCityChips({ blr: 5, hyd: 4, pnq: 4, mumbai: 1 }).total === 14,
+    "the total is every relevant role, which the three chips need not add up to",
+  );
+
 
   /*
    * --- Watchlist — the company picker, and what Home now lists --------------
@@ -1395,6 +1735,44 @@ async function main() {
       setupWatching.includes('class="save-state-ok"'),
     "and once a company is watched the bar reports the form as answerable",
     "a complete onboarding form still reads as blocked",
+  );
+
+  /*
+   * --- KEYWORDS ARE SHOUTED ON SCREEN AND LOWERCASE IN THE ROW --------------
+   *
+   * Both directions, because only one of them can break the digest.
+   * notify/match.py compares against a lowercased title, so a keyword STORED as
+   * "LLM" would match nothing at all — silently, forever. The display half is
+   * asserted in the markup of the shipped component; the storage half is asserted
+   * against the shipped cleanList, which is what PUT /api/preferences runs.
+   *
+   * Here rather than beside the card grid because it needs the stub router that
+   * PreferencesEditor's useRouter() call demands — see the experience-panel
+   * section above.
+   */
+  console.log("\nKeywords — ALL CAPS on screen, lowercase in the row");
+  check(displayKeyword("llm") === "LLM", "the display transform shouts a keyword");
+  check(
+    lib.cleanList(["LLM", "Backend Engineer"]).join() === "llm,backend engineer",
+    "and the SAVE path still lowercases — the stored value is untouched by it",
+    "cleanList stopped lowercasing, which would silently empty the digest",
+  );
+  const shouted = withRouter(
+    createElement(lib.PreferencesEditor, {
+      initial: { ...prefs, keywords: ["llm", "react native"] },
+      resume: null,
+    }),
+  );
+  check(shouted.includes(">LLM"), "a keyword chip renders LLM");
+  check(shouted.includes("REACT NATIVE"), "and a multi-word one renders REACT NATIVE");
+  check(
+    !shouted.includes(">llm<") && !shouted.includes(">react native<"),
+    "the lowercase spelling is not what a person reads",
+  );
+  check(
+    shouted.includes('aria-label="Remove LLM"'),
+    "the remove control's accessible name matches what is on screen",
+    "a screen reader would hear a different string than the chip shows",
   );
 
   // --- the ordering rule --------------------------------------------------

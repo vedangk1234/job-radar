@@ -2,7 +2,7 @@
 
 import { badgeClass, homeBadge, jobsBadge } from "@/lib/badges";
 import type { JobView } from "@/lib/jobs";
-import { descriptionHint } from "@/lib/match";
+import { descriptionHint, salaryOf } from "@/lib/match";
 
 /**
  * One job row, on either screen.
@@ -60,6 +60,7 @@ export function JobLine({
 }) {
   const hint = descriptionHint(job);
   const badge = mode === "matches" ? homeBadge(job) : jobsBadge(job);
+  const pay = salaryLabel(job);
 
   return (
     <li className={`job${job.applied ? " applied" : ""}`}>
@@ -89,6 +90,15 @@ export function JobLine({
       <div className="job-meta">
         <span className="tag">{job.city ?? "—"}</span>
         {job.location ? <span className="muted small">{job.location}</span> : null}
+        {/*
+          Pay, when the posting states any. See salaryLabel below for why "states
+          any" is read off the two numbers rather than off `salary_checked`.
+        */}
+        {pay ? (
+          <span className="tag pay" title="The pay this posting states, normalised to LPA.">
+            {pay}
+          </span>
+        ) : null}
         {job.is_pm_role ? (
           <span className="tag" title="The description frames this as a product/people management role.">
             PM
@@ -125,6 +135,39 @@ export function JobLine({
       </div>
     </li>
   );
+}
+
+/**
+ * The pay this posting states, in LPA, or null when it states none.
+ *
+ * READ OFF THE TWO NUMBERS RATHER THAN OFF `salary_checked`, and the distinction
+ * is worth one paragraph because the column exists precisely to be that
+ * distinction. `salary_checked` means "a parser has read this posting's prose
+ * looking for pay" — it separates "read it, states no pay" from "nobody has
+ * looked", which is a fact about our COVERAGE and the reason the column is not a
+ * second `jobs.notified`. What a row on a screen shows is a fact about the JOB,
+ * and both of those states print the same thing here: nothing. So this needs one
+ * bit of information the row already carries, and taking `salary_checked` as
+ * well would mean widening jobColumns() — which would put a lifecycle column into
+ * lib/jobs.setApplied's RETURNING, in the one statement whose whole claim is that
+ * it names two columns and reads back two columns.
+ *
+ * lib/match.salaryOf is the reader, which is also what resolves the NUMERIC
+ * -comes-back-as-a-string divergence in one place rather than here.
+ *
+ * IT WILL RENDER ON ALMOST NOTHING TODAY, and that is the data rather than the
+ * code: `salary_min` and `salary_max` are NULL on every row of the live board,
+ * because the parser refuses on every real description it has been shown. An
+ * unpriced job is shown to everyone regardless — the salary filter is the one
+ * that fails OPEN — so a job with no pay tag is not a job that failed a test.
+ */
+function salaryLabel(job: JobView): string | null {
+  const [low, high] = salaryOf(job);
+  const lpa = (value: number) => `₹${Number.isInteger(value) ? value : value.toFixed(1)}L`;
+  if (low !== null && high !== null) return `${lpa(low)} – ${lpa(high)}`;
+  if (low !== null) return `${lpa(low)}+`;
+  if (high !== null) return `up to ${lpa(high)}`;
+  return null;
 }
 
 /**

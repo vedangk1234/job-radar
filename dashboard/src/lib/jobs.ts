@@ -452,32 +452,98 @@ export async function openJobsWithMatchFlag(
   return jobs.map((job) => ({ ...job, matches: isMatch(job, prefs) }));
 }
 
-/** What one company's row prints next to its name, in one pass over the matches. */
-export type CompanyJobCounts = { match: number; applied: number };
+/**
+ * What one company's CARD prints, in one pass over the matches.
+ *
+ * IT WAS TWO INTEGERS UNTIL THE CARD-GRID SLICE — `{ match, applied }` — and the
+ * three fields added are not three new queries. Every one of them was already
+ * sitting on the candidate rows this function walks and was being dropped on the
+ * floor: `city`, `first_seen_at` and `user_notified` travel on every row
+ * matchCandidates returns, because jobColumns() and notifiedToUser() have always
+ * selected them for the job list. Aggregating them costs one pass over an array
+ * that was already in memory.
+ *
+ *   match            the big number: relevant roles, all of them
+ *   applied          how many of THOSE are ticked (a share of the number, never a
+ *                    total from a wider population)
+ *   cities           the chip row: label -> count, over the same matches
+ *   latest_match_at  the freshness tag, and the `latest` sort's key
+ *   queued           matches with no user_job_notifications row for this account
+ *                    — the NEW badge, counted rather than rendered
+ */
+export type CompanyMatchFacts = {
+  match: number;
+  applied: number;
+  cities: Record<string, number>;
+  latest_match_at: string | null;
+  queued: number;
+};
 
 /**
- * company_id -> its match count and how many of those are already applied to.
+ * A timestamp column, as a string this app can compare and re-parse.
  *
- * One query and one pass, rather than a query per company: twelve companies is
- * twelve round trips to Tokyo, and the numbers only exist to be printed next to
- * a name.
+ * postgres.js hands back a JS `Date` for `timestamptz` — the declared `string` on
+ * JobRow is what the row is worth to a reader, not what the driver produces — so
+ * a card built by spreading the column would carry a Date through JSON, come back
+ * as a string on the client, and compare differently on the two sides of the
+ * wire. Normalising once, here, is what lets lib/cards.sortCards say "these are
+ * ISO 8601 UTC strings, so lexicographic order is chronological order" and be
+ * right about rows from the server AND rows from a fetch.
+ */
+function toIso(value: unknown): string | null {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  if (typeof value === "string") {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
+  return null;
+}
+
+/**
+ * company_id -> everything its card says about the jobs behind it.
  *
- * The applied count is deliberately counted over MATCHES rather than over every
- * open job. It sits beside the "for you" number and has to mean a share of it —
- * "3 of your 14" — rather than being a total from a different population that
- * could exceed the number next to it and read as a bug.
+ * One query and one pass, rather than a query per company: fifty companies is
+ * fifty round trips to Tokyo, and the numbers only exist to be printed on a card.
+ *
+ * WHAT MAKES EVERY NUMBER HERE CITY-CORRECT WITHOUT A CLAUSE ABOUT CITIES. The
+ * card's rule is that a role in a city this account did not pick does not exist —
+ * and that is already the matcher's rule, twice: lib/jobs.cityClause narrows the
+ * candidates in SQL and lib/match.cityOk re-checks each one below. A job outside
+ * the selection is therefore not in `candidates` at all, so it cannot reach the
+ * big number, a chip, or the freshness tag. There is nothing to enforce here and
+ * deliberately no second city rule to keep in step with the first.
  */
 export async function matchCountsByCompany(
   prefs: Preferences,
   userId: string,
-): Promise<Map<number, CompanyJobCounts>> {
+): Promise<Map<number, CompanyMatchFacts>> {
   const candidates = await matchCandidates(prefs, userId);
-  const counts = new Map<number, CompanyJobCounts>();
+  const counts = new Map<number, CompanyMatchFacts>();
   for (const job of candidates) {
     if (!isMatch(job, prefs)) continue;
-    const entry = counts.get(job.company_id) ?? { match: 0, applied: 0 };
+    const entry = counts.get(job.company_id) ?? {
+      match: 0,
+      applied: 0,
+      cities: {},
+      latest_match_at: null,
+      queued: 0,
+    };
     entry.match += 1;
     if (job.applied) entry.applied += 1;
+    if (!job.user_notified) entry.queued += 1;
+
+    // A NULL city cannot happen (cityClause would have dropped it) and is bucketed
+    // rather than crashed on, exactly as lib/cards.groupJobsByCity does: the
+    // failure worth having is a visible "—" chip, not a job missing from a list
+    // whose count came from here.
+    const city = job.city ?? "";
+    entry.cities[city] = (entry.cities[city] ?? 0) + 1;
+
+    const seen = toIso(job.first_seen_at);
+    if (seen !== null && (entry.latest_match_at === null || seen > entry.latest_match_at)) {
+      entry.latest_match_at = seen;
+    }
+
     counts.set(job.company_id, entry);
   }
   return counts;

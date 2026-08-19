@@ -1417,15 +1417,25 @@ the remainder. `--retry-errors` re-probes only the rows whose fetch threw;
 
 Next.js App Router + TypeScript in `dashboard/`. Read-mostly.
 
-- **Home (`/`)** — per-company collapsible rows showing **matches only**, over
-  **the whole catalog** (it was narrowed to the watch list for one slice in
-  between; the filter-first slice widened it back, because the digest is computed
-  from the catalog again), with a "for you" count per company and, once
-  there is one, an "N applied" count beside it. Whether a job has been emailed is deliberately *not* part of this
-  filter, in either its old global form or the per-user one: Home answers "what
-  fits me right now", not "what has not been emailed yet" — a job sent in this
-  morning's digest is still worth applying to this afternoon. It is shown as a
-  badge instead. Every job row carries an **Applied** checkbox.
+- **Home (`/`)** — a **grid of company cards**, five across, showing **matches
+  only**, over **the whole catalog** (it was narrowed to the watch list for one
+  slice in between; the filter-first slice widened it back, because the digest is
+  computed from the catalog again). Each card carries a monogram placeholder, the
+  name, a large **relevant-roles** count, a **freshness tag** read from the
+  freshest matching job's `first_seen_at`, a **city chip row**
+  (`18 roles · 5 BLR · 4 HYD · 4 PUNE · +more`), open jobs as faint secondary
+  context, and an "N applied" count once there is one. **The grid is always full
+  to 50**: companies with at least one relevant role first, then the rest of the
+  catalog alphabetically stating `0 relevant roles` honestly — there is no empty
+  state, because the catalog is the filler. A **sort dropdown** offers latest /
+  highest count / A–Z and opens on latest-first while this account has a match no
+  digest has sent yet. Opening a card expands it **in place across the whole row**
+  and lists that company's matches **grouped by city, all of them**. Whether a job
+  has been emailed is deliberately *not* part of this filter, in either its old
+  global form or the per-user one: Home answers "what fits me right now", not
+  "what has not been emailed yet" — a job sent in this morning's digest is still
+  worth applying to this afternoon. It is shown as a badge instead. Every job row
+  carries an **Applied** checkbox.
 - **Watchlist (`/watchlist`)** — the **company picker**: browse and search the
   full shared catalog and pin companies to your account. Pinning narrows nothing
   and admits nothing since the filter-first slice — your filter is matched against
@@ -1434,9 +1444,13 @@ Next.js App Router + TypeScript in `dashboard/`. Read-mostly.
   until that slice; see *`user_companies`* for why that became unsafe. A free
   account may pin **5**; the limit is enforced in `lib/watchlist.watchCompany`,
   inside its transaction, and the picker only greys the buttons.
-- **Jobs (`/jobs`)** — literally the same component with one prop different
-  (`mode="all"`), showing every open posting unfiltered, over the same companies
-  Home lists — whichever list that is. The two must never disagree. This is the screen that
+- **Jobs (`/jobs`)** — the same component with two props different
+  (`mode="all"`, and the `variant="list"` default), showing every open posting
+  unfiltered, over the same companies Home lists — whichever list that is. The two
+  must never disagree. **It stayed a list when Home became a grid**, and that is
+  not an oversight: the rule is about which COMPANIES are in the set, not about
+  the shape they are drawn in. Cards are for scanning relevance; this screen is a
+  reference you look things up in, and a reference should be where you left it. This is the screen that
   answers "did the crawler miss it, or did the filter drop it?". In this mode
   each job additionally shows its `status` and a SUGGESTED badge if it also
   passes the filter. There is no Applied checkbox here: this screen is the raw
@@ -1562,6 +1576,7 @@ Guard 3 (`miss_count >= 3`) disappears from both screens.
 | `watchlist.ts` | the per-user watch list: `watchCompany` (pair + history suppression, one transaction, per-plan cap), `unwatchCompany`, `watchesAnything`. The port of `db/watchlist.py` + `db/notifications.SUPPRESS_COMPANY_HISTORY_SQL` |
 | `currentUser.ts` | the MY_EMAIL → `public.users.id` bridge, memoised. **Temporary; deleted at Phase 2 auth** |
 | `labels.ts` | `Preferences`, `CITY_LABELS`, `KEYWORD_CAP`, `DEFAULT_PREFERENCES` (the install's filter, mirrored from Python), `NEW_ACCOUNT_SEED` (what a signup actually gets) and `ONBOARDING_PATH` (re-exported by `guard.ts`; the nav needs it and cannot import that file) — **constants with no database import** |
+| `cards.ts` | the card grid's pure functions — `GRID_CAP`, `sortCards`, `defaultSortMode`, `freshnessLabel`, `topCityChips`, `groupJobsByCity`, `monogram`. **No database import**, for `labels.ts`'s reason and one more: every one of them is a decision with an off-by-one in it, and a function is checkable where a JSX expression is not |
 | `match.ts` | the port of `notify/match.py` |
 | `ats.ts` / `workday.ts` | the port of `fetchers/resolve.py` |
 | `board-url.ts` | a pasted URL → `(ats, token, config)`. Dashboard-only; no Python counterpart |
@@ -3348,6 +3363,102 @@ Newest last. Append here as the project evolves.
   Deliberately **not** here: the crawler and `COMPANIES_SQL` (byte-for-byte), both
   matchers, the enrichment union, `companies.tracked`, the picker, the 5-company
   cap, `/watchlist`, the card UI, and the schema.
+
+- **2026-08-12 — Phase 3, the card-grid slice. Home's rows become a grid of
+  company cards.** A RESKIN OF A WORKING SCREEN PLUS THREE DERIVED NUMBERS, not a
+  rebuild: the expand fetch and its once-only cache, the optimistic Applied tick
+  and its rollback, the card replacement after a category edit and the one
+  comparator that sinks applied jobs are the code they were, in the component they
+  were already in. `/api` is not in the diff, and neither is the crawler, either
+  matcher, or the schema.
+
+  **`variant` is a second PRESENTATION, not a second list**, exactly as
+  `WatchlistPicker` gained `variant="search"` in the reskin without gaining a
+  second picker. It defaults to `list`, so `/jobs` is unchanged by omission rather
+  than by remembering to pass something — and the proof is stronger than a
+  reading: **the pre-slice `ui-check`, unmodified, still passes 168/168 against
+  this tree**, and that script renders `CompanyList` with no variant at all.
+
+  **THREE NEW NUMBERS AND NOT ONE NEW QUERY.** `matchCountsByCompany` already
+  walked every candidate row and kept two integers; the chip row, the freshness
+  tag and the queued count were all sitting on those same rows — `city`,
+  `first_seen_at` and `user_notified` — being dropped on the floor. Widening the
+  accumulator is one pass over an array that was already in memory.
+
+  **Every count on a card is inside the account's city answer, and nothing on the
+  card enforces that.** It is the matcher's rule, applied twice already
+  (`cityClause` in SQL, `cityOk` in TypeScript), so a role in an unticked city is
+  not in `candidates` and cannot reach a number. Writing a second city rule here
+  would be a second thing to keep in step with the first. The one case worth
+  knowing: a REMOTE posting matches anywhere in India and therefore brings its own
+  real city onto the chip row even if that city was not ticked. It is a real match
+  in a real place and it gets its real label.
+
+  **The chips are the stored label, shouted — `pune` is `PUNE`, never `PNQ`.**
+  Cities Slice A tested and rejected all fourteen airport codes for carrying zero
+  rows, and a chip that invented one would be a second city vocabulary living on
+  one line of one screen. The friendly name still travels, on the chip's `title`.
+  Note what live data will show until the relabel is pushed: `OTHER`, because that
+  is what `jobs.city` still holds — stale data, not a card bug. See *Pending*.
+
+  **The default sort is derived from the queue rather than stored, and it is
+  deliberately not monotonic.** `defaultSortMode` opens on latest-first while any
+  card has a match carrying no `user_job_notifications` row — which is
+  `homeBadge`'s condition for NEW, counted per company instead of rendered per
+  job. So the grid sorts newest-first precisely while there is a NEW badge on it,
+  which a person can SEE is the rule being followed. When the hour's digest sends,
+  the receipts land and it returns to browsing order. A `preferences` column would
+  have made it one-way and was refused: this slice adds no schema, and a default
+  that corrects itself is worth more than one that remembers. It inherits the NEW
+  badge's own edge — a matching *seeded* job has no receipt either — and inherits
+  it rather than introducing it, which is the property worth having.
+
+  **Selection and order are two different decisions.** The fifty cards are always
+  chosen by relevance-then-name; the dropdown reorders those fifty and never
+  re-selects them. Sorting first and slicing second would let "Latest" — under
+  which every zero-relevance company ties at `null` — decide which companies you
+  can see, and a company with matches would drop off the page for having nothing
+  new today. Inert at a 50-company catalog and written down so it stays right at
+  200.
+
+  **The category select and the tracked pill moved into the panel, and the
+  security assertions moved with them.** A card's whole face is the disclosure
+  button, and a `<select>` cannot live inside a `<button>` — the card would open
+  every time the tag was changed, which is the same rule that kept them outside the
+  row's button. Both are still rendered, still exactly once, still in the markup of
+  a CLOSED card because the panel is `hidden` rather than absent. `companies
+  .tracked` stays sealed and read-only.
+
+  **Keywords render in ALL CAPS everywhere they render, and are stored in none.**
+  `lib/labels.displayKeyword` is the transform and `KeywordChips` is its only call
+  site today — Home shows no keyword at all. The two directions are opposite and
+  both load-bearing: everything inbound is lowercased, because `notify/match.py`
+  compares against a lowercased title and a keyword stored as `LLM` would match
+  nothing, silently, forever. In JavaScript rather than CSS `text-transform`,
+  because `ui-check` reads markup and has no browser, and an ALL-CAPS rule nothing
+  can check is a rule that quietly stops holding.
+
+  An open card spans `grid-column: 1 / -1`, so it grows into a full-width band
+  exactly where it already was rather than jumping elsewhere to expand. Styled
+  from `globals.css`'s own tokens rather than a scoped skin like `setup.css` or
+  `landing.css`: those are surfaces a whole page commits to, this is Home wearing
+  the dashboard's own clothes in a different arrangement, and a scoped skin would
+  mean a card that stops repainting when a token changes.
+
+  Verification: **1,624 pytest / 3 skipped** (including the three sweeps that read
+  the *TypeScript* tree — `test_dashboard_notified`, `test_tracked_write_sealed`,
+  `test_watchlist_write`), typecheck and `next build` clean, `match-parity` green
+  over 7,914 live rows × 15 filters, `badge-check` and `filter-first-check` green,
+  `ui-check` **168 → 233** assertions. Two mutations run, two caught: pinning
+  `defaultSortMode` to `count` (1 failure) and deleting the panel's controls (1) —
+  the second also exposed a weak assertion of the new set, which passed because the
+  sort dropdown is a `<select>` too, and it now names the control it means.
+
+  Deliberately **not** here: real logo fetching (Slice 3 — `CompanyLogo` makes no
+  network request of any kind and the markup is asserted to contain no `<img>`),
+  search and the city/industry filters (Slice 4), Common Crawl, `/jobs`'s
+  presentation, every `/api` route, `lib/preferences`, both matchers, the crawler,
+  and the schema.
 
 **Pending**
 

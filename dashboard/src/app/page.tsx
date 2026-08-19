@@ -1,5 +1,6 @@
 import Link from "next/link";
 
+import { GRID_CAP } from "@/lib/cards";
 import { byMatchesThenName, listCompanyCards } from "@/lib/companies";
 import { requirePage } from "@/lib/guard";
 import { CompanyList } from "@/components/CompanyList";
@@ -8,9 +9,9 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * Home — "what fits me right now", by company.
+ * Home — "what fits me right now", by company, as a grid of cards.
  *
- * The "For you" count is not a dashboard opinion about a job. It is
+ * The relevant-roles count is not a dashboard opinion about a job. It is
  * notify/match.is_match, ported to lib/match.ts and parity-checked against the
  * Python over the live table by `npm run match-parity`. A job counted here is a
  * job the digest would email; if the two ever disagree, that check fails before
@@ -40,6 +41,20 @@ export const dynamic = "force-dynamic";
  * companies beside it was narrowed, so this is the page agreeing with its own
  * numbers again. /watchlist is still where you pin companies.
  *
+ * THE GRID IS ALWAYS FULL, AND THAT IS WHY THERE IS NO EMPTY STATE. Companies
+ * with at least one relevant role come first, and the remaining slots are the
+ * catalog in alphabetical order, each stating `0 relevant roles` honestly. A
+ * screen that went blank when a filter matched nothing would be answering "you
+ * have nothing" with "there is nothing", which is a different and less true
+ * sentence — the boards are still there and still being crawled.
+ *
+ * SELECTION IS RELEVANCE-THEN-NAME; ORDER IS THE DROPDOWN'S. The slice below is
+ * taken from the byMatchesThenName ordering and never from the ordering the
+ * reader chose, so switching to "Latest" cannot decide WHICH companies are on the
+ * page — every zero-relevance company ties at null there, and a company with
+ * matches would drop off the grid for having nothing new today. See
+ * lib/cards.GRID_CAP.
+ *
  * Rendered on the server — the page is already behind the session gate, so
  * reading the database directly beats making the browser round-trip through an
  * API route that would re-check the same session.
@@ -47,26 +62,48 @@ export const dynamic = "force-dynamic";
 export default async function HomePage() {
   const { userId } = await requirePage();
 
-  const companies = (await listCompanyCards(userId)).sort(byMatchesThenName);
-  const matches = companies.reduce((n, c) => n + c.match_jobs, 0);
-  const withMatches = companies.filter((c) => c.match_jobs > 0).length;
-  const openJobs = companies.reduce((n, c) => n + c.open_jobs, 0);
+  const all = (await listCompanyCards(userId)).sort(byMatchesThenName);
+  const companies = all.slice(0, GRID_CAP);
+  const matches = all.reduce((n, c) => n + c.match_jobs, 0);
+  const withMatches = all.filter((c) => c.match_jobs > 0).length;
+  const openJobs = all.reduce((n, c) => n + c.open_jobs, 0);
 
   return (
     <>
       <h1>Home</h1>
       <p className="lede">
         <strong>{matches}</strong> of {openJobs} open jobs fit your preferences, across{" "}
-        {withMatches} of the {companies.length} compan
-        {companies.length === 1 ? "y" : "ies"} we track. Same filter as the digest email — city,
+        {withMatches} of the {all.length} compan
+        {all.length === 1 ? "y" : "ies"} we track. Same filter as the digest email — city,
         keyword, no excluded word, no level above your ceiling, and nothing the description
         marked as a PM role or a 3+-years role. Your filter decides this, not a company list:
-        every board we crawl is matched against it. Expand a company to see its matches; the
-        title is the apply link, and the checkbox beside it records that you took it.
+        every board we crawl is matched against it. Every count on a card — the big number and
+        the city chips — is inside the cities you picked. Open a card to see its roles grouped
+        by city; the title is the apply link, and the checkbox beside it records that you took
+        it.
       </p>
       <CompanyList
         initial={companies}
         mode="matches"
+        variant="grid"
+        // One instant for the whole page, decided by the server. See the prop's
+        // comment in CompanyList for the hydration bug the alternative is.
+        now={new Date().toISOString()}
+        /*
+          Fetch every card's jobs in the background as soon as the grid has
+          painted, so that opening one is instant rather than a spinner. The grid
+          itself does not wait on any of it — the counts came with the page.
+
+          THIS IS CORRECT HERE BECAUSE OF GRID_CAP, AND ONLY BECAUSE OF IT.
+          `companies` is sliced to fifty above, so "preload all of them" is fifty
+          bounded requests over a page that is going to be sat on and clicked
+          through. It is not a general improvement to how a company list loads:
+          on a screen whose length is decided by a query rather than by a cap —
+          a search returning two hundred companies — the same flag would fire two
+          hundred queries to open one card. Such a screen should leave it off and
+          keep the lazy expand fetch, which is the default.
+        */
+        preload
         empty={
           <>
             The catalog is empty, so there is nothing to match against yet.{" "}
@@ -75,14 +112,22 @@ export default async function HomePage() {
           </>
         }
       />
+      {all.length > companies.length ? (
+        <p className="muted small" style={{ marginTop: 14 }}>
+          Showing {companies.length} of {all.length} companies — every company with something
+          for you, then the rest of the catalog alphabetically.
+        </p>
+      ) : null}
       <p className="muted small" style={{ marginTop: 14 }}>
-        A <span className="badge new">new</span> badge marks a match that is still queued for
+        Cards are ordered by whichever sort is chosen above; it opens on the newest first while
+        you have a role no digest has sent you yet, and on the biggest count otherwise. A{" "}
+        <span className="badge new">new</span> badge marks a match that is still queued for
         your inbox; a match with no badge has already been handled, either because a digest
         sent it or because it was already on the board when you set your filter up. It is
         computed from the row as it stands — nothing is stored, so editing your preferences
         re-decides every badge on the next load. Ticking{" "}
         <strong>Applied</strong> dims the job, strikes the title through and sinks it to the
-        bottom of its company; the link still works, and the crawler never clears the tick.
+        bottom of its city; the link still works, and the crawler never clears the tick.
       </p>
       <p className="muted small" style={{ marginTop: 10 }}>
         A job already sent in a digest still appears here — this is what fits, not what is

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-import { KEYWORD_CAP } from "@/lib/labels";
+import { displayKeyword, KEYWORD_CAP } from "@/lib/labels";
 
 /**
  * The keyword list: removable chips, and a box you type into.
@@ -26,6 +26,18 @@ import { KEYWORD_CAP } from "@/lib/labels";
  *
  * Nothing is filtered either. Any string a person types is accepted, stored and
  * matched. The only transformation is the one correctness requires — see below.
+ *
+ * KEYWORDS ARE SHOWN IN ALL CAPS, EVERYWHERE THEY ARE SHOWN, AND STORED IN NONE.
+ * `llm` renders as LLM. This is the only component in the app that renders a
+ * keyword, so it is the only call site of lib/labels.displayKeyword today — the
+ * rule is stated in that function rather than here so a second screen that ever
+ * prints one inherits it rather than reinventing it. The two directions are
+ * deliberately opposite and both are load-bearing: everything on the way IN is
+ * lowercased (`add` below, and lib/preferences.cleanList on the server) because
+ * notify/match.py compares against a lowercased title, and everything on the way
+ * OUT is shouted. What is on screen is therefore NOT what is in the row, which is
+ * true of `blr`/"Bengaluru" one panel over for the same reason: the value is the
+ * vocabulary, the label is for the reader.
  */
 export function KeywordChips({
   values,
@@ -84,12 +96,20 @@ export function KeywordChips({
         <ul className="chips">
           {values.map((value) => (
             <li key={value}>
-              {value}
+              {displayKeyword(value)}
+              {/*
+                The accessible name is shouted too, deliberately. It has to name
+                the chip a person can SEE — "Remove LLM" beside a chip reading LLM
+                — and a screen reader saying "remove ell ell em" for a control
+                next to a visible "LLM" is the same control described two ways.
+                `values.filter` below still compares the STORED value, so the
+                casing on screen cannot affect what is removed.
+              */}
               <button
                 className="linky"
                 onClick={() => onChange(values.filter((v) => v !== value))}
-                aria-label={`Remove ${value}`}
-                title={`Remove ${value}`}
+                aria-label={`Remove ${displayKeyword(value)}`}
+                title={`Remove ${displayKeyword(value)}`}
               >
                 ×
               </button>

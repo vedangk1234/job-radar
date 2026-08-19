@@ -1,5 +1,5 @@
 import { sql } from "./db";
-import { matchCountsByCompany, type CompanyJobCounts } from "./jobs";
+import { matchCountsByCompany, type CompanyMatchFacts } from "./jobs";
 import { loadPreferences } from "./preferences";
 
 /**
@@ -22,22 +22,36 @@ export type CompanyRow = {
 };
 
 /**
- * A company row plus the numbers both screens print next to its name.
+ * A company row plus the numbers both screens print beside its name.
  *
- *   open_jobs     every open job stored for it — the row's "Total jobs"
- *   match_jobs    how many of those pass the digest filter — the row's "For you"
- *   applied_jobs  how many of THOSE MATCHES are already ticked as applied to
+ *   open_jobs        every open job stored for it — the card's faint "total jobs"
+ *   match_jobs       how many of those pass the digest filter — the BIG number
+ *   applied_jobs     how many of THOSE MATCHES are already ticked as applied to
+ *   city_counts      the chip row: city label -> relevant roles there
+ *   latest_match_at  the freshest relevant role, ISO UTC — the freshness tag
+ *   queued           relevant roles not yet emailed to me — the NEW badge, counted
  *
  * The second number is the whole point of Home, and it is computed here rather
  * than in the browser: a count is 2 bytes and the rows behind it are 300 KB.
  *
- * The third rides along for free — it is counted in the same pass over the same
- * candidate rows, so the "3 applied" note beside a company costs no query. It
- * counts matches rather than all open jobs on purpose: it sits next to the "for
- * you" number and has to be a share of it, not a total from a wider population
- * that could exceed the figure printed beside it.
+ * The rest ride along for free — every one of them is aggregated in the same
+ * single pass over the same candidate rows (see lib/jobs.matchCountsByCompany),
+ * so a chip row, a freshness tag and a sort key cost no query. `applied_jobs`
+ * counts matches rather than all open jobs on purpose: it sits next to the big
+ * number and has to be a share of it, not a total from a wider population that
+ * could exceed the figure printed beside it.
+ *
+ * EVERY ONE OF THESE IS INSIDE THIS ACCOUNT'S CITY ANSWER, and none of them says
+ * so, because none of them has to: the counts come from the matcher, and a job in
+ * a city this person did not pick is not a match. See matchCountsByCompany.
  */
-export type CompanyCard = CompanyRow & { match_jobs: number; applied_jobs: number };
+export type CompanyCard = CompanyRow & {
+  match_jobs: number;
+  applied_jobs: number;
+  city_counts: Record<string, number>;
+  latest_match_at: string | null;
+  queued: number;
+};
 
 /**
  * The company rows and their open/total counts. One aggregate, no job rows.
@@ -141,10 +155,30 @@ export async function companyCard(id: number, userId: string): Promise<CompanyCa
   return rows[0] ? withCounts(rows[0], counts) : null;
 }
 
-/** A company with no matching jobs is absent from the map, not zero in it. */
-function withCounts(row: CompanyRow, counts: Map<number, CompanyJobCounts>): CompanyCard {
+/**
+ * A company with no matching jobs is absent from the map, not zero in it — so
+ * every default here is what "nothing relevant" looks like on a card: a zero, an
+ * empty chip row and no freshness tag at all.
+ *
+ * THAT IS THE FILLER CARD, AND IT IS A REAL COMPANY. Home is always full to
+ * GRID_CAP; the companies past the relevant ones are the catalog in alphabetical
+ * order, shown honestly as `0 relevant roles` rather than hidden or faked.
+ *
+ * It is also what PATCH /api/companies/:id returns, which is why the fields are
+ * filled in here rather than at the page: the editor replaces a whole card with
+ * the server's answer after a category edit, and a shape missing `city_counts`
+ * would blank the chip row on the card that was just touched.
+ */
+function withCounts(row: CompanyRow, counts: Map<number, CompanyMatchFacts>): CompanyCard {
   const found = counts.get(row.id);
-  return { ...row, match_jobs: found?.match ?? 0, applied_jobs: found?.applied ?? 0 };
+  return {
+    ...row,
+    match_jobs: found?.match ?? 0,
+    applied_jobs: found?.applied ?? 0,
+    city_counts: found?.cities ?? {},
+    latest_match_at: found?.latest_match_at ?? null,
+    queued: found?.queued ?? 0,
+  };
 }
 
 /**

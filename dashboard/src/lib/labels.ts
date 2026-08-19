@@ -383,6 +383,45 @@ export function cityDisplayName(label: string): string {
   return CITY_DISPLAY_NAMES[label] ?? label;
 }
 
+/**
+ * HOW A CITY LABEL IS SPELLED ON A CARD CHIP — uppercase, and the same one
+ * vocabulary.
+ *
+ * `blr` becomes `BLR` and `pune` becomes `PUNE`. It is deliberately NOT an
+ * airport code: cities Slice A tested and rejected all fourteen of them for the
+ * new cities because they carried zero rows, and a chip that read `PNQ` would be
+ * a second city vocabulary invented for one line of one screen — the exact drift
+ * CITY_DISPLAY_NAMES is documented as not being. The friendly name still travels,
+ * on the chip's `title`, which is where a reader who does not know `blr` looks.
+ *
+ * Case only, so it cannot fail: a label missing from every map still renders as
+ * itself, shouted.
+ */
+export function cityChipLabel(label: string): string {
+  return label.toUpperCase();
+}
+
+/**
+ * HOW A KEYWORD IS SPELLED ANYWHERE IT IS SHOWN — `llm` renders as `LLM`.
+ *
+ * A DISPLAY TRANSFORM AND NOTHING ELSE, and the direction matters. The stored
+ * value stays lowercase, because notify/match.py compares against a normalised,
+ * lowercased title: a keyword stored as `LLM` would match nothing at all. So
+ * KeywordChips still lowercases on the way IN (see its `add`), lib/preferences
+ * .cleanList still lowercases on the way to the database, and this is applied on
+ * the way OUT, at render.
+ *
+ * IN JAVASCRIPT RATHER THAN IN CSS `text-transform`, which would be the purer
+ * display-only mechanism and is the wrong tool here: `npm run ui-check` reads
+ * MARKUP and has no browser, so a CSS-only rule would be unassertable — and an
+ * ALL-CAPS rule nothing can check is the shape of a rule that quietly stops
+ * holding. It lives in this file, with no database import, so a client component
+ * can call it without dragging postgres.js into the browser bundle.
+ */
+export function displayKeyword(keyword: string): string {
+  return keyword.toUpperCase();
+}
+
 /** Every label a person may put in selected_cities, flattened from the groups. */
 export const SELECTABLE_CITY_LABELS: readonly string[] = CITY_LABEL_GROUPS.flatMap(
   (group) => group.labels,
