@@ -151,7 +151,16 @@ async def fetch_ashby(token: str, *, save_raw: bool = True) -> list[dict]:
     return jobs
 
 
-async def fetch_smartrecruiters(token: str, *, save_raw: bool = True) -> list[dict]:
+# The default page cap for fetch_smartrecruiters: 50 pages of 100 = 5,000 jobs.
+# It exists so a mis-reported `totalFound` cannot spin forever, and it is what
+# every crawl path uses. A caller that only needs to know WHETHER a board has
+# India jobs (crawler/verify_india.py) can ask for fewer.
+SR_MAX_PAGES = 50
+
+
+async def fetch_smartrecruiters(
+    token: str, *, save_raw: bool = True, max_pages: int = SR_MAX_PAGES
+) -> list[dict]:
     """GET /v1/companies/{token}/postings?limit=100, paginated by offset.
 
     Live shape: {"offset", "limit", "totalFound", "content": [...]}. Two traps:
@@ -159,9 +168,17 @@ async def fetch_smartrecruiters(token: str, *, save_raw: bool = True) -> list[di
     can open — the public posting is jobs.smartrecruiters.com/{company}/{id}.
     Pagination stops on totalFound, on an empty page, or at a hard page cap so
     a mis-reported total cannot spin forever.
+
+    `max_pages` is that cap, and it is the only Tier-1 fetcher that needs one:
+    this is the only paginated board, and it has real 5,000-job tenants on it
+    (aecom2, measured at 4,939 jobs = 50 requests = 50 seconds in one board).
+    The default is unchanged, so every existing caller fetches exactly what it
+    always did. A caller that lowers it must treat `len(jobs) == max_pages * 100`
+    as "this board was truncated" — the loop breaks early on any short page, so
+    an exact multiple of the page size is the signal that the cap was the thing
+    that stopped it.
     """
     limit, offset, page, jobs = 100, 0, 0, []
-    max_pages = 50
 
     while page < max_pages:
         url = (
@@ -314,9 +331,19 @@ FETCHERS = {
 }
 
 
-async def fetch(ats: str, token: str, *, save_raw: bool = True) -> list[dict]:
-    """Dispatch to the right Tier 1 fetcher by ATS name."""
+async def fetch(
+    ats: str, token: str, *, save_raw: bool = True, max_pages: int | None = None
+) -> list[dict]:
+    """Dispatch to the right Tier 1 fetcher by ATS name.
+
+    `max_pages` is forwarded ONLY to the one fetcher that paginates. Passing it
+    for any other vendor is a no-op rather than an error: a caller sweeping a
+    mixed list of boards sets it once and does not have to know which of the six
+    reads more than one page.
+    """
     fetcher = FETCHERS.get(ats)
     if fetcher is None:
         raise ValueError(f"unknown tier-1 ats {ats!r}; expected one of {', '.join(TIER1_ATS)}")
+    if max_pages is not None and fetcher is fetch_smartrecruiters:
+        return await fetcher(token, save_raw=save_raw, max_pages=max_pages)
     return await fetcher(token, save_raw=save_raw)

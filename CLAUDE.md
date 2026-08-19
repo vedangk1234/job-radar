@@ -223,6 +223,21 @@ Two conventions the schema does not state:
 `config` carries the free-text extras the table has no column for: the candidate
 name as typed, the city spread, a probe error, and the `"try Workday"` note.
 
+Since the India verify sweep it also carries a **probe verdict**, and the column
+pair `job_count` / `config->>'probe'` is what makes four states distinguishable
+in a table where three of them used to look alike:
+
+| state | `job_count` | `config->>'probe'` |
+|---|---|---|
+| harvested, never looked at | `NULL` | absent |
+| probed, has ≥1 India job | ≥1 | `india` |
+| probed, no India job | ≥1 | `no-india` |
+| probed, board gave us nothing | **0** | `empty` |
+| probed, the fetch threw | **0** | `error` |
+
+`job_count IS NULL` is the resume predicate for every sweep that fills this
+table, which is why **0 has to be written as 0**. See *The India verify sweep*.
+
 ### `notifications`
 The sent-log: `canonical_id`, `sent_at`, `digest` (e.g. `2026-07-25-am`). A
 receipt per email, so a job is never emailed twice. It is **not** the thing that
@@ -1258,6 +1273,143 @@ written **every ten candidates rather than at the end** — a sweep that only wr
 on a clean exit would have nothing to resume from. `--recheck` re-probes the
 logged near-misses, which is the flag worth running monthly: a board with no
 Bangalore job in July may have one in August.
+
+### The India verify sweep — measuring what the harvest actually found
+
+The Common Crawl harvest produces a **list**: 11,435 `(ats, token)` pairs with
+`job_count` and `city_hits` NULL, because nothing has looked at any of those
+boards. `crawler/verify_india.py` + `scripts/verify_india.py` are what look.
+They fetch each board once, label its jobs' cities, and write the verdict back
+onto the same row. **They promote nothing** — the promotion decision is a
+separate task that this run exists to inform, not to pre-empt.
+
+It is `discover.py`'s two-bar test with the first bar already cleared (the token
+came out of a real URL) and the second widened from blr/hyd/pune to **India
+anywhere**: at least one open job that is not `non-india`, i.e. exactly
+`normalize.india_funnel`. Loose on purpose — the per-user city filter narrows
+who sees what later, so the bar for "is this board worth cataloguing" is only
+"does it hire in India at all", and a false-positive company sitting unwatched
+in the catalog costs nothing.
+
+**The loose bar is noisy on this population, and the report says so twice.**
+Measured on 30 harvested boards before the module was written: a hotel in Eemnes
+scored ten India jobs out of ten. Its postings read `"Eemnes, Utrecht,
+Nederland"`, and `nederland` is not in the non-India table while `netherlands`
+is — so every one of them fell through to `india-unclear`, which the funnel
+keeps. `india-unclear` means *probably India* on the fifty hand-picked Indian
+boards it was designed for, and it **inverts** on eleven thousand random global
+ones: there, an unrecognised place name is almost certainly foreign. Bare
+`Remote` and an empty location land in the same bucket.
+
+So every verdict stores both numbers, off the one histogram, for free:
+
+```
+india_loose = jobs - non_india                    the stored bar
+india_named = jobs - non_india - india_unclear    a CONFIDENT India statement
+```
+
+The gap between them **is** the inflation, per board and in total, and the
+promotion task can pick either without re-probing anything. Each row also keeps
+`unclear_sample` — that board's commonest `india-unclear` location string — so
+the residue ("which markers is the labeller missing?") is reconstructible from
+SQL later instead of costing another 12,000 requests. Fixing those markers is a
+separate task; this run produces the evidence list for it.
+
+**Why it is a separate module from `discover.py`, and it comes down to one
+line.** `discover.log_row` writes `jobs_seen or None`, storing NULL for a board
+that answered with zero jobs. That is right there — NULL is what the harvester
+leaves behind, and it means *nobody has looked at this* — and fatal here, where
+NULL is the resume predicate: a probed-and-dead board would be indistinguishable
+from a never-probed one, and every resume would re-fetch the thousands of dead
+boards it had already paid for. `verify_india` writes 0 as 0. Everything else is
+reused: the same `tier1.fetch`, the same `city_counts`, the same
+`latest_posting`, so this sweep and the hourly crawl cannot disagree about what
+a board says.
+
+**One statement, and it is an UPDATE.** `VERIFY_SQL` is keyed by `id`, so it
+cannot create a row — only fill in one the harvester wrote. `companies`, `jobs`,
+`user_companies` and `promoted` do not appear in it at all, which makes "this
+run promotes nothing" a property of the statement rather than a promise the
+caller has to keep. `tests/test_verify_india.py` asserts it against the
+statement text, against the *executable* source (docstrings stripped, because
+the prose in these files talks about `companies` constantly and that is the
+point of the prose), and again by counting rows either side of a write.
+
+#### Why the order of the work decides the runtime
+
+Every board here is one request to one **known** host — nothing to resolve, so
+nothing drifts out of step the way `run_discovery.py`'s candidates do. That
+exposes a hazard the older sweep escapes by accident, and it is the difference
+between 72 minutes and 3 hours 20.
+
+`fetchers/http.py` takes the global 8-slot semaphore **before** it waits out a
+host's one-request-a-second pace, so a coroutine sitting on a host lock is
+holding a slot. Feed the work in table order — 4,294 Greenhouse boards, then
+3,145 Workable — and eight Greenhouse tasks take every slot and queue behind one
+lock. Five hosts, one of them working, and the sweep serialises onto a single
+lane: ~12,100 seconds.
+
+So the work is one **queue per ATS**, with workers allocated so the total is
+exactly `MAX_CONCURRENCY`. Every worker therefore always holds a slot, no worker
+can block another lane, and each lane's rate is set by its own host lock:
+
+| lane | boards | workers | host | measured |
+|---|---:|---:|---|---|
+| greenhouse | 4,294 | 2 | `boards-api.greenhouse.io` | **~72 min ← the bottleneck** |
+| workable | 3,145 | 2 | `apply.workable.com` | ~52 min |
+| ashby | 2,651 | 2 | `api.ashbyhq.com` | ~44 min |
+| smartrecruiters | 634 | 1 | `api.smartrecruiters.com` | ~22 min (paginated) |
+| recruitee | 711 | 1 | `{token}.recruitee.com` | ~6 min (a host **per token**) |
+| | | **8** | == `http.MAX_CONCURRENCY` | **~75–110 min total** |
+
+`tests/test_verify_india.py` asserts that total against the semaphore rather
+than trusting the comment: if somebody lowers `MAX_CONCURRENCY`, the allocation
+stops being starvation-free and the run should say so instead of quietly
+serialising. A lane's throughput is capped at one request a second however many
+workers it has; the second worker on the big three exists only so one 30-second
+timeout does not stall a 4,294-board queue. Nothing here raises
+`MAX_CONCURRENCY` or `PER_HOST_DELAY`, and nothing here can.
+
+`--limit` is applied **after** a round-robin interleave, so `--limit 300`
+calibrates all five lanes rather than probing 300 Greenhouse boards.
+
+#### The canary is a measurement guard, not just manners
+
+A 429 storm exhausts `http.py`'s three retries and `tier1.fetch` returns `[]` —
+so **being throttled looks exactly like a run of dead boards**, and would
+silently deflate the one number this run exists to produce. Workable's own
+fetcher docstring says it rate-limits aggressively, and its lane is 3,145
+requests long.
+
+Each lane remembers the last token that answered with jobs. After 25 consecutive
+empty results it re-fetches that known-live board. Still alive → those boards
+really are dead, carry on. Suddenly empty → we are being throttled: the lane
+pauses 60 s, doubles its own per-board delay, says so loudly, and **re-queues
+the 25 boards it just mis-recorded**. Re-probing is safe because the write is an
+UPDATE keyed by id — a corrected verdict simply overwrites the wrong one. A lane
+that has never seen a live board says so once instead of guessing.
+
+#### SmartRecruiters is the one lane that can run away
+
+It is the only paginated Tier-1 board and it has real 5,000-job tenants:
+`aecom2` measured at **4,939 jobs / 50 requests / 50 seconds in a single board**.
+`fetch_smartrecruiters` therefore took an optional `max_pages` keyword —
+**default 50, unchanged for every existing caller**, and forwarded by
+`tier1.fetch` only to the fetcher that paginates, so a caller sweeping a mixed
+list sets it once without knowing which vendor reads more than one page. The
+verify sweep passes 10. A thousand jobs is far past the `20+` bucket the
+distribution ends at, and a board that hits the cap is flagged `truncated` so
+its count is never silently understated.
+
+#### Running it
+
+`workflow_dispatch` only, in its own concurrency group, with a 240-minute
+timeout — **never** a `schedule:`, and never a step in `crawl.yml`. An hour-long
+job on an hourly cadence would hammer five vendors to re-confirm what it already
+knew. Resumable in the same way as the harvester: verdicts are written every 25
+results, the selection is `job_count IS NULL`, so an interrupt costs nothing but
+the remainder. `--retry-errors` re-probes only the rows whose fetch threw;
+`--report-only` re-reads the report from the table with no network at all.
 
 ---
 

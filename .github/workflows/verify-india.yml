@@ -1,0 +1,156 @@
+name: verify-india
+
+# Probe every harvested board once and measure how many of them hire in India.
+# MANUAL ONLY — see the `on:` block below.
+#
+#   scripts/verify_india.py   fetch each discovered_companies row the Common
+#                             Crawl harvest wrote, label its jobs' cities, and
+#                             record the verdict on that same row
+#
+# MEASUREMENT ONLY. It fills in job_count, city_hits, last_posting_at and a probe
+# verdict in `config`, on rows that already exist. It PROMOTES NOTHING: it writes
+# no `companies` row, no `jobs` row, and never touches `promoted`. That is a
+# property of crawler/verify_india.VERIFY_SQL — an UPDATE keyed by id, which
+# names one table and cannot insert — and tests/test_verify_india.py asserts it
+# against the statement text and again by counting rows.
+
+on:
+  # workflow_dispatch ONLY. There is deliberately no `schedule:` here, and this
+  # is deliberately NOT a step in crawl.yml.
+  #
+  # crawl.yml runs hourly against ~50 tracked boards: a known, bounded few
+  # minutes of work. This is ~12,100 requests across five vendors and runs for
+  # well over an hour. Hourly it would be an hour-long job on a 60-minute
+  # cadence, hammering five vendors to re-confirm what it already knew. Run it
+  # by hand, once, after a harvest — which is roughly as often as there is a new
+  # monthly crawl to harvest.
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Stop after N boards, spread evenly across lanes (blank = all). 300 is the calibration run.'
+        required: false
+        default: ''
+      lane_delay:
+        description: 'Extra pause per board on one lane, e.g. workable=2.0 (blank = none)'
+        required: false
+        default: ''
+      retry_errors:
+        description: 'Re-probe only the rows whose previous fetch threw'
+        type: boolean
+        required: false
+        default: false
+      dry_run:
+        description: 'Probe and report without writing any verdict'
+        type: boolean
+        required: false
+        default: false
+
+# Its own group, NOT job-radar-crawl. This must never queue behind — or hold up
+# — the hourly crawl. The two touch different tables (this one writes only
+# discovered_companies, and only rows the crawl never reads), so there is
+# nothing to serialise against each other; a 90-minute job sharing the crawl's
+# group would stall the digest for an hour and a half.
+#
+# Two verify runs at once WOULD be a genuine waste — both would select the same
+# unprobed rows and fetch every board twice — so the group stops a double-click,
+# and cancel-in-progress is FALSE because the run already in flight is the one
+# with the work done.
+concurrency:
+  group: job-radar-verify-india
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    # Measured, not guessed: the Greenhouse lane is 4,294 boards paced at one
+    # request a second, which is ~72 minutes, and every other lane is shorter
+    # and runs beside it. 75-110 minutes is the honest range once retries and
+    # timeouts are counted. 240 leaves room for a throttled lane backing itself
+    # off without a hung run holding the group forever — and the script is
+    # resumable, so a run that hits the cap loses nothing but the remainder.
+    timeout-minutes: 240
+
+    env:
+      # The only secrets this needs. No AWS credentials and no API key: every
+      # board here is a free public JSON endpoint read anonymously.
+      #
+      # CRAWLER_DB_URL must be the SESSION pooler (port 5432), same as crawl.yml
+      # — the direct db.<ref>.supabase.co endpoint is IPv6-only and these
+      # runners are IPv4-only.
+      CRAWLER_DB_URL: ${{ secrets.CRAWLER_DB_URL }}
+      # Read by fetchers/http.py for the User-Agent contact address, so a board
+      # owner who sees 12,000 requests in their logs can reach a human.
+      MY_EMAIL: ${{ secrets.MY_EMAIL }}
+      PYTHONUNBUFFERED: '1' # interleave print() with step output in real time
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Pinned rather than floating, matching crawl.yml and
+          # discovery-harvest.yml: a new interpreter landing in the runner image
+          # must not change behaviour on a job that writes to the database.
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install runtime dependencies
+        # requirements.txt ONLY — nothing on the verify path imports pytest.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify required secrets are present
+        # Presence only. The values are never printed or compared.
+        run: |
+          missing=
+          for name in CRAWLER_DB_URL MY_EMAIL; do
+            if [ -z "${!name}" ]; then
+              missing="$missing $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing"
+            echo "Set them at Settings -> Secrets and variables -> Actions." >&2
+            exit 1
+          fi
+          echo "Both required secrets are present."
+
+      - name: Probe the harvested boards
+        # The report this prints is the point of the run: total probed, how many
+        # were reachable, how many are dead, and THE NUMBER — how many boards
+        # have at least one India job — broken down by ATS and by how many India
+        # jobs each has.
+        #
+        # It prints that number TWICE and they will not agree. `india-loose` is
+        # the stored bar (anything not `non-india`, so `india-unclear` counts);
+        # `india-named` is the confident one (a named Indian city, or
+        # other-india). The gap between them is foreign boards whose locations
+        # no marker recognised — measured before this script existed: a Dutch
+        # hotel scored 10 India jobs out of 10 on "Eemnes, Utrecht, Nederland",
+        # because `nederland` is not in the non-India table and `netherlands`
+        # is. The residue table at the end of the report is the evidence list for
+        # fixing that, which is a later task and not this one.
+        #
+        # A quiet step with a moving progress line is a working run. Expect
+        # 75-110 minutes for the full sweep.
+        run: |
+          args=""
+          if [ -n "${{ inputs.limit }}" ]; then
+            args="$args --limit ${{ inputs.limit }}"
+          fi
+          if [ -n "${{ inputs.lane_delay }}" ]; then
+            args="$args --lane-delay ${{ inputs.lane_delay }}"
+          fi
+          if [ "${{ inputs.retry_errors }}" = "true" ]; then
+            args="$args --retry-errors"
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args="$args --dry-run"
+          fi
+          echo "running: python scripts/verify_india.py$args"
+          python scripts/verify_india.py $args

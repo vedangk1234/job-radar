@@ -220,7 +220,14 @@ CREATE TABLE IF NOT EXISTS discovered_companies (
   config              JSONB NOT NULL DEFAULT '{}'::jsonb,
   job_count           INT,
   last_posting_at     TIMESTAMPTZ,
-  city_hits           TEXT[],           -- which of the three cities appeared
+  -- Which India labels appeared on the board. The discovery sweep writes the
+  -- subset of blr/hyd/pune it found (crawler/discover.py, the three-city bar);
+  -- the India verify sweep writes every non-`non-india` label it found
+  -- (crawler/verify_india.py, the India-anywhere bar), so the array can hold
+  -- any of the 23 cities plus other-india and india-unclear. Widening it needed
+  -- no migration: it is the same column meaning "the India labels this board
+  -- carries", asked with a wider vocabulary.
+  city_hits           TEXT[],
   looks_like_services BOOLEAN NOT NULL DEFAULT FALSE,  -- name-regex heuristic
   source              TEXT,             -- commoncrawl | github | domain_crawl
   discovered_at       TIMESTAMPTZ NOT NULL DEFAULT now(),

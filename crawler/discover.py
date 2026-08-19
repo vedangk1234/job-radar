@@ -107,7 +107,7 @@ def city_hits(counts: dict[str, int]) -> list[str]:
     return [city for city in TARGET_CITIES if counts.get(city, 0) > 0]
 
 
-def _latest_posting(jobs: Iterable[dict]) -> datetime | None:
+def latest_posting(jobs: Iterable[dict]) -> datetime | None:
     """The newest vendor posted_at across a board, as an aware datetime.
 
     Advisory, exactly as it is everywhere else in this project: it goes into
@@ -215,7 +215,7 @@ async def probe(candidate: Candidate, *, max_variants: int | None = None) -> Out
         token=token,
         jobs_seen=len(jobs),
         cities=counts,
-        last_posting_at=_latest_posting(jobs),
+        last_posting_at=latest_posting(jobs),
         note=candidate.note,
     )
 
