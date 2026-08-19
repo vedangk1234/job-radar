@@ -85,13 +85,33 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("ashby", re.compile(r"jobs\.ashbyhq\.com/([A-Za-z0-9][A-Za-z0-9_-]{1,48})", re.IGNORECASE)),
 )
 
-# Workday is name-only: the tenant is in the host, but the SITE is not derivable
-# from anything here, so a tenant is a lead for a human rather than something the
-# sweep can resolve. See the Workday note in fetchers/resolve.py.
+# Workday is name-only WHEN ALL YOU HAVE IS THE HOST: the tenant is in the host,
+# but the SITE is not, so a bare tenant is a lead for a human rather than
+# something the sweep can resolve. See the Workday note in fetchers/resolve.py.
 _WORKDAY_TENANT = re.compile(
     r"(?:https?://)?([A-Za-z0-9][A-Za-z0-9_-]{1,48})\.wd\d+\.myworkdayjobs\.com",
     re.IGNORECASE,
 )
+
+# The other half of that story. A README table does not always write the bare
+# host — often it writes the whole careers URL, and the whole URL DOES carry the
+# site: `.../en-US/External_Careers`. That is the third unguessable string, so a
+# URL like this is not a lead, it is a complete config, and fetchers.resolve's
+# parse_workday_url is what takes it apart. Nothing here parses it — this regex
+# only decides what looks like a Workday careers URL and hands the text over.
+#
+# The character class stops at whitespace and at the punctuation that ends a URL
+# in the two syntaxes these READMEs are written in: Markdown links `[x](url)`,
+# Markdown tables `| url |`, and HTML anchors. Trailing sentence punctuation is
+# trimmed after the match rather than excluded, because a dot or comma is legal
+# INSIDE a Workday path and only ever junk at the end of one.
+_WORKDAY_URL = re.compile(
+    r"""(?:https?://)?[A-Za-z0-9][A-Za-z0-9.-]*\.myworkdayjobs\.com(?:/[^\s"'<>)\]|\\]*)?""",
+    re.IGNORECASE,
+)
+
+# Trailing characters that are the sentence around the URL, never part of it.
+_URL_TRAILING = ".,;:!?'\"*_)]}>"
 
 # Path segments that are the vendor's own plumbing rather than anybody's board.
 _NOT_A_TOKEN = frozenset(
@@ -166,6 +186,51 @@ def extract_workday_tenants(text: str) -> list[str]:
         if tenant and tenant not in _NOT_A_TOKEN and tenant not in seen:
             seen.append(tenant)
     return seen
+
+
+def extract_workday_urls(text: str) -> list[str]:
+    """Every myworkdayjobs.com careers URL a blob of text names, deduped.
+
+    The counterpart to extract_workday_tenants: that one answers "which tenants
+    are mentioned", this one hands back the WHOLE URL, because the site name —
+    the piece no rule can produce — only exists in the path. Deduping is on the
+    lowercased URL but the ORIGINAL casing is what comes back: a Workday site
+    name is case-sensitive (`NVIDIAExternalCareerSite`), and lowercasing it here
+    would hand the caller a config that 404s.
+
+    Says nothing about whether a URL is usable. A bare host with no path matches
+    and comes back, and it is parse_workday_url in the caller that decides it is
+    missing a site — counting those as found-then-skipped is the honest report.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _WORKDAY_URL.finditer(text or ""):
+        url = match.group(0).rstrip(_URL_TRAILING)
+        if not url:
+            continue
+        key = url.lower()
+        if key not in seen:
+            seen.add(key)
+            found.append(url)
+    return found
+
+
+async def candidate_repos(*, repos_per_host: int = 12) -> list[str]:
+    """The job-list repositories to read, as `owner/repo`, deduped.
+
+    One repository search per ATS hostname, at the search API's own pace. This
+    is the expensive half of mining in wall-clock terms — six searches at 6.5s
+    apiece — so it is a function rather than an inlined loop: a second miner
+    wanting the same repositories reuses this instead of running the searches
+    again.
+    """
+    repos: list[str] = []
+    for hosts in ATS_HOSTS.values():
+        for hostname in hosts:
+            for full_name in await search_repos(hostname, per_page=repos_per_host):
+                if full_name not in repos:
+                    repos.append(full_name)
+    return repos
 
 
 async def search_repos(hostname: str, *, per_page: int = 30, pages: int = 1) -> list[str]:
@@ -289,12 +354,7 @@ async def discover_candidates(*, limit: int = 200, repos_per_host: int = 12) -> 
 
     # 2. README mining. The repository search is cheap; the READMEs behind it
     #    are where the volume is.
-    repos: list[str] = []
-    for hosts in ATS_HOSTS.values():
-        for hostname in hosts:
-            for full_name in await search_repos(hostname, per_page=repos_per_host):
-                if full_name not in repos:
-                    repos.append(full_name)
+    repos = await candidate_repos(repos_per_host=repos_per_host)
 
     for full_name in repos:
         if len(boards) >= limit:
