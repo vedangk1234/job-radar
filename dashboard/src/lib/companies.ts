@@ -1,5 +1,6 @@
 import { sql } from "./db";
 import { matchCountsByCompany, type CompanyMatchFacts } from "./jobs";
+import { TRACKED_CAP } from "./labels";
 import { loadPreferences } from "./preferences";
 
 /**
@@ -267,45 +268,21 @@ export async function upsertCompany(input: {
  * deliberately refuse to overwrite it (see upsertCompany), so this is its only
  * editor.
  *
- * `tracked` USED TO BE THE SECOND FIELD, AND REMOVING IT IS A SECURITY FIX
+ * `tracked` IS NOT WRITTEN HERE — IT HAS ITS OWN WRITER, setTracked BELOW.
  * ----------------------------------------------------------------------
- * This statement used to carry `tracked = COALESCE($1::boolean, tracked)`, fed
- * by a toggle on every company row of Home and Jobs. That column is not a
- * per-user preference and never was: scripts/crawl.py selects
- * `FROM companies WHERE tracked = TRUE`, so it is the crawler's catalog-wide
- * exclusion axis — one shared row, one shared value, for the whole install.
+ * `tracked` is the crawler's catalog-wide flag (scripts/crawl.py selects
+ * `FROM companies WHERE tracked = TRUE`), so it is one shared value for the whole
+ * install rather than a per-account preference. It was UNWRITABLE from the app
+ * for several phases — the crawl-selection slice makes it editable again, behind
+ * setTracked and a global TRACKED_CAP, on the deliberate decision that any
+ * signed-in user may curate the shared crawl set. That write is deliberately NOT
+ * folded into this function: setTracked has to run in a transaction (advisory
+ * lock + cap check) and this one does not, and keeping the two apart is what lets
+ * this stay a plain category UPDATE and keeps the cap in one place.
  *
- * With Phase 2a opening sign-up, the arithmetic changed and the control did not.
- * The route behind it authenticates but authorises nothing beyond "is there a
- * session", and this UPDATE is scoped by company id alone — so any stranger who
- * signed up ninety seconds ago could switch crawling OFF for any company, or for
- * all fifty, and every other account's digest would go quiet with nothing
- * anywhere recording why. A dashboard write that can silence somebody else's
- * inbox is the exact failure the `applied` / `seeded` ownership split in
- * lib/jobs.ts exists to prevent, arriving one table over.
- *
- * IT IS REMOVED RATHER THAN GATED, and that is the load-bearing choice. The
- * obvious alternative — let only the operator call it — needs an operator
- * identity, and there is deliberately none in the deployed app: lib/env.ts has
- * carried no myEmail() since 2b, and the comment there warns that an ambient
- * identity read in src/ becomes the thing the next page in a hurry reaches for.
- * So gating would mean reversing 2b to protect a flag the web app has no
- * business owning. A removed statement cannot be reached by curl at all; a gate
- * is a condition a later edit can get wrong silently.
- *
- * WHAT THAT COSTS, stated rather than glossed: no script in this project sets
- * `tracked = FALSE` — every Python writer sets TRUE (scripts/seed_companies.py,
- * scripts/add_workday.py, crawler/discover.TRACK_SQL, which is ON CONFLICT DO
- * NOTHING precisely so a sweep cannot undo a hand-set FALSE). This toggle was
- * therefore the only off-switch in the repo, and switching a company off is now
- * a statement against the pooler by whoever holds the DSN. That is a rare
- * operator action moving to the runtime that already owns the column.
- *
- * The column is still READ here — companyRows() selects it and the row still
- * shows a tracked/off pill. Reading a crawler fact is not owning it.
- *
- * Optional, and a patch with nothing in it is rejected by the route rather than
- * silently doing nothing. Returns false when no such id exists.
+ * So updateCompany still edits `category` and nothing else. Optional, and a patch
+ * with nothing in it is rejected by the route rather than silently doing nothing.
+ * Returns false when no such id exists.
  */
 export async function updateCompany(
   id: number,
@@ -324,4 +301,93 @@ export async function updateCompany(
     RETURNING id
   `;
   return rows.length > 0;
+}
+
+/** Refused because turning this company on would exceed TRACKED_CAP. Nothing was written. */
+export class TrackedCapError extends Error {
+  readonly cap: number;
+  readonly tracked: number;
+
+  constructor(cap: number, tracked: number) {
+    super(
+      `${tracked} companies are already being crawled, which is the limit (${cap}). ` +
+        `The hourly crawl has to finish inside a fixed time budget, so the crawled ` +
+        `set is capped. Untrack a company before adding another — nothing has been ` +
+        `changed.`,
+    );
+    this.name = "TrackedCapError";
+    this.cap = cap;
+    this.tracked = tracked;
+  }
+}
+
+/** Refused because no such company exists in the shared catalog. */
+export class NoSuchCompanyError extends Error {
+  constructor(companyId: number) {
+    super(`no company with id ${companyId} is in the catalog.`);
+    this.name = "NoSuchCompanyError";
+  }
+}
+
+/** How many companies are currently crawled — the `N` in "N / 150 tracked". */
+export async function trackedCount(): Promise<number> {
+  const [{ n }] = await sql<{ n: number }[]>`
+    SELECT count(*)::int AS n FROM companies WHERE tracked = TRUE
+  `;
+  return n;
+}
+
+/**
+ * Turn crawling on or off for one company — the shared `companies.tracked` flag.
+ *
+ * THIS IS THE ONE PLACE `tracked` IS WRITTEN FROM THE APP (upsertCompany aside,
+ * which only ever sets TRUE when a board is added). tests/test_tracked_write.py
+ * asserts that, the same way lib/watchlist.ts is the sole writer of user_companies.
+ *
+ * IT IS A SHARED FLAG, NOT A PER-USER ONE — one value decides whether the crawler
+ * fetches this board at all, for the whole install. The crawl-selection slice made
+ * it editable by any signed-in user on a deliberate, documented decision (see the
+ * spec and lib/labels.TRACKED_CAP); the per-user "I want alerts for this company"
+ * concept is user_companies, a different table with its own writer.
+ *
+ * ═══ ONE TRANSACTION, MIRRORING lib/watchlist.watchCompany ═══
+ *
+ * 1. a GLOBAL advisory lock (a constant key, because the cap is a single
+ *    install-wide count — two clicks racing must not both see 149 and both turn a
+ *    company on). Released by the commit or rollback; no unlock path to leak.
+ * 2. the company has to exist, so the caller is told "no such id" rather than the
+ *    UPDATE silently affecting zero rows.
+ * 3. the UPDATE. When turning OFF, that is all — an untrack is always allowed, so
+ *    an install already over the cap can be trimmed toward it.
+ * 4. when turning ON, re-count and throw TrackedCapError (rolling the UPDATE back)
+ *    if the count now exceeds TRACKED_CAP. Checked AFTER the write and on the
+ *    resulting count, exactly as the watch-list cap is, so a re-track of an
+ *    already-tracked company is a no-op rather than a spurious limit error.
+ */
+export async function setTracked(companyId: number, tracked: boolean): Promise<void> {
+  await sql.begin(async (tx) => {
+    // A single fixed key: the cap counts every tracked row on the install, so all
+    // callers serialise on the same lock. 0 is as good as any constant here.
+    await tx`SELECT pg_advisory_xact_lock(hashtextextended('companies.tracked', 0))`;
+
+    const [company] = await tx<{ id: number }[]>`
+      SELECT id FROM companies WHERE id = ${companyId}
+    `;
+    if (!company) throw new NoSuchCompanyError(companyId);
+
+    await tx`
+      UPDATE companies SET tracked = ${tracked} WHERE id = ${companyId}
+    `;
+
+    if (!tracked) return; // untracking is never capped
+
+    const [{ n }] = await tx<{ n: number }[]>`
+      SELECT count(*)::int AS n FROM companies WHERE tracked = TRUE
+    `;
+    if (n > TRACKED_CAP) {
+      // The throw rolls back the UPDATE above, so this company stays off. `n - 1`
+      // is what is actually tracked, since the row we just turned on disappears.
+      throw new TrackedCapError(TRACKED_CAP, n - 1);
+    }
+  });
 }

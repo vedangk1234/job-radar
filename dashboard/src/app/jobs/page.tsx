@@ -1,7 +1,8 @@
 import Link from "next/link";
 
-import { listCompanyCards } from "@/lib/companies";
+import { listCompanyCards, trackedCount } from "@/lib/companies";
 import { requirePage } from "@/lib/guard";
+import { TRACKED_CAP } from "@/lib/labels";
 import { CompanyList } from "@/components/CompanyList";
 
 export const runtime = "nodejs";
@@ -43,7 +44,7 @@ export const dynamic = "force-dynamic";
 export default async function JobsPage() {
   const { userId } = await requirePage();
 
-  const companies = await listCompanyCards(userId);
+  const [companies, tracked] = await Promise.all([listCompanyCards(userId), trackedCount()]);
   const openJobs = companies.reduce((n, c) => n + c.open_jobs, 0);
 
   return (
@@ -58,6 +59,8 @@ export default async function JobsPage() {
       <CompanyList
         initial={companies}
         mode="all"
+        cap={TRACKED_CAP}
+        trackedCount={tracked}
         empty={
           <>
             The catalog is empty, so there is nothing to list.{" "}

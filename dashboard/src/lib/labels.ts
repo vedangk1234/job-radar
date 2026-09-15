@@ -187,6 +187,29 @@ export const ONBOARDING_PATH = "/onboarding";
 export const FREE_WATCHLIST_CAP = 5;
 
 /**
+ * HOW MANY COMPANIES MAY BE CRAWLED AT ONCE — the cap on `companies.tracked`.
+ *
+ * This is a SHARED, INSTALL-WIDE limit, not a per-account one: `tracked` is the
+ * crawler's catalog-wide flag (scripts/crawl.py reads `WHERE tracked = TRUE`), so
+ * the count it caps is a single number for the whole install, unlike
+ * FREE_WATCHLIST_CAP which is per user_companies row-set.
+ *
+ * WHY 150. The hourly cron (`.github/workflows/crawl.yml`) has a 20-minute
+ * timeout and crawls companies one at a time (scripts/crawl.py), so the crawled
+ * set has to stay small enough to finish inside it. ~700 boards blew past the
+ * ceiling and the run was cancelled; 150 finishes comfortably. It is a ceiling on
+ * how many boards the cron fetches per hour, chosen from that budget rather than
+ * from anything about a person.
+ *
+ * ENFORCED IN lib/companies.setTracked, not only here: a cap that lives in the
+ * browser is a suggestion to anyone holding curl. It refuses ADDITIONS only —
+ * turning a company off is always allowed — so an install already over the cap
+ * (as it was right after the promote_india mass-track) can be trimmed down but
+ * never grown past 150.
+ */
+export const TRACKED_CAP = 150;
+
+/**
  * How many companies THIS account may watch, from `public.users.plan`.
  *
  * `null` means no limit. The column is `TEXT NOT NULL DEFAULT 'free'` with no

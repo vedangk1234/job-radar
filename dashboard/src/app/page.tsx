@@ -1,8 +1,9 @@
 import Link from "next/link";
 
 import { GRID_CAP } from "@/lib/cards";
-import { byMatchesThenName, listCompanyCards } from "@/lib/companies";
+import { byMatchesThenName, listCompanyCards, trackedCount } from "@/lib/companies";
 import { requirePage } from "@/lib/guard";
+import { TRACKED_CAP } from "@/lib/labels";
 import { CompanyList } from "@/components/CompanyList";
 
 export const runtime = "nodejs";
@@ -62,7 +63,8 @@ export const dynamic = "force-dynamic";
 export default async function HomePage() {
   const { userId } = await requirePage();
 
-  const all = (await listCompanyCards(userId)).sort(byMatchesThenName);
+  const [cards, tracked] = await Promise.all([listCompanyCards(userId), trackedCount()]);
+  const all = cards.sort(byMatchesThenName);
   const companies = all.slice(0, GRID_CAP);
   const matches = all.reduce((n, c) => n + c.match_jobs, 0);
   const withMatches = all.filter((c) => c.match_jobs > 0).length;
@@ -86,6 +88,8 @@ export default async function HomePage() {
         initial={companies}
         mode="matches"
         variant="grid"
+        cap={TRACKED_CAP}
+        trackedCount={tracked}
         // One instant for the whole page, decided by the server. See the prop's
         // comment in CompanyList for the hydration bug the alternative is.
         now={new Date().toISOString()}

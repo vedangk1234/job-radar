@@ -1087,6 +1087,92 @@ button.card-open:hover {
   color: var(--ink-3);
 }
 
+/*
+ * The crawl toggle. It IS a .tag (pill shape, on/off colours above) but a real
+ * <button>, so it needs the generic button padding/radius stripped back to the
+ * pill's and a pointer cursor to read as clickable. `tracked` from the dashboard
+ * used to be read-only; the crawl-selection slice makes this a switch.
+ */
+.track-toggle.tag {
+  cursor: pointer;
+  padding: 1px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.track-toggle.tag:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+.track-toggle.tag:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* ── The /companies crawl-selection manager ───────────────────────────── */
+.manage-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 14px 0;
+}
+.manage-count {
+  font-size: 15px;
+  color: var(--ink-2);
+}
+.manage-count strong {
+  color: var(--ink);
+}
+.manage-search {
+  flex: 1 1 200px;
+  min-width: 160px;
+}
+.manage-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.manage-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 14px;
+  border-top: 1px solid var(--line);
+}
+.manage-row:first-child {
+  border-top: none;
+}
+.manage-row.untracked {
+  background: color-mix(in srgb, var(--panel-2) 40%, transparent);
+}
+.manage-name {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-weight: 500;
+}
+.manage-name .tag {
+  font-weight: 400;
+}
+.manage-nums {
+  display: flex;
+  gap: 14px;
+  flex: 0 0 auto;
+  text-align: right;
+}
+.manage-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  margin: 16px 0;
+}
+
 button,
 .btn {
   font: inherit;

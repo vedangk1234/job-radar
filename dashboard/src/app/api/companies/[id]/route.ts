@@ -1,15 +1,21 @@
 import { NextResponse } from "next/server";
 
 import { badRequest, requireSession, serverError } from "@/lib/guard";
-import { companyCard, updateCompany } from "@/lib/companies";
+import {
+  companyCard,
+  NoSuchCompanyError,
+  setTracked,
+  TrackedCapError,
+  updateCompany,
+} from "@/lib/companies";
 import { CATEGORIES } from "@/lib/labels";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * PATCH { category?: string } — the one field the dashboard may change on a
- * company.
+ * PATCH { category?: string, tracked?: boolean } — the two fields the dashboard
+ * may change on a company.
  *
  * The response carries the whole re-read card, counts included, so the client
  * re-renders from what the database now says rather than from what it guessed.
@@ -17,29 +23,19 @@ export const dynamic = "force-dynamic";
  * the round trip, and this response is what corrects it if the write did
  * something other than what the click assumed.
  *
- * `tracked` IS REFUSED HERE, EXPLICITLY, AND THE REFUSAL IS THE POINT OF THE
- * ROUTE NOW. It used to be the second accepted field, and this handler's only
- * gate is requireSession() — which asks whether there is a session, never whose.
- * Since sign-up opened in 2a that means any signed-in stranger could have
- * switched the crawler off for a company, or for the whole catalog, for every
- * account at once (scripts/crawl.py reads `WHERE tracked = TRUE`). See
- * lib/companies.updateCompany for why the write was deleted rather than gated:
- * there is no operator identity in this app to gate on, by design.
+ * `tracked` IS ACCEPTED AGAIN — the crawl-selection slice. It is the crawler's
+ * catalog-wide flag (scripts/crawl.py reads `WHERE tracked = TRUE`), one shared
+ * value for the whole install, and it is editable by any signed-in user on a
+ * deliberate, documented decision: the operator wants to curate the crawled set
+ * from the dashboard, and the app has one real user. It is capped — lib/companies
+ * .setTracked enforces TRACKED_CAP inside a transaction — so turning a company on
+ * past the limit is refused with 409 and nothing is written.
  *
- * WHY 400 AND NOT 403. A 403 says "you may not", which implies somebody may.
- * Nobody may — the statement behind it no longer exists, for any caller, so the
- * honest answer is that the field is not a thing this route accepts. And it is
- * an explicit refusal rather than a silently-ignored key: a caller told 200 for
- * a write that did not happen is how the next person concludes the flag is
- * per-user and builds on it.
- *
- * THE PER-USER WATCH LIST IS THE THING THIS IS NOT. `user_companies` is where
- * "I want alerts for this company" belongs, it is a different table on a
- * different axis, and it has its own route — POST / DELETE /api/watchlist, which
- * writes rows bound to the caller's own session and creates each pair together
- * with the history suppression that stops a first digest being an archive dump.
- * Nothing here should be widened to stand in for it: this route edits the SHARED
- * catalog row, that one edits a statement about one person.
+ * This is still NOT the per-user watch list. `user_companies` ("I want alerts for
+ * this company") is a different table with its own route (POST/DELETE
+ * /api/watchlist). This route edits the SHARED catalog row; that one edits a
+ * statement about one person. category and tracked are handled as separate
+ * branches so a body may carry either.
  */
 export async function PATCH(request: Request, ctx: { params: Promise<{ id: string }> }) {
   const gate = await requireSession();
@@ -56,39 +52,45 @@ export async function PATCH(request: Request, ctx: { params: Promise<{ id: strin
     return badRequest("body was not JSON");
   }
 
-  const patch: { category?: string } = {};
-
-  // Refused before anything is validated or written, so the answer does not
-  // depend on what else was in the body.
-  if ("tracked" in body) {
-    return badRequest(
-      "tracked is not editable from the dashboard. It is the crawler's " +
-        "catalog-wide flag — one shared value that decides whether this company " +
-        "is fetched at all, for every account on this install — so it is owned by " +
-        "the crawl runtime and changed there, not by a signed-in request.",
-    );
+  const hasCategory = "category" in body;
+  const hasTracked = "tracked" in body;
+  if (!hasCategory && !hasTracked) {
+    return badRequest("nothing to update: send category and/or tracked");
   }
 
-  if ("category" in body) {
-    const category = String(body.category ?? "").trim().toLowerCase();
+  if (hasTracked && typeof body.tracked !== "boolean") {
+    return badRequest("tracked must be true or false");
+  }
+
+  let category: string | undefined;
+  if (hasCategory) {
+    category = String(body.category ?? "").trim().toLowerCase();
     // A closed list, checked here rather than by a CHECK constraint: the column
     // is documented prose in db/schema.sql, and a typo'd tag is a company that
     // quietly stops matching any grouping anyone later writes.
     if (!(CATEGORIES as readonly string[]).includes(category)) {
       return badRequest(`category must be one of ${CATEGORIES.join(", ")}`);
     }
-    patch.category = category;
-  }
-
-  if (patch.category === undefined) {
-    return badRequest("nothing to update: send category");
   }
 
   try {
-    const found = await updateCompany(id, patch);
-    if (!found) return NextResponse.json({ error: "not_found" }, { status: 404 });
+    if (hasCategory) {
+      const found = await updateCompany(id, { category });
+      if (!found) return NextResponse.json({ error: "not_found" }, { status: 404 });
+    }
+    if (hasTracked) {
+      await setTracked(id, body.tracked as boolean);
+    }
     return NextResponse.json({ company: await companyCard(id, gate.session.userId) });
   } catch (err) {
+    if (err instanceof NoSuchCompanyError) {
+      return NextResponse.json({ error: "not_found" }, { status: 404 });
+    }
+    // 409 Conflict: the request was valid but the install is at its crawl limit.
+    // A human-readable message so the picker can show it verbatim.
+    if (err instanceof TrackedCapError) {
+      return NextResponse.json({ error: "tracked_cap", detail: err.message }, { status: 409 });
+    }
     return serverError(err, `PATCH /api/companies/${id}`);
   }
 }
