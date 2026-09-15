@@ -20,6 +20,7 @@ import { ONBOARDING_PATH } from "@/lib/labels";
 const TABS = [
   { href: "/", label: "Home" },
   { href: "/jobs", label: "Jobs" },
+  { href: "/companies", label: "Companies" },
   { href: "/watchlist", label: "Watchlist" },
   { href: "/add", label: "Add" },
   { href: "/preferences", label: "Preferences" },

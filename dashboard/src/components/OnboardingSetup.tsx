@@ -1,22 +1,25 @@
 "use client";
 
-import { useState } from "react";
-
+import type { CompanyCard } from "@/lib/companies";
 import type { Preferences, StoredResume } from "@/lib/labels";
+import { CompanyManager } from "./CompanyManager";
 import { FormSection, PreferencesEditor } from "./PreferencesEditor";
-import { WatchlistPicker, type PickerCompany } from "./WatchlistPicker";
 
 /**
  * Setup, as one screen: the companies you want, then the filter over them.
  *
  * WHY A WRAPPER EXISTS AT ALL. The two halves of onboarding commit at different
- * moments, and honestly so. Watching a company is a write the instant you press
- * it — it has to be, because creating the pair and suppressing that company's
- * history is one transaction on the server, and there is no staged version of
- * that. The filter is staged and written by one Save, because a half-edited
- * filter must never be what the digest runs on. The resume panel already
- * established that asymmetry on this screen; this adds a second thing on the
- * "commits immediately" side.
+ * moments, and honestly so. Tracking a company (companies.tracked, the shared
+ * crawl list) is a write the instant you press it — the CompanyManager toggle
+ * PATCHes straight through, and there is no staged version of it. The filter is
+ * staged and written by one Save, because a half-edited filter must never be what
+ * the digest runs on. The resume panel already established that asymmetry on this
+ * screen; the company picker is a second thing on the "commits immediately" side.
+ *
+ * IT USED TO BE THE PER-USER WATCH PICKER (user_companies, cap 5); the
+ * crawl-selection slice replaced it with the crawl picker so signup has one
+ * company concept. /watchlist still carries the old per-user pinning for anyone
+ * who wants it.
  *
  * IT USED TO SHARE ONE NUMBER BETWEEN THE TWO — how many companies were watched —
  * because Save was refused while that was zero, by the route and by the button
@@ -49,18 +52,16 @@ import { WatchlistPicker, type PickerCompany } from "./WatchlistPicker";
 export function OnboardingSetup({
   preferences,
   resume,
-  catalog,
-  initialWatched,
+  cards,
+  trackedCount,
   cap,
 }: {
   preferences: Preferences;
   resume: StoredResume | null;
-  catalog: PickerCompany[];
-  initialWatched: number[];
+  cards: CompanyCard[];
+  trackedCount: number;
   cap: number | null;
 }) {
-  const [watched, setWatched] = useState<number[]>(initialWatched);
-
   return (
     <PreferencesEditor
       initial={preferences}
@@ -86,17 +87,10 @@ export function OnboardingSetup({
       extraSections={
         <FormSection
           id="companies"
-          title="Companies to watch"
-          tag={cap === null ? undefined : `${watched.length} of ${cap}`}
-          lede="Optional. Your filter above is matched against every board we crawl, so you will hear about matching jobs whether or not you pin anything here. Pinning is for keeping an eye on the companies you care about most."
+          title="Companies to crawl"
+          lede="Optional. Pick which company boards we fetch every hour — search, then tap to add. Your filter above is matched against whatever is crawled. You can skip this and add companies later from the Companies tab; sort by Most relevant to find boards with jobs that fit you."
         >
-          <WatchlistPicker
-            catalog={catalog}
-            initialWatched={initialWatched}
-            cap={cap}
-            onWatchedChange={setWatched}
-            variant="search"
-          />
+          <CompanyManager initial={cards} cap={cap} trackedCount={trackedCount} />
         </FormSection>
       }
     />

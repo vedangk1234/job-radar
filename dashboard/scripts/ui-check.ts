@@ -65,7 +65,7 @@ import {
   sortCards,
   topCityChips,
 } from "../src/lib/cards";
-import { displayKeyword } from "../src/lib/labels";
+import { displayKeyword, TRACKED_CAP } from "../src/lib/labels";
 // Static for the reason CompanyList is: its lib/companies import is `import
 // type` and erased, and the only other things it reaches are React and the DOM.
 // Nothing on that graph builds a database pool.
@@ -584,11 +584,14 @@ async function main() {
   check(Boolean(card), "there is a live company card to render");
   check(
     companyMarkup.includes(">tracked<") || companyMarkup.includes(">off<"),
-    "the row still SHOWS the tracked/off pill — the fact is worth reading",
+    "the row still SHOWS the tracked/off state — the fact is worth reading",
   );
   check(
-    !companyMarkup.includes("aria-label=\"Track "),
-    "there is no `Track <company>` control in the markup",
+    companyMarkup.includes("track-toggle") &&
+      /aria-label="(Crawl|Stop crawling) /.test(companyMarkup),
+    "the crawl toggle is an interactive control on the row — the crawl-selection " +
+      "slice made companies.tracked editable again",
+    "the tracked pill is read-only — the toggle did not render",
   );
   check(
     !companyMarkup.includes('class="switch"'),
@@ -770,8 +773,12 @@ async function main() {
     "the tracked/off pill is still SHOWN on the grid — the fact is worth reading",
     "the card grid dropped the crawl-flag pill entirely",
   );
-  check(!grid.includes('aria-label="Track '), "there is no `Track <company>` control on a card");
-  check(!grid.includes('class="switch"'), "and no switch label that could carry one");
+  check(
+    grid.includes("track-toggle") && /aria-label="(Crawl|Stop crawling) /.test(grid),
+    "the crawl toggle is present on the card too — same interactive control as the list",
+    "the card grid has no crawl toggle",
+  );
+  check(!grid.includes('class="switch"'), "and no switch label (the toggle is a plain button)");
   check(
     !grid.includes('type="checkbox"'),
     "a closed card renders no checkbox at all (the Applied box lives on a job, not a company)",
@@ -1585,20 +1592,25 @@ async function main() {
   // `savable` rather than the operator's row, for the reason the watch-list gate
   // section above gives: 43 stored keywords are over KEYWORD_CAP, so `overCap`
   // fires first in the button's label chain and would mask the answer under test.
+  //
+  // The picker is now the crawl-selection CompanyManager (companies.tracked), not
+  // the per-user WatchlistPicker — the crawl-selection slice made onboarding pick
+  // which boards are crawled. It takes the full CompanyCard[] so it can sort by
+  // relevance, and the crawl cap rather than the watch cap.
   const setupBlank = withRouter(
     createElement(OnboardingSetup, {
       preferences: savable,
       resume: null,
-      catalog,
-      initialWatched: [],
-      cap: lib.FREE_WATCHLIST_CAP,
+      cards: companies,
+      trackedCount: companies.filter((c) => c.tracked).length,
+      cap: TRACKED_CAP,
     }),
   );
 
   const at = (needle: string) => setupBlank.indexOf(needle);
   check(
     at('id="companies"') > 0,
-    "the watch-list picker renders as a section of the form, with its own heading",
+    "the company picker renders as a section of the form, with its own heading",
     "the picker is not a section — the save bar cannot be the last thing on the page",
   );
   check(
@@ -1646,8 +1658,8 @@ async function main() {
     "while the picker itself is still a section of the form — removed as a GATE, not as a feature",
   );
   check(
-    setupBlank.includes('type="search"') && setupBlank.includes("not watching any company"),
-    "the picker itself is fully present in that section — search box and empty state",
+    setupBlank.includes('type="search"') && setupBlank.includes("crawled"),
+    "the crawl picker itself is fully present in that section — search box and the N/cap counter",
   );
 
   /*
@@ -1685,9 +1697,9 @@ async function main() {
     createElement(OnboardingSetup, {
       preferences: { ...savable, exclusions: [], max_level: 2 },
       resume: null,
-      catalog,
-      initialWatched: [catalog[0].id],
-      cap: lib.FREE_WATCHLIST_CAP,
+      cards: companies,
+      trackedCount: companies.filter((c) => c.tracked).length,
+      cap: TRACKED_CAP,
     }),
   );
   check(
@@ -1725,15 +1737,15 @@ async function main() {
     createElement(OnboardingSetup, {
       preferences: { ...prefs, keywords: ["backend engineer"] },
       resume: null,
-      catalog,
-      initialWatched: [catalog[0].id],
-      cap: lib.FREE_WATCHLIST_CAP,
+      cards: companies,
+      trackedCount: companies.filter((c) => c.tracked).length,
+      cap: TRACKED_CAP,
     }),
   );
   check(
     !setupWatching.includes("Pick a company to watch to save") &&
       setupWatching.includes('class="save-state-ok"'),
-    "and once a company is watched the bar reports the form as answerable",
+    "and a complete filter reports the form as answerable — company selection is not a gate",
     "a complete onboarding form still reads as blocked",
   );
 

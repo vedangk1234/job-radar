@@ -76,6 +76,8 @@ export function CompanyList({
   variant = "list",
   now,
   preload = false,
+  cap = null,
+  trackedCount = 0,
 }: {
   initial: CompanyCard[];
   mode: Mode;
@@ -123,9 +125,24 @@ export function CompanyList({
    * row count is decided by a query rather than by a cap.
    */
   preload?: boolean;
+  /**
+   * The crawl cap (TRACKED_CAP) and how many companies are tracked right now,
+   * across the WHOLE catalog — not just the rows on screen. Home shows fifty of
+   * ~seven hundred, so the tracked count cannot be derived from `initial`; it is
+   * threaded from the server and kept live here as toggles fire. `null` cap means
+   * no limit; when omitted the toggle still works and never greys out.
+   */
+  cap?: number | null;
+  trackedCount?: number;
 }) {
   const [rows, setRows] = useState(initial);
   const [error, setError] = useState<string | null>(null);
+  // The live install-wide tracked count. Adjusted by ±1 as toggles resolve, so
+  // "Track" can grey out at the cap even though the count spans companies not on
+  // this page.
+  const [trackedNow, setTrackedNow] = useState(trackedCount);
+  const adjustTracked = useCallback((delta: number) => setTrackedNow((n) => n + delta), []);
+  const canTrackMore = cap === null || trackedNow < cap;
   /**
    * WHICH ORDER THE CARDS ARE IN, and where the default comes from.
    *
@@ -211,6 +228,8 @@ export function CompanyList({
             variant={variant}
             now={now}
             preload={preload}
+            canTrackMore={canTrackMore}
+            onTrackedChange={adjustTracked}
             onPatched={replace}
             onError={setError}
           />
@@ -245,6 +264,8 @@ function CompanyRow({
   variant,
   now,
   preload,
+  canTrackMore,
+  onTrackedChange,
   onPatched,
   onError,
 }: {
@@ -254,6 +275,10 @@ function CompanyRow({
   now?: string;
   /** See CompanyList's prop of the same name — bounded lists only. */
   preload?: boolean;
+  /** Whether the install is below the crawl cap, so an untracked card may be turned on. */
+  canTrackMore: boolean;
+  /** Nudge the list's live tracked count when this card's tracked flag changes. */
+  onTrackedChange: (delta: number) => void;
   onPatched: (next: CompanyCard) => void;
   onError: (message: string | null) => void;
 }) {
@@ -442,13 +467,56 @@ function CompanyRow({
   }
 
   /**
-   * The two controls that may not live inside a <button>, and the untracked note.
+   * Turn crawling on or off for this company — the shared companies.tracked flag.
+   *
+   * Optimistic like the category patch, plus the install-wide count bookkeeping:
+   * the button greys out at the cap (canTrackMore), and each resolved toggle nudges
+   * the list's live count through onTrackedChange so a sibling card can grey too.
+   * A cap collision comes back 409 and rolls the count adjustment back, so the
+   * displayed "N / cap" never drifts past a refused add.
+   */
+  async function toggleTracked() {
+    const next = !company.tracked;
+    if (next && !canTrackMore) return; // button is disabled anyway; belt and braces
+
+    const before = company;
+    setPending(true);
+    onError(null);
+    onPatched({ ...company, tracked: next });
+    onTrackedChange(next ? 1 : -1);
+
+    try {
+      const res = await fetch(`/api/companies/${company.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tracked: next }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+      onPatched(data.company as CompanyCard); // trust the server over the guess
+    } catch (err) {
+      onPatched(before);
+      onTrackedChange(next ? -1 : 1); // undo the optimistic count change
+      onError(
+        `Could not ${next ? "start" : "stop"} crawling ${before.name}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      setPending(false);
+    }
+  }
+
+  /**
+   * The controls that may not live inside a <button>: the category select and the
+   * tracked toggle. The tracked pill USED TO BE READ-ONLY (companies.tracked was
+   * sealed from the dashboard); the crawl-selection slice makes it a switch again,
+   * deliberately — the operator curates the crawled set from here, and setTracked
+   * enforces the shared cap. See lib/companies.setTracked and the spec.
    *
    * One definition, rendered in two places: beside the header in the list, inside
-   * the panel on a card. Shared rather than copied because the tracked pill is
-   * the subject of a security assertion — it must be SHOWN and must not be
-   * writable — and a copy is how the second one quietly becomes a switch again.
+   * the panel on a card.
    */
+  const atCapUntracked = !company.tracked && !canTrackMore;
   const controls = (
     <div className="company-controls">
       <label className="cat">
@@ -465,33 +533,23 @@ function CompanyRow({
           ))}
         </select>
       </label>
-      {/*
-        READ-ONLY, AND IT USED TO BE A SWITCH. This pill sat inside a
-        <label> wrapping a checkbox that PATCHed companies.tracked — the
-        crawler's catalog-wide flag, one shared value for the whole install.
-        Any signed-in account could therefore stop a company being crawled
-        for everybody. The write is gone from the route and from the SQL (see
-        lib/companies.updateCompany), and the control is gone from here, so
-        there is no longer a writable control anywhere that maps to it.
-
-        The pill stays because the fact is still worth showing: an untracked
-        company's jobs are stale, and the note below says so. A span, with no
-        handler and no input — this must not become interactive again without
-        an answer to "whose flag is it", and the answer is: not the reader's.
-
-        THE CARD-GRID SLICE MOVED IT INTO THE PANEL AND CHANGED NOTHING ELSE
-        ABOUT IT. It is still rendered, still on every company, still a span.
-      */}
-      <span
-        className={company.tracked ? "tag on" : "tag off"}
+      <button
+        type="button"
+        className={`track-toggle tag ${company.tracked ? "on" : "off"}`}
+        aria-pressed={company.tracked}
+        aria-label={`${company.tracked ? "Stop crawling" : "Crawl"} ${company.name}`}
+        disabled={pending || atCapUntracked}
         title={
           company.tracked
-            ? "Crawled hourly. This is the catalog-wide crawl flag, not a per-account setting."
-            : "Not being crawled. This is the catalog-wide crawl flag, not a per-account setting."
+            ? "Crawled hourly. Click to stop crawling this company."
+            : atCapUntracked
+              ? "The crawl limit is full. Untrack a company before adding another."
+              : "Not being crawled. Click to add it to the hourly crawl."
         }
+        onClick={toggleTracked}
       >
         {company.tracked ? "tracked" : "off"}
-      </span>
+      </button>
     </div>
   );
 
