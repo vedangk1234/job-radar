@@ -78,7 +78,11 @@ from typing import Any, Mapping, Sequence
 
 from notify.description import enrich_candidates
 from notify.match import Preferences, is_match, worth_a_description
-from notify.store import fetch_enrichment_targets, load_active_preferences
+from notify.store import (
+    fetch_enrichment_details,
+    load_active_preferences,
+    scan_enrichment_targets,
+)
 
 # How long a FAILED description read is believed before it is worth asking
 # again. Only failures are affected: a description that was read cleanly is
@@ -174,10 +178,19 @@ async def enrich_matches(
     now = now or datetime.now(timezone.utc)
     retry_before = now - RETRY_AFTER
 
-    targets = await fetch_enrichment_targets(conn, retry_before)
-    candidates = [
-        job for job in targets if any(worth_a_description(job, prefs) for prefs in filters)
+    # Two passes, one purpose kept from the single query it replaced: a free test
+    # over the whole unchecked board, then a request for what survived. The first
+    # pass is now a CHEAP scan — only the columns worth_a_description reads — so
+    # the wide columns cross the pooler for the matches alone rather than for the
+    # whole board every crawl. See notify/store.py for why that split exists and
+    # why it changes nothing downstream.
+    targets = await scan_enrichment_targets(conn, retry_before)
+    candidate_ids = [
+        job["canonical_id"]
+        for job in targets
+        if any(worth_a_description(job, prefs) for prefs in filters)
     ]
+    candidates = await fetch_enrichment_details(conn, candidate_ids)
 
     report = await enrich_candidates(
         conn, candidates, fetcher=fetcher, retry_before=retry_before

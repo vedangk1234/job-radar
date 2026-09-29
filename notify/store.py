@@ -10,7 +10,8 @@ Eight operations, and the split between them is the whole safety story:
     fetch_suppression_candidates  the same two clauses over ANY status — what
                                                 could still be owed to somebody
     suppress_filter_backlog    write the history a new or widened filter admits
-    fetch_enrichment_targets   read the jobs whose description is unread
+    scan_enrichment_targets    read (cheaply) the jobs whose description is unread
+    fetch_enrichment_details   read the wide columns for the matches worth reading
     save_description_facts     write what reading a description taught us
     record_sent                write the receipt, ONLY after Resend returned an id
 
@@ -20,11 +21,14 @@ desc_checked, desc_fetch_failed, desc_checked_at. It has no parameter for the
 description itself, which is the point — see notify/description.py. There is no
 column for one and no statement here that could fill it.
 
-fetch_enrichment_targets is read by the CRAWLER (crawler/enrich.py) rather than
-by the digest, which is why it does not filter on notification state at all: the
-dashboard shows every open job that fits, emailed or not, so every open job that
-fits has to have had its description read. That difference is the whole bug fix;
-the digest's own queue is still fetch_candidates.
+The enrichment read (scan_enrichment_targets then fetch_enrichment_details) is
+read by the CRAWLER (crawler/enrich.py) rather than by the digest, which is why
+it does not filter on notification state at all: the dashboard shows every open
+job that fits, emailed or not, so every open job that fits has to have had its
+description read. That difference is the whole bug fix; the digest's own queue is
+still fetch_candidates. The read is in two passes only to keep egress bounded —
+the scan is cheap and wide over the board, the detail is wide but narrow over the
+matches — and the split changes nothing a reader downstream can observe.
 
 THE QUEUE IS ONE PERSON'S, SINCE PHASE 1e — AND FILTER-FIRST SINCE PHASE 3
 ---------------------------------------------------------------------------
@@ -74,17 +78,18 @@ rather than a mock of them.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from db.notifications import record_notified
 
 from .match import Preferences, is_match
 
-# No CHUNK constant here any more. This module held one until Phase 1g, for the
-# IN-list in record_sent's boolean flip; the two statements that remain bind
-# either one parameter or a list of records through executemany, and the chunking
-# that a digest's worth of ids genuinely needs lives with the statement that
-# needs it — db/notifications.record_notified.
+# A CHUNK constant lives with the enrichment detail read further down, guarding
+# its IN-list the same way crawler/store.py and db/notifications.py guard theirs.
+# It went away in Phase 1g when record_sent's boolean flip did, and came back when
+# the enrichment read was split into a scan and a by-id detail fetch; the digest's
+# own writes still bind one parameter or a list of records through executemany,
+# and their chunking lives with db/notifications.record_notified.
 # SEVEN COLUMNS SINCE PHASE 3 SLICE 2, and the one it still does not name.
 #
 # The three experience columns arrived empty in Step 0 and are read here for the
@@ -356,8 +361,22 @@ SUPPRESSION_CANDIDATES_SQL = _CANDIDATES_TEMPLATE.format(
     status_filter=_ANY_STATUS, queue_filter=_QUEUE_FILTER
 )
 
-# Every open job whose description we have not successfully read — the crawl's
-# enrichment queue, before the title filter narrows it in Python.
+# The enrichment queue is read in TWO passes, and the split is an egress fix
+# rather than a change of behaviour. The queue is "every open job whose
+# description we have not successfully read" — the unchecked half of the whole
+# board, hundreds of rows — of which only a few dozen (the title-stage matches)
+# are ever worth a network request. The old single query fetched all SIXTEEN
+# wide columns (title, location, url, the JSONB config …) for the WHOLE
+# unchecked half every crawl, just so Python could throw almost all of it away.
+# On the live board that is the entire jobs table crossing the pooler once an
+# hour, and it is what exhausted the free-tier egress quota.
+#
+# So the scan and the detail read are separated. ENRICHMENT_SCAN_SQL reads only
+# the FIVE columns worth_a_description() actually inspects, over the same rows;
+# the caller narrows that to the matches in Python; ENRICHMENT_DETAILS_TEMPLATE
+# then fetches the wide columns for JUST those ids. The detail rows are
+# byte-for-byte what the single query used to return for the matches, so
+# enrich_candidates and _newly_hidden see identical data — see crawler/enrich.py.
 #
 # The `$1` cutoff is passed in rather than written as `now() - interval '24
 # hours'` for the reason the module docstring gives about SQL portability: an
@@ -368,7 +387,30 @@ SUPPRESSION_CANDIDATES_SQL = _CANDIDATES_TEMPLATE.format(
 # The status = 'open' clause is not an optimisation. A closed job is not worth a
 # request, and enriching one would be the crawler spending politeness on a
 # posting nobody can apply to.
-ENRICHMENT_TARGETS_SQL = """
+#
+# The five columns here are EXACTLY the ones notify.match.worth_a_description
+# reads (title -> keyword/exclusion/level, city + work_mode -> city_ok, location
+# -> india_funnel), plus canonical_id to carry the identity into the detail pass.
+# No JOIN to companies: nothing in that filter looks at a company column, so the
+# big scan no longer pays for a join it never used. There is no ORDER BY either —
+# the ordering that the report relies on is applied in the detail pass below,
+# over the handful of rows that survive.
+ENRICHMENT_SCAN_SQL = """
+SELECT j.canonical_id, j.title, j.location, j.city, j.work_mode
+  FROM jobs j
+ WHERE j.status = 'open'
+   AND (j.desc_checked = FALSE
+        OR (j.desc_fetch_failed = TRUE
+            AND (j.desc_checked_at IS NULL OR j.desc_checked_at < $1)))
+"""
+
+# The wide read, for the matched ids only. `{ids}` is filled with a numbered
+# IN-list ($1, $2, …) by _enrichment_details_sql; the column list is identical to
+# the one the single-pass query used, so a detail row is indistinguishable from
+# what the caller used to receive. ORDER BY c.name, j.title lives here, so the
+# `asked` / `hidden` report keeps the order it always had — over the few dozen
+# candidates rather than the whole board.
+ENRICHMENT_DETAILS_TEMPLATE = """
 SELECT j.canonical_id, j.title, j.location, j.city, j.url,
        j.first_seen_at, j.company_id,
        j.min_experience, j.is_pm_role, j.desc_checked,
@@ -376,10 +418,7 @@ SELECT j.canonical_id, j.title, j.location, j.city, j.url,
        c.name AS company, c.ats, c.token, c.config
   FROM jobs j
   JOIN companies c ON c.id = j.company_id
- WHERE j.status = 'open'
-   AND (j.desc_checked = FALSE
-        OR (j.desc_fetch_failed = TRUE
-            AND (j.desc_checked_at IS NULL OR j.desc_checked_at < $1)))
+ WHERE j.canonical_id IN ({ids})
  ORDER BY c.name, j.title
 """
 
@@ -399,7 +438,7 @@ VALUES ($1, now(), $2)
 # back NULL because the fetch failed. "We looked and learned nothing" is a fact
 # worth recording — the alternative is re-fetching the same dead endpoint on
 # every run for as long as the posting stays open. desc_fetch_failed is what
-# keeps that from meaning "and never look again": see ENRICHMENT_TARGETS_SQL.
+# keeps that from meaning "and never look again": see ENRICHMENT_SCAN_SQL.
 #
 # work_mode JOINED THE LIST IN THE WORK-MODE SLICE, and it is the one column here
 # that is deliberately allowed to be written as NULL. The other four always carry
@@ -645,22 +684,72 @@ async def suppress_filter_backlog(
     return ids
 
 
-async def fetch_enrichment_targets(
+# SQLite caps host parameters at 999 and Postgres at 65535. The candidate set is
+# the title-stage matches (a few dozen on the live board), so a single detail
+# query is the normal case — but chunk defensively so a future board that ever
+# matched hundreds of rows cannot blow the limit, the same guard crawler/store.py
+# keeps for its own IN-lists.
+CHUNK = 400
+
+
+def _chunks(items: Sequence[str]) -> Iterable[Sequence[str]]:
+    for start in range(0, len(items), CHUNK):
+        yield items[start : start + CHUNK]
+
+
+def _enrichment_details_sql(count: int) -> str:
+    """ENRICHMENT_DETAILS_TEMPLATE with an IN-list of `count` numbered params."""
+    placeholders = ", ".join(f"${n}" for n in range(1, count + 1))
+    return ENRICHMENT_DETAILS_TEMPLATE.format(ids=placeholders)
+
+
+async def scan_enrichment_targets(
     conn, retry_before: datetime
 ) -> list[Mapping[str, Any]]:
     """Open jobs whose description has not been read successfully — and only those.
 
+    The FIRST of the two enrichment passes: the cheap scan. It returns just the
+    columns worth_a_description() reads, over the unchecked half of the board, so
+    the caller can decide which handful are worth a request without dragging every
+    wide column across the pooler. fetch_enrichment_details fetches the rest for
+    the matches. See the SQL comments above for why the read is split.
+
     `retry_before` is the cutoff for asking a FAILED read again; a row that was
-    read cleanly is never returned whatever it is set to. The caller then
-    narrows this to the title-stage matches, which is where the cost argument
-    lives: this returns the unchecked half of the board, and only a few dozen of
-    those are worth a request.
+    read cleanly is never returned whatever it is set to.
 
     Deliberately not filtered on notification state of any kind. See the module
     docstring: this is the CRAWL's queue, not a digest's.
     """
-    rows = await conn.fetch(ENRICHMENT_TARGETS_SQL, retry_before)
+    rows = await conn.fetch(ENRICHMENT_SCAN_SQL, retry_before)
     return [dict(row) for row in rows]
+
+
+async def fetch_enrichment_details(
+    conn, canonical_ids: Iterable[str]
+) -> list[Mapping[str, Any]]:
+    """The SECOND enrichment pass: the wide columns, for the matched ids only.
+
+    Each row carries exactly the columns the single-pass query used to return, so
+    the result is indistinguishable to enrich_candidates and _newly_hidden from
+    what they received before the read was split.
+
+    The single-query case (one chunk) preserves the SQL ORDER BY untouched. Only
+    a set large enough to span chunks — which the title-stage filter makes
+    vanishingly unlikely — needs the final Python sort to restore that order
+    across chunk boundaries.
+    """
+    ids = list(canonical_ids)
+    if not ids:
+        return []
+
+    rows: list[Mapping[str, Any]] = []
+    for chunk in _chunks(ids):
+        fetched = await conn.fetch(_enrichment_details_sql(len(chunk)), *chunk)
+        rows.extend(dict(row) for row in fetched)
+
+    if len(ids) > CHUNK:
+        rows.sort(key=lambda row: (row["company"], row["title"]))
+    return rows
 
 
 async def save_description_facts(
