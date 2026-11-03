@@ -94,20 +94,21 @@ export default async function HomePage() {
         // comment in CompanyList for the hydration bug the alternative is.
         now={new Date().toISOString()}
         /*
-          Fetch every card's jobs in the background as soon as the grid has
-          painted, so that opening one is instant rather than a spinner. The grid
-          itself does not wait on any of it — the counts came with the page.
+          PRELOAD IS DELIBERATELY OFF — it was an egress leak, not just a nicety.
+          `preload` fired a /api/companies/:id/jobs fetch for every one of the
+          fifty cards the instant the grid painted, so each Home render pulled the
+          whole board's candidate rows a SECOND time (matchCountsByCompany already
+          pulled them once for the counts) across fifty round trips — on every
+          visit, refresh and router prefetch. On the live free-tier database that
+          was the dominant source of the egress that got the project restricted.
 
-          THIS IS CORRECT HERE BECAUSE OF GRID_CAP, AND ONLY BECAUSE OF IT.
-          `companies` is sliced to fifty above, so "preload all of them" is fifty
-          bounded requests over a page that is going to be sat on and clicked
-          through. It is not a general improvement to how a company list loads:
-          on a screen whose length is decided by a query rather than by a cap —
-          a search returning two hundred companies — the same flag would fire two
-          hundred queries to open one card. Such a screen should leave it off and
-          keep the lazy expand fetch, which is the default.
+          The lazy expand-fetch (CompanyList's default) fetches a card's jobs only
+          when it is actually opened, which is one bounded request for the one or
+          two cards a person clicks rather than fifty for cards they never touch.
+          The cost is a brief spinner the first time each card opens, which is the
+          correct trade: the counts — the whole point of the grid — still come with
+          the page and need no fetch.
         */
-        preload
         empty={
           <>
             The catalog is empty, so there is nothing to match against yet.{" "}

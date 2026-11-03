@@ -67,6 +67,13 @@ export function Nav({ email }: { email: string }) {
               <Link
                 key={tab.href}
                 href={tab.href}
+                // prefetch={false} because every tab here is a force-dynamic page
+                // that reads the database on render. With the default prefetch,
+                // Next renders these routes in the background whenever a tab
+                // scrolls into view, so merely sitting on any page would fire the
+                // heavy Home/Jobs reads unasked — egress nobody chose to spend.
+                // A tab costs a DB read only when it is actually clicked.
+                prefetch={false}
                 aria-current={pathname === tab.href ? "page" : undefined}
               >
                 {tab.label}
